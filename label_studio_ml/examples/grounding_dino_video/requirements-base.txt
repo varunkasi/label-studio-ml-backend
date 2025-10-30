@@ -1,0 +1,4 @@
+gunicorn==23.0.0
+label-studio-ml @ git+https://github.com/HumanSignal/label-studio-ml-backend.git@master
+label-studio-sdk @ git+https://github.com/HumanSignal/label-studio-sdk.git
+supervision>=0.19.0

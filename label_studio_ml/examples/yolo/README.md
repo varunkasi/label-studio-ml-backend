@@ -515,7 +515,7 @@ For example:
 
 ### Default model
 
-`yolov8m.pt` is the default object detection model.
+`yolov8x.pt` is the default object detection model.
 `yolov8n-obb.pt` is the default OBB object detection model.
 
 ### Oriented Bounding Boxes (YOLO OBB)

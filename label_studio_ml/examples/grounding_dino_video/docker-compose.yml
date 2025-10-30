@@ -1,0 +1,52 @@
+version: "3.11"
+
+services:
+  grounding_dino_video:
+    container_name: grounding_dino_video
+    image: humansignal/grounding-dino-video:dev
+    build:
+      context: .
+      args:
+        TEST_ENV: ${TEST_ENV}
+    environment:
+      # specify these parameters if you want to use basic auth for the model server
+      - BASIC_AUTH_USER=
+      - BASIC_AUTH_PASS=
+      # set the log level for the model server
+      - LOG_LEVEL=INFO
+      - WORKERS=1
+      - THREADS=8
+      - PYTHONPATH=/app
+
+      # Label Studio connectivity
+      - LABEL_STUDIO_HOST=https://app.heartex.com
+      - LABEL_STUDIO_URL=https://app.heartex.com
+      - LABEL_STUDIO_API_KEY=7d250b9f196375489cb474a4763219bf53318202
+
+      # Grounding DINO configuration
+      - GROUNDING_DINO_PROMPT=person
+      - GROUNDING_DINO_BOX_THRESHOLD=0.30
+      - GROUNDING_DINO_TEXT_THRESHOLD=0.25
+      - GROUNDING_DINO_DEVICE=cuda
+      - GROUNDING_DINO_CONFIG=GroundingDINO_SwinB_cfg.py
+      - GROUNDING_DINO_WEIGHTS=groundingdino_swinb_cogcoor.pth
+
+      # Tracker configuration defaults mirror ByteTrack
+      - TRACKER_LOST_BUFFER=30
+      - TRACKER_MATCH_THRESHOLD=0.8
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"  # for macos and unix      
+    ports:
+      - "9090:9090"
+    volumes:
+      - "./data/server:/data"
+      - "./cache_dir:/app/cache_dir"
+      - "./output_frames:/app/output_frames"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

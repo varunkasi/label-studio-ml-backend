@@ -12,6 +12,9 @@ LABEL_STUDIO_URL = os.getenv("LABEL_STUDIO_URL", "http://localhost:8080")
 LABEL_STUDIO_API_KEY = os.getenv("LABEL_STUDIO_API_KEY", "your_api_key")
 PROJECT_ID = os.getenv("LABEL_STUDIO_PROJECT_ID", "1")
 
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=logging.INFO)
+
 logger = logging.getLogger(__name__)
 
 

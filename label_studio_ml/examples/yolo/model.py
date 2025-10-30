@@ -114,6 +114,7 @@ class YOLO(LabelStudioMLBase):
             regions = []
             for model in control_models:
                 path = model.get_path(task)
+                print(f"[YOLO] {model.__class__.__name__} using media at {path}")
                 regions += model.predict_regions(path)
 
             # calculate final score
