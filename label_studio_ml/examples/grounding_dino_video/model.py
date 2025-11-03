@@ -125,6 +125,17 @@ class YOLO(LabelStudioMLBase):
                     batch_size=batch_size,
                 )
 
+                if isinstance(model, VideoRectangleModel):
+                    tracking_result = getattr(model, "last_tracking_result", None)
+                    task_data = task.setdefault("data", {}) if isinstance(task, dict) else {}
+                    if (
+                        tracking_result
+                        and isinstance(task_data, dict)
+                        and "fps" not in task_data
+                        and tracking_result.fps
+                    ):
+                        task_data["fps"] = tracking_result.fps
+
             # calculate final score
             all_scores = [region["score"] for region in regions if "score" in region]
             avg_score = sum(all_scores) / max(len(all_scores), 1)

@@ -23,9 +23,9 @@ ENV PYTHONUNBUFFERED=1 \
     WORKERS=2 \
     THREADS=4 \
     CUDA_HOME=/usr/local/cuda \
-    GROUNDINGDINO_REPO_PATH=/GroundingDINO \
-    GROUNDING_DINO_CONFIG=GroundingDINO_SwinB_cfg.py \
-    GROUNDING_DINO_WEIGHTS=groundingdino_swinb_cogcoor.pth
+    GROUNDINGDINO_REPO_PATH=/GroundingDINO
+    # GROUNDING_DINO_CONFIG=GroundingDINO_SwinB_cfg.py \
+    # GROUNDING_DINO_WEIGHTS=groundingdino_swinb_cogcoor.pth
 
 ENV PATH="/usr/local/cuda/bin:${PATH}"
 ENV TORCH_CUDA_ARCH_LIST="6.0;6.1;7.0;7.5;8.0;8.6+PTX;8.9;9.0"
@@ -63,6 +63,9 @@ RUN mkdir -p ${GROUNDINGDINO_REPO_PATH}/weights \
     && cd ${GROUNDINGDINO_REPO_PATH}/weights \
     && wget -q https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth \
     && wget -q https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha2/groundingdino_swinb_cogcoor.pth
+
+# Copy any project-provided checkpoints into the Grounding DINO weights directory
+COPY gdino_swint_darpa-ir-v1-1k_20_1.pth ${GROUNDINGDINO_REPO_PATH}/weights/
 
 ENV PYTHONPATH=/app
 

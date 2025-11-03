@@ -29,10 +29,12 @@ services:
       - GROUNDING_DINO_TEXT_THRESHOLD=0.25
       - GROUNDING_DINO_DEVICE=cuda
       - GROUNDING_DINO_CONFIG=GroundingDINO_SwinB_cfg.py
+      - GROUNDING_DINO_CONFIG=GroundingDINO_SwinT_OGC.py
       - GROUNDING_DINO_WEIGHTS=groundingdino_swinb_cogcoor.pth
+      - GROUNDING_DINO_WEIGHTS=gdino_swint_darpa-ir-v1-1k_20_1.pth
 
       # Tracker configuration defaults mirror ByteTrack
-      - TRACKER_LOST_BUFFER=30
+      - TRACKER_LOST_BUFFER=100
       - TRACKER_MATCH_THRESHOLD=0.8
 
     extra_hosts:

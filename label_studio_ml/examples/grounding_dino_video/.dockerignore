@@ -12,6 +12,7 @@
 !control_models/*
 !models/*
 !utils/*
+!gdino_swint_darpa-ir-v1-1k_20_1.pth
 
 # Include requirements files
 !requirements*.txt

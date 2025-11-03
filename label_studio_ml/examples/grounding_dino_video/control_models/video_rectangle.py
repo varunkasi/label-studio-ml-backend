@@ -4,6 +4,7 @@ from collections import defaultdict
 from typing import Dict, List, Optional
 
 from control_models.base import ControlModel
+from utils.grounding import VideoTrackingResult
 from label_studio_sdk.label_interface.control_tags import ControlTag
 
 
@@ -26,6 +27,7 @@ class VideoRectangleModel(ControlModel):
     """Video rectangle control using Grounding DINO detections with ByteTrack."""
 
     type = "VideoRectangle"
+    last_tracking_result: Optional[VideoTrackingResult] = None
 
     @classmethod
     def is_control_matched(cls, control: ControlTag) -> bool:
@@ -48,6 +50,9 @@ class VideoRectangleModel(ControlModel):
         box_threshold = self._get_float_attr("model_box_threshold")
         text_threshold = self._get_float_attr("model_text_threshold")
 
+        # Reset cached tracking result before processing the current task
+        self.last_tracking_result = None
+
         tracking = self.inference.track_video(
             path,
             box_threshold=box_threshold,
@@ -57,6 +62,7 @@ class VideoRectangleModel(ControlModel):
             save_frames=save_frames,
             batch_size=batch_size,
         )
+        self.last_tracking_result = tracking
         return self.create_video_rectangles(tracking)
 
     def create_video_rectangles(self, tracking_result) -> List[Dict]:

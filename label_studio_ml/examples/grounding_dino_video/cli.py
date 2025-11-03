@@ -88,6 +88,7 @@ class LabelStudioMLPredictor:
 
         # predict and send prediction to Label Studio
         for task in tqdm(tasks, desc="Predict tasks"):
+            fps_synced = False
             response = model.predict(
                 [task],
                 output_dir=output_dir,
@@ -105,9 +106,33 @@ class LabelStudioMLPredictor:
                     result=prediction["result"],
                 )
 
+            if not fps_synced:
+                fps_synced = self._update_task_fps_if_needed(task)
+
         logger.info("Model predictions are done!")
         if save_frames:
             logger.info(f"Annotated frames saved to: {output_dir}")
+
+    def _update_task_fps_if_needed(self, task):
+        if not isinstance(task, dict):
+            return False
+
+        task_id = task.get("id")
+        task_data = task.get("data")
+        if not task_id or not isinstance(task_data, dict):
+            return False
+
+        fps = task_data.get("fps")
+        if fps is None:
+            return False
+
+        try:
+            self.ls.tasks.update(task_id, data=task_data)
+            logger.info("Updated task %s with fps=%.4f", task_id, fps)
+            return True
+        except Exception as exc:
+            logger.warning("Failed to update task %s with fps: %s", task_id, exc)
+            return False
 
     @staticmethod
     def postprocess_response(model, response, task):
