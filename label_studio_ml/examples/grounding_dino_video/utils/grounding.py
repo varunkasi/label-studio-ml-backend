@@ -257,103 +257,32 @@ class GroundingDINOInference:
         text_threshold: Optional[float] = None,
     ) -> List[sv.Detections]:
         """Perform batched inference on multiple frames for better GPU utilization.
-        
+
         Args:
             frames: List of frames (numpy arrays in RGB format)
             prompt: Text prompt for detection
             box_threshold: Confidence threshold for bounding boxes
             text_threshold: Confidence threshold for text matching
-            
+
         Returns:
             List of detections, one per frame
         """
         if not frames:
             return []
         
-        prompt = (prompt or self.prompt).strip()
-        if not prompt.endswith("."):
-            prompt = prompt + "."
+        resolved_prompt = (prompt or self.prompt).strip()
+        detections_list: List[sv.Detections] = []
 
-        box_threshold = (
-            float(box_threshold)
-            if box_threshold is not None
-            else float(os.getenv("GROUNDING_DINO_BOX_THRESHOLD", 0.35))
-        )
-        text_threshold = (
-            float(text_threshold)
-            if text_threshold is not None
-            else float(os.getenv("GROUNDING_DINO_TEXT_THRESHOLD", 0.25))
-        )
-
-        # Transform all frames and stack into batch
-        batch_tensors = []
-        frame_sizes = []
         for frame in frames:
-            tensor, _ = self.transform(Image.fromarray(frame).convert("RGB"), None)
-            batch_tensors.append(tensor)
-            frame_sizes.append((frame.shape[0], frame.shape[1]))  # height, width
-        
-        # Stack into batch tensor
-        batch_tensor = torch.stack(batch_tensors).to(self.device)
-        
-        # Run batched inference
-        with torch.no_grad():
-            if self.use_amp:
-                with autocast():
-                    boxes, scores, phrases = predict(
-                        model=self.model,
-                        image=batch_tensor,
-                        caption=prompt,
-                        box_threshold=box_threshold,
-                        text_threshold=text_threshold,
-                        device=self.device,
-                    )
-            else:
-                boxes, scores, phrases = predict(
-                    model=self.model,
-                    image=batch_tensor,
-                    caption=prompt,
-                    box_threshold=box_threshold,
-                    text_threshold=text_threshold,
-                    device=self.device,
-                )
-        
-        # Process results for each frame
-        results = []
-        for idx, (height, width) in enumerate(frame_sizes):
-            # Extract results for this frame
-            if boxes.numel() == 0 or len(boxes) <= idx:
-                results.append(self._empty_detections())
-                continue
-            
-            frame_boxes = boxes[idx] if boxes.dim() > 2 else boxes
-            frame_scores = scores[idx] if scores.dim() > 1 else scores
-            frame_phrases = [phrases[idx]] if isinstance(phrases, list) and len(phrases) > idx else phrases
-            
-            # Convert boxes to absolute coordinates
-            if frame_boxes.numel() == 0:
-                results.append(self._empty_detections())
-                continue
-                
-            xyxy = box_ops.box_cxcywh_to_xyxy(frame_boxes) * torch.tensor([width, height, width, height])
-            xyxy = xyxy.cpu().numpy().astype(np.float32)
-            confidences = frame_scores.cpu().numpy().astype(np.float32)
-            
-            # Filter detections
-            matches = self._filter_detections(frame_phrases, xyxy, confidences)
-            if not matches:
-                results.append(self._empty_detections())
-                continue
-            
-            filtered_xyxy, filtered_scores, class_ids = zip(*matches)
-            detections = sv.Detections(
-                xyxy=np.stack(filtered_xyxy, axis=0),
-                confidence=np.array(filtered_scores, dtype=np.float32),
-                class_id=np.array(class_ids, dtype=np.int32),
+            detections = self.infer_frame(
+                frame,
+                prompt=resolved_prompt,
+                box_threshold=box_threshold,
+                text_threshold=text_threshold,
             )
-            results.append(detections)
-        
-        return results
+            detections_list.append(detections)
+
+        return detections_list
 
     def track_video(
         self,
@@ -401,10 +330,28 @@ class GroundingDINOInference:
             fps,
         )
 
-        # Get batch size from parameter, environment, or default
+        # Get batch size from parameter or environment. Default to single-frame inference.
         if batch_size is None:
-            batch_size = int(os.getenv("GROUNDING_DINO_BATCH_SIZE", "8"))
-        logger.info("Using batch size: %d", batch_size)
+            env_batch = os.getenv("GROUNDING_DINO_BATCH_SIZE")
+            if env_batch is None:
+                batch_size = 1
+            else:
+                try:
+                    batch_size = int(env_batch)
+                except ValueError:
+                    logger.warning(
+                        "Invalid GROUNDING_DINO_BATCH_SIZE value '%s', falling back to 1",
+                        env_batch,
+                    )
+                    batch_size = 1
+        if batch_size <= 0:
+            logger.warning("Received non-positive batch_size=%d, defaulting to 1", batch_size)
+            batch_size = 1
+
+        use_batch_inference = batch_size > 1
+        logger.info("Effective batch size: %d", batch_size)
+        if not use_batch_inference:
+            logger.info("Batch size <= 1; using single-frame inference path")
 
         progress_every = os.getenv("GROUNDING_DINO_PROGRESS_EVERY", "25")
         try:
@@ -423,8 +370,8 @@ class GroundingDINOInference:
         
         # Process frames in streaming batches to avoid memory issues
         frame_index = 0
-        batch_frames = []
-        batch_indices = []
+        batch_frames: List[np.ndarray] = []
+        batch_indices: List[int] = []
         
         try:
             while True:
@@ -453,44 +400,32 @@ class GroundingDINOInference:
                     torch.cuda.synchronize()
                 batch_start_time = time.perf_counter()
                 
-                # Process entire batch at once for better GPU utilization
+                # Process entire batch at once when supported, otherwise per frame
                 batch_detections_count = 0
-                try:
-                    # Batched inference on all frames simultaneously
-                    batch_detections_list = self.infer_batch(
-                        batch_frames,
-                        prompt=prompt,
-                        box_threshold=box_threshold,
-                        text_threshold=text_threshold,
-                    )
-                    
-                    # Update tracker and save results for each frame
-                    for frame, frame_idx, detections in zip(batch_frames, batch_indices, batch_detections_list):
-                        tracked = tracker.update_with_detections(detections)
-                        
-                        frames.append(
-                            FrameDetections(
-                                frame_index=frame_idx,
-                                height=frame.shape[0],
-                                width=frame.shape[1],
-                                detections=tracked,
-                            )
+                process_as_batch = use_batch_inference and len(batch_frames) > 1
+                detections_payload: List[Tuple[np.ndarray, int, sv.Detections]] = []
+
+                if process_as_batch:
+                    try:
+                        batch_detections_list = self.infer_batch(
+                            batch_frames,
+                            prompt=prompt,
+                            box_threshold=box_threshold,
+                            text_threshold=text_threshold,
                         )
-                        
-                        batch_detections_count += tracked.xyxy.shape[0]
-                        
-                        # Save annotated frame if requested
-                        if save_frames:
-                            annotated_frame = self._annotate_frame(
-                                frame, tracked, frame_idx
-                            )
-                            frame_filename = output_path / f"frame_{frame_idx:06d}.jpg"
-                            cv2.imwrite(str(frame_filename), annotated_frame)
-                            
-                except Exception as e:
-                    logger.error("Error processing batch starting at frame %d: %s",
-                               batch_indices[0] if batch_indices else 0, e)
-                    # Fall back to single-frame processing for this batch
+                        detections_payload = list(
+                            zip(batch_frames, batch_indices, batch_detections_list)
+                        )
+                    except Exception as batch_error:
+                        logger.error(
+                            "Error processing batch starting at frame %d: %s",
+                            batch_indices[0] if batch_indices else 0,
+                            batch_error,
+                        )
+                        process_as_batch = False
+
+                if not process_as_batch:
+                    detections_payload = []
                     for frame, frame_idx in zip(batch_frames, batch_indices):
                         try:
                             detections = self.infer_frame(
@@ -499,28 +434,29 @@ class GroundingDINOInference:
                                 box_threshold=box_threshold,
                                 text_threshold=text_threshold,
                             )
-                            tracked = tracker.update_with_detections(detections)
-                            
-                            frames.append(
-                                FrameDetections(
-                                    frame_index=frame_idx,
-                                    height=frame.shape[0],
-                                    width=frame.shape[1],
-                                    detections=tracked,
-                                )
-                            )
-                            
-                            batch_detections_count += tracked.xyxy.shape[0]
-                            
-                            if save_frames:
-                                annotated_frame = self._annotate_frame(
-                                    frame, tracked, frame_idx
-                                )
-                                frame_filename = output_path / f"frame_{frame_idx:06d}.jpg"
-                                cv2.imwrite(str(frame_filename), annotated_frame)
                         except Exception as frame_error:
                             logger.error("Error processing frame %d: %s", frame_idx, frame_error)
                             continue
+                        detections_payload.append((frame, frame_idx, detections))
+
+                for frame, frame_idx, detections in detections_payload:
+                    tracked = tracker.update_with_detections(detections)
+
+                    frames.append(
+                        FrameDetections(
+                            frame_index=frame_idx,
+                            height=frame.shape[0],
+                            width=frame.shape[1],
+                            detections=tracked,
+                        )
+                    )
+
+                    batch_detections_count += tracked.xyxy.shape[0]
+
+                    if save_frames:
+                        annotated_frame = self._annotate_frame(frame, tracked, frame_idx)
+                        frame_filename = output_path / f"frame_{frame_idx:06d}.jpg"
+                        cv2.imwrite(str(frame_filename), annotated_frame)
                 
                 if device_is_cuda:
                     torch.cuda.synchronize()
@@ -534,18 +470,33 @@ class GroundingDINOInference:
                 per_frame_ms = batch_time_ms / len(batch_frames) if len(batch_frames) > 0 else 0.0
                 latencies_ms.append(per_frame_ms)
                 
-                logger.info(
-                    "Batch frames %d-%d: detections=%d, latency=%.1f ms/frame%s",
-                    batch_indices[0] if batch_indices else 0,
-                    batch_indices[-1] if batch_indices else 0,
-                    batch_detections_count,
-                    per_frame_ms,
-                    (
-                        f", gpu_mem={gpu_mem_mib:.1f}/{gpu_mem_reserved_mib:.1f} MiB"
-                        if gpu_mem_mib is not None
-                        else ""
-                    ),
-                )
+                if batch_indices and batch_indices[0] == batch_indices[-1]:
+                    frame_msg = "Batch frames %d: detections=%d, latency=%.1f ms/frame%s"
+                    frame_args = (
+                        batch_indices[0],
+                        batch_detections_count,
+                        per_frame_ms,
+                        (
+                            f", gpu_mem={gpu_mem_mib:.1f}/{gpu_mem_reserved_mib:.1f} MiB"
+                            if gpu_mem_mib is not None
+                            else ""
+                        ),
+                    )
+                else:
+                    frame_msg = "Batch frames %d-%d: detections=%d, latency=%.1f ms/frame%s"
+                    frame_args = (
+                        batch_indices[0] if batch_indices else 0,
+                        batch_indices[-1] if batch_indices else 0,
+                        batch_detections_count,
+                        per_frame_ms,
+                        (
+                            f", gpu_mem={gpu_mem_mib:.1f}/{gpu_mem_reserved_mib:.1f} MiB"
+                            if gpu_mem_mib is not None
+                            else ""
+                        ),
+                    )
+
+                logger.info(frame_msg, *frame_args)
                 
                 # Clear batch for next iteration
                 batch_frames = []
