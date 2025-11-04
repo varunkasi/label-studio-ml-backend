@@ -24,8 +24,6 @@ ENV PYTHONUNBUFFERED=1 \
     THREADS=4 \
     CUDA_HOME=/usr/local/cuda \
     GROUNDINGDINO_REPO_PATH=/GroundingDINO
-    # GROUNDING_DINO_CONFIG=GroundingDINO_SwinB_cfg.py \
-    # GROUNDING_DINO_WEIGHTS=groundingdino_swinb_cogcoor.pth
 
 ENV PATH="/usr/local/cuda/bin:${PATH}"
 ENV TORCH_CUDA_ARCH_LIST="6.0;6.1;7.0;7.5;8.0;8.6+PTX;8.9;9.0"
