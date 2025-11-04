@@ -6,12 +6,13 @@ YOLO-compatible behaviours while relying on zero-shot text prompted detections.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import cv2
 import numpy as np
@@ -363,10 +364,19 @@ class GroundingDINOInference:
             )
             progress_every_int = 25
 
-        tracker = sv.ByteTrack(**(tracker_kwargs or {}))
+        tracker_kwargs = dict(tracker_kwargs or {})
+        tracker_kwargs["frame_rate"] = fps
+        tracker_kwargs = self._prepare_tracker_kwargs(tracker_kwargs)
+        print("Prepared tracker kwargs:", tracker_kwargs)
+        tracker = sv.ByteTrack(**tracker_kwargs)
+        print("track_activation_threshold:", tracker.track_activation_threshold)
+        print("lost_track_buffer:", tracker.max_time_lost * 30.0 / fps)
+        print("minimum_matching_threshold:", tracker.minimum_matching_threshold)
+        print("minimum_consecutive_frames:", tracker.minimum_consecutive_frames)
         frames: List[FrameDetections] = []
         latencies_ms: List[float] = []
         device_is_cuda = self.device.startswith("cuda") and torch.cuda.is_available()
+        tracked_ids: Set[int] = set()
         
         # Process frames in streaming batches to avoid memory issues
         frame_index = 0
@@ -375,7 +385,6 @@ class GroundingDINOInference:
         
         try:
             while True:
-                # Read frames for current batch
                 while len(batch_frames) < batch_size:
                     ret, frame = capture.read()
                     if not ret:
@@ -383,13 +392,13 @@ class GroundingDINOInference:
                     batch_frames.append(frame)
                     batch_indices.append(frame_index)
                     frame_index += 1
-                
-                # Break if no frames were read
+
                 if len(batch_frames) == 0:
                     break
-                
-                # Log progress
-                if progress_every_int and (frame_index - len(batch_frames)) % (progress_every_int * batch_size) < batch_size:
+
+                if progress_every_int and (frame_index - len(batch_frames)) % (
+                    progress_every_int * batch_size
+                ) < batch_size:
                     logger.info(
                         "Tracking progress: frames %d/%s",
                         frame_index,
@@ -399,9 +408,13 @@ class GroundingDINOInference:
                 if device_is_cuda:
                     torch.cuda.synchronize()
                 batch_start_time = time.perf_counter()
-                
-                # Process entire batch at once when supported, otherwise per frame
+
                 batch_detections_count = 0
+                print(
+                    "Batch thresholds:",
+                    "box_threshold=", box_threshold,
+                    "text_threshold=", text_threshold,
+                )
                 process_as_batch = use_batch_inference and len(batch_frames) > 1
                 detections_payload: List[Tuple[np.ndarray, int, sv.Detections]] = []
 
@@ -435,12 +448,23 @@ class GroundingDINOInference:
                                 text_threshold=text_threshold,
                             )
                         except Exception as frame_error:
-                            logger.error("Error processing frame %d: %s", frame_idx, frame_error)
+                            logger.error(
+                                "Error processing frame %d: %s", frame_idx, frame_error
+                            )
                             continue
                         detections_payload.append((frame, frame_idx, detections))
 
                 for frame, frame_idx, detections in detections_payload:
                     tracked = tracker.update_with_detections(detections)
+
+                    if tracked.tracker_id is not None:
+                        for tracker_id in tracked.tracker_id:
+                            if tracker_id is None:
+                                continue
+                            try:
+                                tracked_ids.add(int(tracker_id))
+                            except (TypeError, ValueError):
+                                continue
 
                     frames.append(
                         FrameDetections(
@@ -457,7 +481,7 @@ class GroundingDINOInference:
                         annotated_frame = self._annotate_frame(frame, tracked, frame_idx)
                         frame_filename = output_path / f"frame_{frame_idx:06d}.jpg"
                         cv2.imwrite(str(frame_filename), annotated_frame)
-                
+
                 if device_is_cuda:
                     torch.cuda.synchronize()
                     gpu_mem_mib = torch.cuda.memory_allocated() / (1024 ** 2)
@@ -465,11 +489,13 @@ class GroundingDINOInference:
                 else:
                     gpu_mem_mib = None
                     gpu_mem_reserved_mib = None
-                
+
                 batch_time_ms = (time.perf_counter() - batch_start_time) * 1000.0
-                per_frame_ms = batch_time_ms / len(batch_frames) if len(batch_frames) > 0 else 0.0
+                per_frame_ms = (
+                    batch_time_ms / len(batch_frames) if len(batch_frames) > 0 else 0.0
+                )
                 latencies_ms.append(per_frame_ms)
-                
+
                 if batch_indices and batch_indices[0] == batch_indices[-1]:
                     frame_msg = "Batch frames %d: detections=%d, latency=%.1f ms/frame%s"
                     frame_args = (
@@ -497,11 +523,10 @@ class GroundingDINOInference:
                     )
 
                 logger.info(frame_msg, *frame_args)
-                
-                # Clear batch for next iteration
+
                 batch_frames = []
                 batch_indices = []
-                
+
         except Exception as e:
             logger.error("Error during video tracking: %s", e)
             raise
@@ -513,13 +538,15 @@ class GroundingDINOInference:
         duration = frame_count / fps if fps else float(frame_count)
 
         total_detections = sum(frame.detections.xyxy.shape[0] for frame in frames)
+        total_tracks = len(tracked_ids)
         avg_latency = (sum(latencies_ms) / len(latencies_ms)) if latencies_ms else 0.0
         max_latency = max(latencies_ms) if latencies_ms else 0.0
 
         logger.info(
-            "Completed video tracking: processed=%d frames, detections=%d, avg_latency=%.1f ms/frame, max_latency=%.1f ms/frame",
+            "Completed video tracking: processed=%d frames, detections=%d, tracks=%d, avg_latency=%.1f ms/frame, max_latency=%.1f ms/frame",
             len(frames),
             total_detections,
+            total_tracks,
             avg_latency,
             max_latency,
         )
@@ -530,7 +557,48 @@ class GroundingDINOInference:
             fps=fps,
             frames=frames,
         )
-    
+
+    def _prepare_tracker_kwargs(self, tracker_kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize tracker kwargs so they match the current supervision.ByteTrack signature."""
+
+        signature = inspect.signature(sv.ByteTrack.__init__)
+        accepted_params = {name for name in signature.parameters.keys() if name != "self"}
+
+        normalized: Dict[str, Any] = {}
+        alias_map = {
+            "track_activation_threshold": ("track_activation_threshold", "track_thresh"),
+            "lost_track_buffer": ("lost_track_buffer", "track_buffer"),
+            "minimum_matching_threshold": ("minimum_matching_threshold", "match_thresh"),
+            "minimum_consecutive_frames": ("minimum_consecutive_frames",),
+        }
+
+        for logical_key, aliases in alias_map.items():
+            if logical_key not in tracker_kwargs:
+                continue
+            value = tracker_kwargs[logical_key]
+            for alias in aliases:
+                if alias in accepted_params:
+                    normalized[alias] = value
+                    break
+            else:
+                logger.debug(
+                    "Dropping tracker parameter '%s'; unsupported by current supervision.ByteTrack",
+                    logical_key,
+                )
+
+        for key, value in tracker_kwargs.items():
+            if key in alias_map:
+                continue
+            if key in accepted_params:
+                normalized[key] = value
+            else:
+                logger.debug(
+                    "Dropping tracker parameter '%s'; unsupported by current supervision.ByteTrack",
+                    key,
+                )
+
+        return normalized
+
     def _annotate_frame(
         self,
         frame: np.ndarray,
@@ -591,14 +659,15 @@ class GroundingDINOInference:
         scores: np.ndarray,
     ) -> List[Tuple[np.ndarray, float, int]]:
         matches: List[Tuple[np.ndarray, float, int]] = []
-        for idx, phrase in enumerate(phrases):
-            normalized = phrase.lower().replace(".", " ")
-            class_id = self._match_class(normalized)
+
+        for phrase, bbox, score in zip(phrases, xyxy, scores):
+            class_id = self._match_class(phrase.lower())
             if class_id is None:
                 continue
-            matches.append((xyxy[idx], float(scores[idx]), class_id))
-        return matches
+            matches.append((bbox, float(score), class_id))
 
+        return matches
+        
     def _match_class(self, phrase: str) -> Optional[int]:
         for index, term in enumerate(self.allowed_terms):
             if term in phrase:

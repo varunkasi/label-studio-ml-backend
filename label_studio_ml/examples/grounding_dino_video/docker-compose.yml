@@ -25,7 +25,7 @@ services:
 
       # Grounding DINO configuration
       - GROUNDING_DINO_PROMPT=person
-      - GROUNDING_DINO_BOX_THRESHOLD=0.30
+      - GROUNDING_DINO_BOX_THRESHOLD=0.20
       - GROUNDING_DINO_TEXT_THRESHOLD=0.25
       - GROUNDING_DINO_DEVICE=cuda
       - GROUNDING_DINO_CONFIG=GroundingDINO_SwinB_cfg.py
@@ -33,9 +33,24 @@ services:
       - GROUNDING_DINO_WEIGHTS=groundingdino_swinb_cogcoor.pth
       - GROUNDING_DINO_WEIGHTS=gdino_swint_darpa-ir-v1-1k_20_1.pth
 
+      # track_activation_threshold (float): Detection confidence threshold for track activation.
+      #   Increasing track_activation_threshold improves accuracy and stability but might miss
+      #   true detections. Decreasing it increases completeness but risks introducing noise and
+      #   instability.
+      # lost_track_buffer (int): Number of frames to buffer when a track is lost. Increasing
+      #   lost_track_buffer enhances occlusion handling, significantly reducing the likelihood of
+      #   track fragmentation or disappearance caused by brief detection gaps.
+      # minimum_matching_threshold (float): Threshold for matching tracks with detections.
+      #   Increasing minimum_matching_threshold improves accuracy but risks fragmentation.
+      #   Decreasing it improves completeness but risks false positives and drift.
+      # minimum_consecutive_frames (int): Frames an object must be tracked before it's considered
+      #   valid. Increasing minimum_consecutive_frames prevents accidental tracks from false or
+      #   duplicate detections but may miss shorter tracks.
       # Tracker configuration defaults mirror ByteTrack
+      - TRACKER_ACTIVATION_THRESHOLD=0.2
       - TRACKER_LOST_BUFFER=100
-      - TRACKER_MATCH_THRESHOLD=0.8
+      - TRACKER_MATCH_THRESHOLD=0.5
+      - TRACKER_MIN_CONSECUTIVE_FRAMES=5
 
     extra_hosts:
       - "host.docker.internal:host-gateway"  # for macos and unix      

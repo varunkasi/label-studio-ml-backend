@@ -20,7 +20,29 @@ TRACKER_ENV_MAP = {
     "lost_track_buffer": "TRACKER_LOST_BUFFER",
     "minimum_matching_threshold": "TRACKER_MATCH_THRESHOLD",
     "track_activation_threshold": "TRACKER_ACTIVATION_THRESHOLD",
+    "minimum_consecutive_frames": "TRACKER_MIN_CONSECUTIVE_FRAMES",
 }
+
+MODEL_THRESHOLD_ENV_MAP = {
+    "model_box_threshold": "GROUNDING_DINO_BOX_THRESHOLD",
+    "model_text_threshold": "GROUNDING_DINO_TEXT_THRESHOLD",
+}
+
+TRACKER_PARAM_CASTERS = {
+    "lost_track_buffer": int,
+    "minimum_consecutive_frames": int,
+    "minimum_matching_threshold": float,
+    "track_activation_threshold": float,
+}
+
+
+def _require_env(name: str) -> str:
+    value = os.getenv(name)
+    if value is None or value == "":
+        raise RuntimeError(
+            f"Required environment variable '{name}' is not set or empty."
+        )
+    return value
 
 
 class VideoRectangleModel(ControlModel):
@@ -163,20 +185,22 @@ class VideoRectangleModel(ControlModel):
         kwargs: Dict = {}
 
         for param, env_name in TRACKER_ENV_MAP.items():
-            env_value = os.getenv(env_name)
-            attr_value = self.control.attr.get(env_name.lower())
-            value = attr_value or env_value
-            if value is None:
-                continue
+            value = _require_env(env_name)
             try:
-                kwargs[param] = float(value)
-            except ValueError:
-                logger.warning("Invalid tracker parameter %s=%s", param, value)
+                caster = TRACKER_PARAM_CASTERS.get(param, float)
+                if caster is int:
+                    kwargs[param] = int(float(value))
+                else:
+                    kwargs[param] = caster(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Invalid value for environment variable '{env_name}': {value}"
+                ) from exc
 
         control_threshold = self.control.attr.get("tracker_match_threshold")
         if control_threshold:
             try:
-                kwargs["minimum_matching_threshold"] = float(control_threshold)
+                kwargs.setdefault("minimum_matching_threshold", float(control_threshold))
             except ValueError:
                 logger.warning(
                     "Invalid tracker_match_threshold value '%s'", control_threshold
@@ -185,6 +209,16 @@ class VideoRectangleModel(ControlModel):
         return kwargs
 
     def _get_float_attr(self, key: str) -> Optional[float]:
+        env_name = MODEL_THRESHOLD_ENV_MAP.get(key)
+        if env_name:
+            env_value = _require_env(env_name)
+            try:
+                return float(env_value)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid value for environment variable '{env_name}': {env_value}"
+                ) from exc
+
         value = self.control.attr.get(key)
         if value is None:
             return None

@@ -99,9 +99,15 @@ class LabelStudioMLPredictor:
 
             # send predictions to Label Studio
             for prediction in predictions:
+                score = prediction.get("score", 0)
+                logger.info(
+                    "Submitting prediction for task %s with score=%.4f",
+                    task.get("id"),
+                    float(score) if isinstance(score, (int, float)) else score,
+                )
                 ls.predictions.create(
                     task=task["id"],
-                    score=prediction.get("score", 0),
+                    score=score,
                     model_version=prediction.get("model_version", "none"),
                     result=prediction["result"],
                 )
