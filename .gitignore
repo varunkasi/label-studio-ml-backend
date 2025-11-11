@@ -132,3 +132,11 @@ dmypy.json
 .github/actions-hub
 
 .idea/
+
+*.jpg
+*.pt
+*.pth
+.DS_Store
+
+# Grounding DINO video artifacts
+label_studio_ml/examples/grounding_dino_video/output_frames/
