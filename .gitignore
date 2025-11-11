@@ -140,3 +140,5 @@ dmypy.json
 
 # Grounding DINO video artifacts
 label_studio_ml/examples/grounding_dino_video/output_frames/
+
+.repoprompt/
