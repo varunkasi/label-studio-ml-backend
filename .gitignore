@@ -142,3 +142,4 @@ dmypy.json
 label_studio_ml/examples/grounding_dino_video/output_frames/
 
 .repoprompt/
+label_studio_ml/examples/segment_anything_2_video/data/server/models/cache.db
