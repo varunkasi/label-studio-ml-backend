@@ -35,7 +35,9 @@ services:
       # Determine the actual IP using 'ifconfig' (Linux/Mac) or 'ipconfig' (Windows).
       - LABEL_STUDIO_URL=
       - LABEL_STUDIO_API_KEY=
-      - MAX_FRAMES_TO_TRACK=10
+      # Set MAX_FRAMES_TO_TRACK to 0 or empty for no limit (tracks full video)
+      # Or set to a specific number to limit tracking
+      - MAX_FRAMES_TO_TRACK=0
     ports:
       - "9090:9090"
     deploy:
@@ -47,3 +49,4 @@ services:
               capabilities: [gpu]
     volumes:
       - "./data/server:/data"
+      - ".:/app"  # Mount app directory for CLI access
