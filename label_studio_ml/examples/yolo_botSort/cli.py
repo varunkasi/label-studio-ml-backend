@@ -41,42 +41,62 @@ def arg_parser():
              "String with ids separated by comma: if you provide task ids, "
              "task data will be downloaded automatically from the Label Studio instance. Example: 1,2,3",
     )
+
     parser.add_argument(
-        "--output-dir",
+        "--yolo_botsort",
+        action="store_true",
+        default=False,
+        help="Enable YOLO BotSort multi-object tracker (used for video tracking)"
+    )
+
+    parser.add_argument(
+        "--model_path",
+        type=str,
+        default="yolo11m.pt",
+        help="Path to YOLO model weights file. If not provided, defaults to yolo11m.pt"
+    )
+
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["train", "inference"],
+        default="inference",
+        help="Mode to run: 'train' to train models or 'inference' to run predictions",
+    )
+
+    parser.add_argument(
+        "--model_version",
+        type=str,
+        choices=["UAV_RGB", "UAV_IR", "UAV_RGBr", "UGV_RGB", "UGV_IR", "UGV_THERMAL"],
+        default="UAV_RGB",
+        help="Model version identifier to attach to predictions (for different scenarios)",
+    )
+
+    parser.add_argument(
+        "--classes",
+        type=str,
+        default="Person",
+        help="Comma-separated list of class names to use for training or inference. Example: person,car,dog"
+    )
+
+    parser.add_argument(
+        "--annotation_id",
         type=str,
         default=None,
-        help="Directory to save annotated frames with bounding boxes for debugging (default: ./output_frames)",
+        help="Annotation ID to use for training (if mode is 'train')",
     )
-    parser.add_argument(
-        "--save-frames",
-        action="store_true",
-        help="Save annotated frames with bounding boxes to output directory",
-    )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=None,
-        help="Batch size for processing frames (default: from env GROUNDING_DINO_BATCH_SIZE or 8)",
-    )
+
+    
     return parser.parse_args()
 
 
 class LabelStudioMLPredictor:
-    def __init__(self, ls_url, ls_api_key):
-        # Validate API key
-        if not ls_api_key or ls_api_key.strip() == "" or ls_api_key == "your_api_key":
-            raise ValueError(
-                "LABEL_STUDIO_API_KEY is required. Please set it via environment variable or --ls-api-key argument."
-            )
-
-        # Set environment variables for SDK internal functions (like get_local_path)
-        os.environ.setdefault("LABEL_STUDIO_URL", ls_url)
-        os.environ.setdefault("LABEL_STUDIO_API_KEY", ls_api_key)
-
+    def __init__(self, ls_url, ls_api_key, args):
         self.ls = LabelStudio(base_url=ls_url, api_key=ls_api_key)
+        self.args = args
         logger.info(f"Successfully connected to Label Studio: {ls_url}")
 
-    def run(self, project, tasks, output_dir=None, save_frames=False, batch_size=None):
+    def run(self, project, tasks):
         # initialize Label Studio SDK client
         ls = self.ls
         project = ls.projects.get(id=project)
@@ -86,69 +106,55 @@ class LabelStudioMLPredictor:
 
         # load YOLO model
         # TODO: use get_all_classes_inherited_LabelStudioMLBase to detect model classes
-        model = YOLO(project_id=str(project.id), label_config=project.label_config)
+        
+        # Joshua: load model 
+        if self.args.model_version and self.args.yolo_botsort:
+            model = YOLO(project_id=str(project.id), label_config=project.label_config)
+            model.setup_yoloBotsort(self.args)
+            model.set("model_version", args.model_version)
+            
+
+        else:
+            model = YOLO(project_id=str(project.id), label_config=project.label_config)
         logger.info(f"YOLO ML backend is created")
 
-        # Setup output directory if saving frames
-        if save_frames and not output_dir:
-            output_dir = "./output_frames"
-        
-        if save_frames:
-            logger.info(f"Annotated frames will be saved to: {output_dir}")
+        # Joshua: Run training if mode is 'train'
+        if self.args.mode == "train":
+            logger.info("Starting model training...")
+            for task in tqdm(tasks, desc="Train tasks"):
+                model_path = self.args.model_path
+                model_version = self.args.model_version
+                # load dataset
+                # print(task)
+                annotations_ls = ls.annotations.get(id=args.annotation_id)
+                annotations_ls = annotations_ls.dict()
+                # print(annotations_ls.keys())
 
-        # predict and send prediction to Label Studio
-        for task in tqdm(tasks, desc="Predict tasks"):
-            fps_synced = False
-            response = model.predict(
-                [task],
-                output_dir=output_dir,
-                save_frames=save_frames,
-                batch_size=batch_size,
-            )
-            predictions = self.postprocess_response(model, response, task)
 
-            # send predictions to Label Studio
-            for prediction in predictions:
-                score = prediction.get("score", 0)
-                logger.info(
-                    "Submitting prediction for task %s with score=%.4f",
-                    task.get("id"),
-                    float(score) if isinstance(score, (int, float)) else score,
-                )
-                ls.predictions.create(
-                    task=task["id"],
-                    score=score,
-                    model_version=prediction.get("model_version", "none"),
-                    result=prediction["result"],
-                )
+                classes = [cls.strip() for cls in self.args.classes.split(",")]
+                logger.info(f"Training on task ID: {task['id']} with model path: {model_path} and model version: {model_version}")
+                
+                model.fit("train", task, model_path = model_path, model_version = model_version, classes=classes, annotations_ls=annotations_ls)
 
-            if not fps_synced:
-                fps_synced = self._update_task_fps_if_needed(task)
+            logger.info("Model training is done!")
 
-        logger.info("Model predictions are done!")
-        if save_frames:
-            logger.info(f"Annotated frames saved to: {output_dir}")
+        # Predict mode
+        else:
+            # predict and send prediction to Label Studio
+            for task in tqdm(tasks, desc="Predict tasks"):
+                response = model.predict([task])
+                predictions = self.postprocess_response(model, response, task)
 
-    def _update_task_fps_if_needed(self, task):
-        if not isinstance(task, dict):
-            return False
+                # send predictions to Label Studio
+                for prediction in predictions:
+                    ls.predictions.create(
+                        task=task["id"],
+                        score=prediction.get("score", 0),
+                        model_version=prediction.get("model_version", "none"),
+                        result=prediction["result"],
+                    )
 
-        task_id = task.get("id")
-        task_data = task.get("data")
-        if not task_id or not isinstance(task_data, dict):
-            return False
-
-        fps = task_data.get("fps")
-        if fps is None:
-            return False
-
-        try:
-            self.ls.tasks.update(task_id, data=task_data)
-            logger.info("Updated task %s with fps=%.4f", task_id, fps)
-            return True
-        except Exception as exc:
-            logger.warning("Failed to update task %s with fps: %s", task_id, exc)
-            return False
+            logger.info("Model predictions are done!")
 
     @staticmethod
     def postprocess_response(model, response, task):
@@ -209,11 +215,5 @@ class LabelStudioMLPredictor:
 
 if __name__ == "__main__":
     args = arg_parser()
-    predictor = LabelStudioMLPredictor(args.ls_url, args.ls_api_key)
-    predictor.run(
-        args.project,
-        args.tasks,
-        output_dir=args.output_dir,
-        save_frames=args.save_frames,
-        batch_size=args.batch_size,
-    )
+    predictor = LabelStudioMLPredictor(args.ls_url, args.ls_api_key, args)
+    predictor.run(args.project, args.tasks)

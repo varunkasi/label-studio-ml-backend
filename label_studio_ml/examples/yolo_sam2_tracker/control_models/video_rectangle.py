@@ -8,18 +8,25 @@ from collections import defaultdict
 from control_models.base import ControlModel, MODEL_ROOT
 from label_studio_sdk.label_interface.control_tags import ControlTag
 from typing import List, Dict, Union
+from pathlib import Path
 
 
 logger = logging.getLogger(__name__)
 
+ALLOWED_LABELS = {
+    label.strip().lower()
+    for label in os.getenv("YOLO_ALLOWED_LABELS", "person").split(",")
+    if label.strip()
+}
 
-class VideoRectangleModel(ControlModel):
+
+class VideoRectangleModelYoloBotSort(ControlModel):
     """
     Class representing a RectangleLabels (bounding boxes) control tag for YOLO model.
     """
 
     type = "VideoRectangle"
-    model_path = "yolov8n.pt"
+    model_path = "yolo11m.pt"
 
     @classmethod
     def is_control_matched(cls, control: ControlTag) -> bool:
@@ -56,6 +63,44 @@ class VideoRectangleModel(ControlModel):
             f"Video duration: {duration} seconds, {frame_count} frames, {fps} fps"
         )
         return frame_count, duration
+    
+    def fit(self, data_yaml: str, epochs: int = 50, imgsz: int = 640, batch_size: int = 8, **kwargs) -> Dict:
+        """Train YOLO model on a dataset.
+        
+        Args:
+            dataset_path: Path to dataset in YOLO format
+            epochs: Number of training epochs
+            imgsz: Image size for training
+            batch_size: Batch size for training
+            **kwargs: Additional arguments including model_path and model_version
+            
+        Returns:
+            Dictionary with training results
+        """
+        # Load augmentation config based on model version
+        aug_config = kwargs.get('aug_config', {})  # default empty dict if not provided
+        output_dir = kwargs.get('output_dir', 'runs/train')  # default output
+
+        try:
+            results = self.model.train(
+                data=data_yaml,
+                epochs=epochs,
+                imgsz=imgsz,
+                batch=batch_size,
+                device=0,
+                project=output_dir,
+                **aug_config  # Unpack augmentation parameters from YAML
+            )
+
+            logger.info(f"Training completed successfully. Output saved to {output_dir}")
+
+            return {
+                "status": "success",
+                "results": results,
+            }
+        except Exception as e:
+            logger.error(f"Training failed: {str(e)}")
+            return {"status": "error", "message": str(e)}
 
     def predict_regions(self, path) -> List[Dict]:
         # bounding box parameters
@@ -73,17 +118,27 @@ class VideoRectangleModel(ControlModel):
         tracker = tmp_yaml if tmp_yaml else original
 
         # run model track
+        track_kwargs = {}
+        imgsz_env = os.getenv("YOLO_IMGSZ")
+        if imgsz_env:
+            try:
+                track_kwargs["imgsz"] = int(imgsz_env)
+            except ValueError:
+                logger.warning(
+                    "Invalid YOLO_IMGSZ value '%s'; falling back to model default",
+                    imgsz_env,
+                )
+
         try:
             results = self.model.track(
-                path, conf=conf, iou=iou, tracker=tracker, stream=True
+                path, conf=conf, iou=iou, tracker=tracker, stream=True, **track_kwargs
             )
+            # convert model results to label studio regions while tracker config exists
+            return self.create_video_rectangles(results, path)
         finally:
-            # clean temporary file
+            # clean temporary file after inference completes
             if tmp_yaml and os.path.exists(tmp_yaml):
                 os.remove(tmp_yaml)
-
-        # convert model results to label studio regions
-        return self.create_video_rectangles(results, path)
 
     def create_video_rectangles(self, results, path):
         """Create regions of video rectangles from the yolo tracker results"""
@@ -110,6 +165,8 @@ class VideoRectangleModel(ControlModel):
                 if model_label not in self.label_map:
                     continue
                 output_label = self.label_map[model_label]
+                if output_label.strip().lower() not in ALLOWED_LABELS:
+                    continue
                 track_labels[track_id] = output_label
 
                 box = {
@@ -224,4 +281,4 @@ class VideoRectangleModel(ControlModel):
 
 
 # pre-load and cache default model at startup
-VideoRectangleModel.get_cached_model(VideoRectangleModel.model_path)
+VideoRectangleModelYoloBotSort.get_cached_model(VideoRectangleModelYoloBotSort.model_path)

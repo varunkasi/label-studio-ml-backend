@@ -46,6 +46,16 @@ def arg_parser():
 
 class LabelStudioMLPredictor:
     def __init__(self, ls_url, ls_api_key):
+        # Validate API key
+        if not ls_api_key or ls_api_key.strip() == "" or ls_api_key == "your_api_key":
+            raise ValueError(
+                "LABEL_STUDIO_API_KEY is required. Please set it via environment variable or --ls-api-key argument."
+            )
+
+        # Set environment variables for SDK internal functions (like get_local_path)
+        os.environ.setdefault("LABEL_STUDIO_URL", ls_url)
+        os.environ.setdefault("LABEL_STUDIO_API_KEY", ls_api_key)
+
         self.ls = LabelStudio(base_url=ls_url, api_key=ls_api_key)
         logger.info(f"Successfully connected to Label Studio: {ls_url}")
 

@@ -81,7 +81,7 @@ class ControlModel(BaseModel):
         return target_name
 
     @classmethod
-    def create(cls, mlbackend: LabelStudioMLBase, control: ControlTag):
+    def create(cls, mlbackend: LabelStudioMLBase, control: ControlTag, custom_model_path: str = None):
         """Factory method to create an instance of a specific control model class.
         Args:
             mlbackend (LabelStudioMLBase): The ML backend instance.
@@ -105,10 +105,18 @@ class ControlModel(BaseModel):
             )  # not recommended option, use `model_score_threshold`
             or MODEL_SCORE_THRESHOLD
         )
-        # read `model_path` attribute from the control tag
-        model_path = (
-            ALLOW_CUSTOM_MODEL_PATH and control.attr.get("model_path")
-        ) or cls.model_path
+
+        # Joshua: use custom model path if provided
+        if custom_model_path:
+            model_path = custom_model_path
+            logger.info(f"Using custom model path from argument: {model_path}")
+
+
+        else:
+            # read `model_path` attribute from the control tag
+            model_path = (
+                ALLOW_CUSTOM_MODEL_PATH and control.attr.get("model_path")
+            ) or cls.model_path
 
         model = cls.get_cached_model(model_path)
         model_names = model.names.values()  # class names from the model
@@ -170,6 +178,7 @@ class ControlModel(BaseModel):
         return False
 
     def get_path(self, task):
+        """Get the path to the media file from the task data."""
         task_path = task["data"].get(self.value) or task["data"].get(
             DATA_UNDEFINED_NAME
         )
