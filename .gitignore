@@ -133,17 +133,16 @@ dmypy.json
 
 .idea/
 
-*.jpg
-*.pt
-*.pth
 .DS_Store
-label_studio_ml/examples/segment_anything_2_video/data/server/models/cache.db
+*.pth
+*.pt
 
-# Grounding DINO video artifacts
+# Data folders
 label_studio_ml/examples/grounding_dino_video/output_frames/
-.repoprompt/
 label_studio_ml/examples/yolo_botSort/workspace/utils/app/workspace/temp/
 label_studio_ml/examples/yolo_botSort/workspace/training_results_weights/
 label_studio_ml/examples/yolo_botSort/workspace/autotrain/temp/
-label_studio_ml/examples/yolo_botSort/data/server/models/cache.db
+
+*.jpg
 label_studio_ml/examples/segment_anything_2_video/data/server/models/cache.db
+label_studio_ml/examples/yolo_botSort/data/server/models/cache.db
