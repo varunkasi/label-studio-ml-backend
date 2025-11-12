@@ -143,6 +143,7 @@ label_studio_ml/examples/yolo_botSort/workspace/utils/app/workspace/temp/
 label_studio_ml/examples/yolo_botSort/workspace/training_results_weights/
 label_studio_ml/examples/yolo_botSort/workspace/autotrain/temp/
 
+.repoprompt/
 *.jpg
 label_studio_ml/examples/segment_anything_2_video/data/server/models/cache.db
 label_studio_ml/examples/yolo_botSort/data/server/models/cache.db
