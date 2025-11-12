@@ -19,7 +19,6 @@ logger = logging.getLogger(__name__)
 
 
 DEVICE = os.getenv('DEVICE', 'cuda')
-SEGMENT_ANYTHING_2_REPO_PATH = os.getenv('SEGMENT_ANYTHING_2_REPO_PATH', 'segment-anything-2')
 MODEL_CONFIG = os.getenv('MODEL_CONFIG', 'sam2_hiera_l.yaml')
 MODEL_CHECKPOINT = os.getenv('MODEL_CHECKPOINT', 'sam2_hiera_large.pt')
 MAX_FRAMES_TO_TRACK = int(os.getenv('MAX_FRAMES_TO_TRACK', 10))
@@ -35,7 +34,7 @@ if DEVICE == 'cuda':
 
 
 # build path to the model checkpoint
-sam2_checkpoint = str(pathlib.Path(__file__).parent / SEGMENT_ANYTHING_2_REPO_PATH / "checkpoints" / MODEL_CHECKPOINT)
+sam2_checkpoint = str(pathlib.Path(__file__).parent / "/sam2" / "checkpoints" / MODEL_CHECKPOINT)
 predictor = build_sam2_video_predictor(MODEL_CONFIG, sam2_checkpoint)
 
 
@@ -244,7 +243,14 @@ class NewModel(LabelStudioMLBase):
             f'last frame index: {last_frame_idx}, '
             f'obj_ids: {obj_ids}')
 
-        frames_to_track = MAX_FRAMES_TO_TRACK
+        # Calculate frames to track: from first keyframe to end of video
+        # If MAX_FRAMES_TO_TRACK is set (not None), use it as a limit
+        if MAX_FRAMES_TO_TRACK > 0:
+            frames_to_track = min(MAX_FRAMES_TO_TRACK, frames_count - first_frame_idx)
+            logger.info(f'Tracking limited to {frames_to_track} frames (MAX_FRAMES_TO_TRACK={MAX_FRAMES_TO_TRACK})')
+        else:
+            frames_to_track = frames_count - first_frame_idx
+            logger.info(f'Tracking full video: {frames_to_track} frames from frame {first_frame_idx} to {frames_count}')
 
         # Split the video into frames
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -253,11 +259,12 @@ class NewModel(LabelStudioMLBase):
             # temp_dir = '/tmp/frames'
             # os.makedirs(temp_dir, exist_ok=True)
 
-            # get all frames
+            # get all frames from first keyframe to end of tracking range
+            end_frame = first_frame_idx + frames_to_track
             frames = list(self.split_frames(
                 video_path, temp_dir,
                 start_frame=first_frame_idx,
-                end_frame=last_frame_idx + frames_to_track + 1
+                end_frame=end_frame
             ))
             height, width, _ = frames[0][1].shape
             logger.debug(f'Video width={width}, height={height}')
@@ -279,15 +286,17 @@ class NewModel(LabelStudioMLBase):
                     labels=prompt['labels']
                 )
 
-            sequence = []
+            # Dictionary to store sequences per object (for multi-person tracking)
+            from collections import defaultdict
+            sequences_by_obj = defaultdict(list)
 
             debug_dir = './debug-frames'
             os.makedirs(debug_dir, exist_ok=True)
 
-            logger.info(f'Propagating in video from frame {last_frame_idx} to {last_frame_idx + frames_to_track}')
+            logger.info(f'Propagating in video from frame {first_frame_idx} to {end_frame}')
             for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(
                 inference_state=inference_state,
-                start_frame_idx=last_frame_idx,
+                start_frame_idx=first_frame_idx,
                 max_frame_num_to_track=frames_to_track
             ):
                 real_frame_idx = out_frame_idx + first_frame_idx
@@ -299,38 +308,73 @@ class NewModel(LabelStudioMLBase):
 
                     bbox = self.convert_mask_to_bbox(mask)
                     if bbox:
-                        sequence.append({
+                        # Append to the specific object's sequence
+                        sequences_by_obj[out_obj_id].append({
                             'frame': real_frame_idx + 1,
-                            # 'x': bbox['x'] / width * 100,
-                            # 'y': bbox['y'] / height * 100,
-                            # 'width': bbox['width'] / width * 100,
-                            # 'height': bbox['height'] / height * 100,
                             'x': bbox['x'],
                             'y': bbox['y'],
                             'width': bbox['width'],
                             'height': bbox['height'],
                             'enabled': True,
                             'rotation': 0,
-                            'time': out_frame_idx / fps
+                            'time': real_frame_idx / fps
                         })
 
-            context_result_sequence = context['result'][0]['value']['sequence']
+            # Create a map from obj_id (SAM2 internal ID) to original annotation ID
+            # obj_ids maps original annotation ID -> SAM2 internal ID
+            # We need the reverse: SAM2 internal ID -> original annotation ID
+            reverse_obj_ids = {v: k for k, v in obj_ids.items()}
 
-            prediction = PredictionValue(
-                result=[{
+            # Get keyframes from context (one result per person)
+            context_results = {r['id']: r for r in context['result']}
+
+            # Build separate regions for each tracked person (multi-person tracking)
+            regions = []
+            for sam_obj_id, predicted_sequence in sequences_by_obj.items():
+                # Get the original annotation ID
+                original_obj_id = reverse_obj_ids.get(sam_obj_id)
+
+                if original_obj_id not in context_results:
+                    logger.warning(f'Could not find context result for obj_id {original_obj_id}')
+                    continue
+
+                # Get the original keyframes from context
+                context_result = context_results[original_obj_id]
+                original_keyframes = context_result['value'].get('sequence', [])
+
+                # Get labels from context
+                labels = context_result['value'].get('labels', ['Person'])
+
+                # Merge original keyframes with predicted sequence
+                # Sort by frame number to maintain temporal order
+                merged_sequence = original_keyframes + predicted_sequence
+                merged_sequence = sorted(merged_sequence, key=lambda x: x['frame'])
+
+                # Calculate score (use 1.0 as default for SAM2 tracking)
+                avg_score = 1.0
+
+                region = {
                     'value': {
                         'framesCount': frames_count,
                         'duration': duration,
-                        'sequence': context_result_sequence + sequence,
+                        'sequence': merged_sequence,
+                        'labels': labels,
                     },
                     'from_name': 'box',
                     'to_name': 'video',
                     'type': 'videorectangle',
                     'origin': 'manual',
-                    # TODO: current limitation is tracking only one object
-                    'id': list(all_obj_ids)[0]
-                }]
-            )
-            logger.debug(f'Prediction: {prediction.model_dump()}')
+                    'id': original_obj_id,
+                    'score': avg_score,
+                }
+                regions.append(region)
+                logger.info(
+                    f'Created region for person {original_obj_id}: '
+                    f'{len(original_keyframes)} keyframes + {len(predicted_sequence)} tracked frames = '
+                    f'{len(merged_sequence)} total frames'
+                )
+
+            prediction = PredictionValue(result=regions)
+            logger.debug(f'Prediction with {len(regions)} regions: {prediction.model_dump()}')
 
             return ModelResponse(predictions=[prediction])

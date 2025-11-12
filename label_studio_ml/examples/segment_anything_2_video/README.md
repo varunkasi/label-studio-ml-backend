@@ -75,13 +75,60 @@ For your project, you can use any labeling config with video properties. Here's 
 </View>
 ```
 
-## Known limitations
-- As of 8/11/2024, SAM2 only runs on GPU servers. 
-- Currently, we only support the tracking of one object in video, although SAM2 can support multiple. 
-- Currently, we do not support video segmentation. 
-- No Docker support
+## CLI Usage for Batch Processing
 
-If you want to contribute to this repository to help with some of these limitations, you can submit a PR. 
+You can use the CLI to run SAM2 tracking on tasks with existing annotations (keyframes):
+
+1. Start the Docker container:
+```bash
+docker compose up -d
+```
+
+2. Draw bounding boxes (keyframes) in Label Studio for the people/objects you want to track
+
+3. Run tracking via CLI:
+```bash
+docker compose exec segment_anything_2_video bash -lc '
+export LABEL_STUDIO_HOST=https://app.heartex.com
+export LABEL_STUDIO_URL=https://app.heartex.com
+export LABEL_STUDIO_API_KEY="$LABEL_STUDIO_API_KEY"
+
+python /app/cli.py \
+  --ls-url https://app.heartex.com \
+  --ls-api-key "$LABEL_STUDIO_API_KEY" \
+  --project 198563 \
+  --task 227350954 \
+  --annotation 12345'
+```
+
+### CLI Parameters:
+- `--ls-url`: Label Studio URL (e.g., https://app.heartex.com)
+- `--ls-api-key`: Your Label Studio API key
+- `--project`: Project ID
+- `--task`: Task ID to process
+- `--annotation`: Annotation ID containing keyframes to track
+- `--max-frames`: (Optional) Limit tracking to N frames (default: tracks full video)
+
+### Tracking Strategy:
+- **Multiple keyframes (recommended for long videos)**: Draw boxes at key moments (start, turns, occlusions). SAM2 uses them as guidance points for better tracking accuracy.
+- **Single keyframe**: Draw one box per person at video start. SAM2 tracks forward from there.
+- The model tracks from the first keyframe to the end of the video (or `--max-frames` limit).
+- Supports multi-person tracking: annotate multiple people and track them all simultaneously.
+
+## Configuration
+
+### Environment Variables:
+- `MAX_FRAMES_TO_TRACK`: Set to `0` for no limit (tracks full video), or a specific number to limit frames. Default: `0`
+- `MODEL_CONFIG`: SAM2 model config (default: `configs/sam2.1/sam2.1_hiera_t.yaml`)
+- `MODEL_CHECKPOINT`: SAM2 checkpoint (default: `sam2.1_hiera_tiny.pt`)
+- `DEVICE`: Computing device (default: `cuda`)
+
+## Known limitations
+- As of 8/11/2024, SAM2 only runs on GPU servers.
+- Currently, we do not support video segmentation (only bounding boxes).
+- For very long videos (40,000+ frames), tracking may take significant time. Consider using `--max-frames` to process in chunks.
+
+If you want to contribute to this repository to help with some of these limitations, you can submit a PR.
 
 ## Customization
 
