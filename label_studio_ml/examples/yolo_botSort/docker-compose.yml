@@ -8,7 +8,10 @@ services:
       context: .
       args:
         TEST_ENV: ${TEST_ENV}
+    mem_limit: 16g
+    cpus: 4.0
     environment:
+      - NVIDIA_VISIBLE_DEVICES=0 # allocate GPU 0 and 1 only
       # specify these parameters if you want to use basic auth for the model server
       - BASIC_AUTH_USER=
       - BASIC_AUTH_PASS=
@@ -31,7 +34,7 @@ services:
       # or you can try http://host.docker.internal:<label-studio-port> if you run LS on the same machine
       - LABEL_STUDIO_HOST=https://app.heartex.com
       - LABEL_STUDIO_URL=https://app.heartex.com
-      - LABEL_STUDIO_API_KEY=7d250b9f196375489cb474a4763219bf53318202
+      - LABEL_STUDIO_API_KEY=${LABEL_STUDIO_API_KEY}
 
       # YOLO parameters
 
@@ -51,7 +54,7 @@ services:
     volumes:
       - .:/app
       - ./data/server:/data
-    shm_size: '2g'
+    shm_size: '8g'
 
     deploy:
       resources:

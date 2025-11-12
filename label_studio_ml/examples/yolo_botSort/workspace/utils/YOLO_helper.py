@@ -5,31 +5,43 @@ from tqdm import tqdm
 import yaml
 import uuid
 from pathlib import Path
+from typing import Dict
+import logging
 
+logger = logging.getLogger(__name__)
+if not os.getenv("LOG_LEVEL"):
+    logger.setLevel(logging.INFO)
+
+def delete_folder(folder_path):
+    if os.path.exists(folder_path):
+        shutil.rmtree(folder_path)
+        print(f"Deleted folder: {folder_path}")
+    else:
+        print(f"Folder does not exist: {folder_path}")
 
 def get_augmentation_config(model_version: str) -> Dict: 
     """Load augmentation configuration from YAML file based on model version. 
     Args: model_version: Model version identifier (e.g., 'UAV_RGB', 'UGV_IR') 
     Returns: Dictionary containing augmentation parameters for the model """ 
 
-# Get the directory where this file is located 
-config_path = "workspace/autotrain/augmentations" + f"{model_version}.yaml" 
-if not config_path.exists():
-    logger.warning(
-        f"!!!Augmentation config for '{model_version}' not found at {config_path}. !!!"
-        f"Using default UAV_RGB config."
-    )
-    config_path = Path("workspace/autotrain/augmentations/UAV_RGB.yaml")
-    
-try: 
-    with open(config_path, 'r') as f: 
-        config = yaml.safe_load(f) 
-        logger.info(f"Loaded augmentation config from {config_path}") 
-        return config 
-    
-except Exception as e: 
-    logger.error(f"Failed to load augmentation config: {str(e)}") 
-    return {}
+    # Get the directory where this file is located 
+    config_path = "workspace/autotrain/augmentations" + f"{model_version}.yaml" 
+    if not config_path.exists():
+        logger.warning(
+            f"!!!Augmentation config for '{model_version}' not found at {config_path}. !!!"
+            f"Using default UAV_RGB config."
+        )
+        config_path = Path("workspace/autotrain/augmentations/UAV_RGB.yaml")
+        
+    try: 
+        with open(config_path, 'r') as f: 
+            config = yaml.safe_load(f) 
+            logger.info(f"Loaded augmentation config from {config_path}") 
+            return config 
+        
+    except Exception as e: 
+        logger.error(f"Failed to load augmentation config: {str(e)}") 
+        return {}
 
 
 def generate_unique_dataset_dirs(base_temp_dir="workspace/autotrain/temp"):
@@ -44,14 +56,14 @@ def generate_unique_dataset_dirs(base_temp_dir="workspace/autotrain/temp"):
     """
     unique_id = str(uuid.uuid4())[:8]  # short unique ID
     base_dir = os.path.join(base_temp_dir, unique_id)
-    labels_dir = os.path.join(base_dir, "labels")
-    frames_dir = os.path.join(base_dir, "frames")
+    # labels_dir = os.path.join(base_dir, "labels")
+    # frames_dir = os.path.join(base_dir, "frames")
 
     # Create directories
-    os.makedirs(labels_dir, exist_ok=True)
-    os.makedirs(frames_dir, exist_ok=True)
+    # os.makedirs(labels_dir, exist_ok=True)
+    # os.makedirs(frames_dir, exist_ok=True)
 
-    return labels_dir, frames_dir
+    return base_dir
 
 
 def combine_yolo_datasets(

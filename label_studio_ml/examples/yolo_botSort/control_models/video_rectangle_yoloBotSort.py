@@ -64,7 +64,7 @@ class VideoRectangleModelYoloBotSort(ControlModel):
         )
         return frame_count, duration
     
-    def fit(self, data_yaml: str, epochs: int = 50, imgsz: int = 640, batch_size: int = 8, **kwargs) -> Dict:
+    def fit(self, data_yaml: str, epochs: int = 50, imgsz: int = 640, batch_size: int = 4, **kwargs) -> Dict:
         """Train YOLO model on a dataset.
         
         Args:

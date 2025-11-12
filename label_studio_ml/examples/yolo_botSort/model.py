@@ -243,35 +243,35 @@ class YOLO(LabelStudioMLBase):
             video_path = model.get_path(task) # returns path of media by downloading if needed
 
             # Prepare dataset in YOLO format 
-            # temp_folder = generate_unique_dataset_dirs()
+            temp_folder = generate_unique_dataset_dirs()
 
-            # output_labels_dir, output_frames_dir = convert_labelstudio_to_yolo(
-            #                                         labelstudio_json = annotations_ls,
-            #                                         output_labels_dir = temp_folder + "/labels",
-            #                                         output_frames_dir = temp_folder + "/images",
-            #                                         video_path = video_path,
-            #                                         jpeg_quality = 95,
-            #                                         class_names=None,
-            #                                         save_empty_labels = False,
-            #                                         reencode_video = False,
-            #                                         reencode_fps = None
-            #                                     )
+            output_labels_dir, output_frames_dir = convert_labelstudio_to_yolo(
+                                                    labelstudio_json = annotations_ls,
+                                                    output_labels_dir = temp_folder + "/labels",
+                                                    output_frames_dir = temp_folder + "/images",
+                                                    video_path = video_path,
+                                                    jpeg_quality = 95,
+                                                    class_names=None,
+                                                    save_empty_labels = False,
+                                                    reencode_video = False,
+                                                    reencode_fps = None
+                                                )
 
-            # # Split the dataset into train/val/test and prepare yaml file 
-            # yaml_file_path = combine_yolo_datasets(
-            #     source_dirs=[temp_folder],
-            #     output_dir=temp_folder + '/split',
-            #     train_ratio=0.8,
-            #     val_ratio=0.2,
-            #     test_ratio=0.0,
-            #     skip_empty_labels=True,
-            #     class_names=classes
-            # )
+            # Split the dataset into train/val/test and prepare yaml file 
+            yaml_file_path = combine_yolo_datasets(
+                source_dirs=[temp_folder],
+                output_dir=temp_folder + '/split',
+                train_ratio=0.8,
+                val_ratio=0.2,
+                test_ratio=0.0,
+                skip_empty_labels=True,
+                class_names=classes
+            )
 
 
             # ----- Temporary debugging -----
-            temp_folder = "workspace/autotrain/temp/6b59f269"
-            yaml_file_path = "workspace/autotrain/temp/6b59f269/split/dataset.yaml"
+            # temp_folder = "workspace/autotrain/temp/6b59f269"
+            # yaml_file_path = "workspace/autotrain/temp/6b59f269/split/dataset.yaml"
             # --------
 
             logger.info(f"Training split created")

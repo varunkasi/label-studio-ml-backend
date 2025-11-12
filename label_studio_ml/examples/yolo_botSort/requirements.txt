@@ -5,4 +5,5 @@ numpy<2
 lap==0.5.12
 boto3
 scikit-learn
+tmux
 

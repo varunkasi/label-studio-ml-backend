@@ -1,2 +1,5 @@
 workspace/temp/*
 workspace/autotrain/temp/*
+.env
+run.sh
+cache.db

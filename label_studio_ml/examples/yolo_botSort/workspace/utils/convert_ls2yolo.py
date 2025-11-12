@@ -1,32 +1,38 @@
-import json
 import os
 import cv2
 from tqdm import tqdm
+import subprocess
+import tempfile
 
 
 def convert_labelstudio_to_yolo(
-    labelstudio_json: str,
+    labelstudio_json: dict,
     output_labels_dir: str,
     output_frames_dir: str = None,
     video_path: str = None,
     jpeg_quality: int = 95,
     class_names=None,
-    save_empty_labels: bool = True
+    save_empty_labels: bool = True,
+    reencode_video: bool = False,
+    reencode_fps: float = None
 ):
     """
-    Converts Label Studio video annotations into YOLO format and optionally extracts video frames.
+    Converts Label Studio video annotations (given as a Python dict) into YOLO format 
+    and optionally extracts video frames.
 
     Args:
-        labelstudio_json (str): Path to the Label Studio JSON file.
+        labelstudio_json (dict): Parsed Label Studio JSON data (not a file path).
         output_labels_dir (str): Directory to save YOLO label .txt files.
         output_frames_dir (str, optional): Directory to save extracted video frames. Ignored if `video_path` is None.
         video_path (str, optional): Path to the source video for frame extraction.
         jpeg_quality (int, optional): JPEG quality for frame extraction (0-100). Default is 95.
         class_names (list[str], optional): List of YOLO class names. Default is ["Person"].
         save_empty_labels (bool, optional): Whether to save empty .txt files for frames without labels.
+        reencode_video (bool, optional): Whether to re-encode the video before frame extraction. Default False.
+        reencode_fps (float, optional): Target FPS for re-encoding. If None, original FPS is preserved.
 
     Returns:
-        None
+        tuple[str, Optional[str]]: Paths to (output_labels_dir, output_frames_dir)
     """
     if class_names is None:
         class_names = ["Person"]
@@ -66,20 +72,40 @@ def convert_labelstudio_to_yolo(
         image_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         image_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
         cap.release()
+
+        if reencode_video:
+            print("🔄 Re-encoding video for consistent frame extraction...")
+            temp_dir = tempfile.mkdtemp()
+            reencoded_path = os.path.join(temp_dir, "reencoded_video.mp4")
+            target_fps = reencode_fps if reencode_fps else fps
+            ffmpeg_cmd = [
+                "ffmpeg", "-y", "-i", video_path,
+                "-vf", f"fps={target_fps}",
+                "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+                "-an", reencoded_path
+            ]
+            subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            video_path = reencoded_path
+
+            # Update properties after re-encoding
+            cap = cv2.VideoCapture(video_path)
+            image_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            image_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            cap.release()
+            print(f"✅ Video re-encoded to {target_fps:.2f} FPS ({total_frames} frames)")
     else:
         image_width = 1920
         image_height = 1080
-        total_frames = None  # Infer from annotations
+        total_frames = None
+        fps = None
 
-    # --- Load Label Studio JSON ---
-    with open(labelstudio_json, "r") as f:
-        data = json.load(f)
-
-    if not isinstance(labelstudio_json, dict):
-        data = json.loads(json.dumps(labelstudio_json))
-    else:
-        data = labelstudio_json
+    # --- Use provided Label Studio JSON data ---
+    data = labelstudio_json
+    annotations = data["result"]
     frames_dict_all = {}  # frame_number -> list of YOLO lines
 
     # --- Process annotations ---
@@ -93,7 +119,7 @@ def convert_labelstudio_to_yolo(
                 last_enabled_frame = None
                 continue
 
-            # Interpolate
+            # Interpolate between frames
             if last_enabled_frame is not None:
                 for f in interpolate(last_enabled_frame, frame):
                     class_id = class_names.index(ann["value"]["labels"][0])
@@ -146,3 +172,6 @@ def convert_labelstudio_to_yolo(
     print(f"✅ YOLO annotations saved to {output_labels_dir}/")
     if video_path and output_frames_dir:
         print(f"✅ Video frames saved to {output_frames_dir}/")
+
+    # --- Return output directories ---
+    return output_labels_dir, output_frames_dir
