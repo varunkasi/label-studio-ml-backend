@@ -400,13 +400,27 @@ class NewModel(LabelStudioMLBase):
         logger.debug(f'Object ID mapping: {obj_ids}')
 
         # Calculate frames to track: from first keyframe to end of video
-        # If MAX_FRAMES_TO_TRACK is set (not None), use it as a limit
+        # If MAX_FRAMES_TO_TRACK is set (not None), use it as a hard limit
         if MAX_FRAMES_TO_TRACK > 0:
             frames_to_track = min(MAX_FRAMES_TO_TRACK, frames_count - first_frame_idx)
             logger.info(f'Tracking limited to {frames_to_track} frames (MAX_FRAMES_TO_TRACK={MAX_FRAMES_TO_TRACK})')
         else:
             frames_to_track = frames_count - first_frame_idx
             logger.info(f'Tracking full video: {frames_to_track} frames from frame {first_frame_idx} to {frames_count}')
+        
+        # HARD LIMIT: Prevent SAM2 memory crashes for large videos
+        # SAM2 loads all frames into memory during init_state(), estimate memory usage
+        ESTIMATED_MEMORY_PER_FRAME_GB = 0.003  # ~3MB per frame at 1280x720 (float32)
+        estimated_memory_gb = frames_to_track * ESTIMATED_MEMORY_PER_FRAME_GB
+        MAX_SAFE_MEMORY_GB = 20  # Conservative limit to prevent crashes
+        
+        if estimated_memory_gb > MAX_SAFE_MEMORY_GB:
+            error_msg = (f'❌ SAM2 MEMORY LIMIT EXCEEDED: {frames_to_track} frames require '
+                        f'~{estimated_memory_gb:.1f}GB RAM (limit: {MAX_SAFE_MEMORY_GB}GB).\n'
+                        f'Solution: Set MAX_FRAMES_TO_TRACK environment variable to ≤{int(MAX_SAFE_MEMORY_GB/ESTIMATED_MEMORY_PER_FRAME_GB)} '
+                        f'or process shorter video segments.')
+            logger.error(error_msg)
+            raise RuntimeError(error_msg)
 
         # Split the video into frames using RAM disk for maximum performance
         # Create a unique cache directory based on video path and parameters
@@ -414,6 +428,10 @@ class NewModel(LabelStudioMLBase):
         import platform
         
         video_hash = hashlib.md5(video_path.encode()).hexdigest()[:8]
+        
+        # Include frame range in hash to prevent cache contamination
+        cache_params = f"{video_hash}_{first_frame_idx}_{frames_to_track}"
+        cache_hash = hashlib.md5(cache_params.encode()).hexdigest()[:8]
         
         # Use RAM disk for maximum I/O performance
         system = platform.system()
@@ -424,7 +442,7 @@ class NewModel(LabelStudioMLBase):
         else:
             ram_disk_path = "./video_cache"  # Fallback to regular disk
             
-        cache_dir = os.path.join(ram_disk_path, f'video_{video_hash}')
+        cache_dir = os.path.join(ram_disk_path, f'video_{cache_hash}')
         os.makedirs(cache_dir, exist_ok=True)
         
         logger.info(f'📁 Using high-performance cache directory: {cache_dir}')
