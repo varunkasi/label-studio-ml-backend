@@ -20,6 +20,7 @@ import yaml
 from workspace.utils.convert_ls2yolo import convert_labelstudio_to_yolo
 from workspace.utils.YOLO_helper import get_augmentation_config, generate_unique_dataset_dirs, combine_yolo_datasets, delete_folder
 from datetime import datetime
+import glob
 
 logger = logging.getLogger(__name__)
 if not os.getenv("LOG_LEVEL"):
@@ -49,7 +50,7 @@ class YOLO(LabelStudioMLBase):
 
     def setup(self):
         """Configure any parameters of your model here"""
-        self.set("model_version", "yolo")
+        self.set("model_version", "yolo-botSort")
 
     def detect_control_models(self, custom_model_path = None) -> List[ControlModel]:
         """Detect control models based on the labeling config.
@@ -134,7 +135,16 @@ class YOLO(LabelStudioMLBase):
         logger.info(
             f"Run prediction on {len(tasks)} tasks, project ID = {self.project_id}"
         )
-        control_models = self.detect_control_models()
+
+        model_version = kwargs.get("model_version", "yolo11m.pt")
+
+        # Get weights path based on model version
+        # TODO: Support saving weights from training sessions (and store data on mAP etc.)
+        model_path = f"workspace/autolabel/saved_weights/{model_version}"
+        model_path = glob.glob(os.path.join(model_path, "*.pt"))
+
+        # Creates VideoRectangleModelYoloBotSort instances for each control tag
+        control_models = self.detect_control_models(custom_model_path=model_path)
 
         predictions = []
         for task in tasks:
@@ -284,7 +294,7 @@ class YOLO(LabelStudioMLBase):
             # print(aug_config)
 
             # Setup training output directory: train_weights/model_version_x
-            base_output_dir = "workspace/autotrain/train_weights"
+            base_output_dir = "workspace/autotrain/train_weights" + f"/{model_version}"
             os.makedirs(base_output_dir, exist_ok=True)
             
             base_path = os.path.join(base_output_dir, model_version)

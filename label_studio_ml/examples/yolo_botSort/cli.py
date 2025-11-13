@@ -116,6 +116,9 @@ class LabelStudioMLPredictor:
 
         else:
             model = YOLO(project_id=str(project.id), label_config=project.label_config)
+            model.setup_yoloBotsort(self.args)
+            model.set("model_version", args.model_version)  # Which YOLO version to use (UAV_RGB etc)
+
         logger.info(f"YOLO ML backend is created")
 
         # Joshua: Run training if mode is 'train'
@@ -128,8 +131,6 @@ class LabelStudioMLPredictor:
                 # print(task)
                 annotations_ls = ls.annotations.get(id=args.annotation_id)
                 annotations_ls = annotations_ls.dict()
-                # print(annotations_ls.keys())
-
 
                 classes = [cls.strip() for cls in self.args.classes.split(",")]
                 logger.info(f"Training on task ID: {task['id']} with model path: {model_path} and model version: {model_version}")
@@ -142,7 +143,7 @@ class LabelStudioMLPredictor:
         else:
             # predict and send prediction to Label Studio
             for task in tqdm(tasks, desc="Predict tasks"):
-                response = model.predict([task])
+                response = model.predict([task], model_version = self.args.model_version)
                 predictions = self.postprocess_response(model, response, task)
 
                 # send predictions to Label Studio

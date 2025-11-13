@@ -131,7 +131,12 @@ class VideoRectangleModelYoloBotSort(ControlModel):
 
         try:
             results = self.model.track(
-                path, conf=conf, iou=iou, tracker=tracker, stream=True, **track_kwargs
+                path, 
+                conf=conf, 
+                iou=iou, 
+                tracker=tracker, 
+                stream=True, 
+                **track_kwargs
             )
             # convert model results to label studio regions while tracker config exists
             return self.create_video_rectangles(results, path)
