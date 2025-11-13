@@ -137,8 +137,8 @@ class NewModel(LabelStudioMLBase):
         HEARTBEAT_INTERVAL = 30  # Log every 30 seconds
         DISK_CHECK_INTERVAL = 60  # Check disk space every minute
 
-        # Optimize JPEG quality for faster writes
-        JPEG_QUALITY = 85  # Reduced quality for faster writes
+        # Optimize JPEG quality for faster writes (more aggressive for RAM disk)
+        JPEG_QUALITY = 75  # Further reduced quality for maximum speed on RAM disk
 
         while True:
             # Heartbeat logging for long operations
@@ -408,30 +408,62 @@ class NewModel(LabelStudioMLBase):
             frames_to_track = frames_count - first_frame_idx
             logger.info(f'Tracking full video: {frames_to_track} frames from frame {first_frame_idx} to {frames_count}')
 
-        # Split the video into frames using persistent cache for better performance
+        # Split the video into frames using RAM disk for maximum performance
         # Create a unique cache directory based on video path and parameters
         import hashlib
+        import platform
+        
         video_hash = hashlib.md5(video_path.encode()).hexdigest()[:8]
-        cache_dir = os.path.join('./video_cache', f'video_{video_hash}')
+        
+        # Use RAM disk for maximum I/O performance
+        system = platform.system()
+        if system == "Darwin":  # macOS
+            ram_disk_path = "/tmp/video_cache_ram"  # Use /tmp which is typically memory-backed
+        elif system == "Linux":
+            ram_disk_path = "/dev/shm/video_cache_ram"  # Use shared memory
+        else:
+            ram_disk_path = "./video_cache"  # Fallback to regular disk
+            
+        cache_dir = os.path.join(ram_disk_path, f'video_{video_hash}')
         os.makedirs(cache_dir, exist_ok=True)
         
-        logger.info(f'📁 Using persistent cache directory: {cache_dir}')
+        logger.info(f'📁 Using high-performance cache directory: {cache_dir}')
+        logger.info(f'💾 Platform: {system}, using {"RAM disk" if system in ["Darwin", "Linux"] else "regular disk"}')
         
         # Check if frames are already cached
         cached_frames = len([f for f in os.listdir(cache_dir) if f.endswith('.jpg')])
         if cached_frames >= frames_to_track:
             logger.info(f'✅ Found {cached_frames} cached frames - skipping extraction')
         else:
-            logger.info(f'📥 Extracting frames to cache (found {cached_frames} cached frames)...')
+            logger.info(f'📥 Extracting frames to high-performance cache (found {cached_frames} cached frames)...')
         
-        # Use persistent directory instead of temporary
-        frames = list(self.split_frames(
+        # Extract frames to high-performance cache (streaming, no memory accumulation)
+        # Run split_frames as generator to avoid loading all frames into memory
+        # SAM2 only needs the frames on disk, not in memory
+        frame_generator = self.split_frames(
             video_path, cache_dir,
             start_frame=first_frame_idx,
             end_frame=first_frame_idx + frames_to_track
-        ))
+        )
         
-        height, width, _ = frames[0][1].shape
+        # Consume generator to extract frames to disk without storing in memory
+        extracted_frames = []
+        for frame_filename, frame_data in frame_generator:
+            extracted_frames.append(frame_filename)
+            # Explicitly clean up frame data to prevent memory accumulation
+            del frame_data
+        
+        # Get first frame for dimensions (read from disk to avoid memory usage)
+        if extracted_frames:
+            first_frame_path = extracted_frames[0]
+            first_frame = cv2.imread(first_frame_path)
+            if first_frame is None:
+                raise ValueError(f"Failed to read first frame: {first_frame_path}")
+            height, width, _ = first_frame.shape
+            del first_frame  # Clean up immediately
+        else:
+            raise ValueError("No frames were extracted")
+            
         logger.info(f'📐 Video dimensions: {width}x{height}')
 
         # get inference state
