@@ -77,7 +77,7 @@ def validate_environment():
     logger.info('✅ Environment validation complete')
 
 
-def fetch_task_data(client, project_id: int, task_id: int, annotation_id: int):
+def fetch_task_data(ls, project_id: int, task_id: int, annotation_id: int):
     """Fetch task and annotation data from Label Studio with timeout"""
     logger.info(f'📥 Fetching task {task_id} from project {project_id}...')
     
@@ -86,7 +86,8 @@ def fetch_task_data(client, project_id: int, task_id: int, annotation_id: int):
     
     try:
         # Fetch task
-        task = client.get_task(task_id)
+        task_obj = ls.tasks.get(task_id)
+        task = {"id": task_obj.id, "data": task_obj.data}
         if not task:
             raise CLIError(f'Task {task_id} not found')
         logger.info(f'✅ Task fetched: {task.get("id")}')
@@ -97,19 +98,25 @@ def fetch_task_data(client, project_id: int, task_id: int, annotation_id: int):
         
         # Fetch annotation
         logger.info(f'📥 Fetching annotation {annotation_id}...')
-        annotations = client.get_annotations(task_id)
-        annotation = next((a for a in annotations if a['id'] == annotation_id), None)
+        annotations = ls.annotations.list(task=task_id)
+        annotation = next((a for a in annotations if a.id == annotation_id), None)
         
         if not annotation:
             raise CLIError(f'Annotation {annotation_id} not found in task {task_id}')
         
-        logger.info(f'✅ Annotation fetched: {annotation.get("id")} with {len(annotation.get("result", []))} regions')
+        # Convert annotation to dict format
+        annotation_dict = {
+            "id": annotation.id,
+            "result": annotation.result
+        }
+        
+        logger.info(f'✅ Annotation fetched: {annotation_dict.get("id")} with {len(annotation_dict.get("result", []))} regions')
         
         # Validate annotation has regions
-        if not annotation.get('result'):
+        if not annotation_dict.get('result'):
             raise CLIError(f'Annotation {annotation_id} has no keyframe regions')
         
-        return task, annotation
+        return task, annotation_dict
         
     except TimeoutError:
         logger.error(f'❌ API request timed out after {timeout}s')
@@ -119,12 +126,17 @@ def fetch_task_data(client, project_id: int, task_id: int, annotation_id: int):
         raise CLIError(f'API error: {e}')
 
 
-def upload_prediction(client, task_id: int, prediction_data: dict):
+def upload_prediction(ls, task_id: int, prediction_data: dict):
     """Upload prediction to Label Studio"""
     logger.info(f'📤 Uploading prediction for task {task_id}...')
     
     try:
-        result = client.create_prediction(task_id, **prediction_data)
+        result = ls.predictions.create(
+            task=task_id,
+            score=prediction_data.get('score', 0),
+            model_version=prediction_data.get('model_version', 'none'),
+            result=prediction_data.get('result', [])
+        )
         logger.info(f'✅ Prediction uploaded successfully: ID={result.get("id")}')
         return result
     except Exception as e:
@@ -185,18 +197,18 @@ Examples:
         
         # Initialize Label Studio client
         logger.info('🔗 Connecting to Label Studio...')
-        from label_studio_sdk import Client
+        from label_studio_sdk.client import LabelStudio
         
-        client = Client(url=args.ls_url, api_key=args.ls_api_key)
+        ls = LabelStudio(base_url=args.ls_url, api_key=args.ls_api_key)
         logger.info('✅ Connected to Label Studio')
         
         # Fetch task and annotation data
-        task, annotation = fetch_task_data(client, args.project, args.task, args.annotation)
+        task, annotation = fetch_task_data(ls, args.project, args.task, args.annotation)
         
         # Get label config from project
         logger.info(f'📥 Fetching project configuration...')
-        project = client.get_project(args.project)
-        label_config = project.get('label_config') or project.get('parsed_label_config')
+        project = ls.projects.get(id=args.project)
+        label_config = project.label_config or project.parsed_label_config
         
         if not label_config:
             raise CLIError('Could not fetch label config from project')
@@ -237,7 +249,7 @@ Examples:
         prediction_data = prediction.model_dump() if hasattr(prediction, 'model_dump') else prediction
         
         # Upload prediction
-        upload_prediction(client, args.task, prediction_data)
+        upload_prediction(ls, args.task, prediction_data)
         
         logger.info('='*80)
         logger.info('✅ CLI EXECUTION SUCCESSFUL')
