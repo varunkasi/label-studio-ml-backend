@@ -117,6 +117,14 @@ class NewModel(LabelStudioMLBase):
         if not video.isOpened():
             raise ValueError(f"Could not open video file: {video_path}")
 
+        # Check available disk space before starting
+        import shutil
+        stat = shutil.disk_usage(temp_dir)
+        free_gb = stat.free / 1024**3
+        logger.info(f'💾 Available disk space: {free_gb:.2f}GB')
+        if free_gb < 5:  # Less than 5GB free
+            logger.warning(f'⚠️  Low disk space: {free_gb:.2f}GB free - extraction may fail')
+
         total_frames_in_video = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
         frames_to_extract = end_frame - start_frame
         logger.info(f'📊 Video has {total_frames_in_video} total frames')
@@ -125,7 +133,12 @@ class NewModel(LabelStudioMLBase):
         frame_count = 0
         extracted_count = 0
         last_heartbeat = time.time()
+        last_disk_check = time.time()
         HEARTBEAT_INTERVAL = 30  # Log every 30 seconds
+        DISK_CHECK_INTERVAL = 60  # Check disk space every minute
+
+        # Optimize JPEG quality for faster writes
+        JPEG_QUALITY = 85  # Reduced quality for faster writes
 
         while True:
             # Heartbeat logging for long operations
@@ -133,6 +146,17 @@ class NewModel(LabelStudioMLBase):
             if now - last_heartbeat > HEARTBEAT_INTERVAL:
                 logger.info(f'💓 Heartbeat: Extracted {extracted_count}/{frames_to_extract} frames, reading frame {frame_count}')
                 last_heartbeat = now
+            
+            # Periodic disk space check
+            if now - last_disk_check > DISK_CHECK_INTERVAL:
+                stat = shutil.disk_usage(temp_dir)
+                free_gb = stat.free / 1024**3
+                logger.info(f'💾 Disk space check: {free_gb:.2f}GB free')
+                if free_gb < 2:  # Critical threshold
+                    logger.error(f'❌ Critical: Low disk space ({free_gb:.2f}GB) - stopping extraction')
+                    video.release()
+                    raise RuntimeError(f'Out of disk space: {free_gb:.2f}GB free')
+                last_disk_check = now
 
             # Read a frame from the video
             try:
@@ -158,22 +182,25 @@ class NewModel(LabelStudioMLBase):
                 logger.debug(f'Frame {frame_count}: {frame_filename} already exists')
                 yield frame_filename, frame
             else:
-                # Save the frame as an image file
+                # Save the frame as an image file with optimized quality
                 try:
-                    success_write = cv2.imwrite(frame_filename, frame)
+                    # Use optimized JPEG parameters for faster writes
+                    success_write = cv2.imwrite(frame_filename, frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
                     if not success_write:
                         logger.error(f'❌ Failed to write frame {frame_count} to {frame_filename}')
                         raise IOError(f'cv2.imwrite failed for frame {frame_count}')
                     logger.debug(f'Frame {frame_count}: {frame_filename}')
                 except Exception as e:
                     logger.error(f'❌ Error writing frame {frame_count}: {e}')
-                    # Check disk space
-                    import shutil
+                    # Check disk space on error
                     stat = shutil.disk_usage(temp_dir)
                     free_gb = stat.free / 1024**3
                     logger.error(f'💾 Disk space: {free_gb:.2f}GB free')
                     raise
                 yield frame_filename, frame
+                
+                # Explicitly clean up frame memory to prevent memory leaks
+                del frame
 
             extracted_count += 1
             # Log progress every 10 frames
@@ -381,195 +408,204 @@ class NewModel(LabelStudioMLBase):
             frames_to_track = frames_count - first_frame_idx
             logger.info(f'Tracking full video: {frames_to_track} frames from frame {first_frame_idx} to {frames_count}')
 
-        # Split the video into frames
-        with tempfile.TemporaryDirectory() as temp_dir:
+        # Split the video into frames using persistent cache for better performance
+        # Create a unique cache directory based on video path and parameters
+        import hashlib
+        video_hash = hashlib.md5(video_path.encode()).hexdigest()[:8]
+        cache_dir = os.path.join('./video_cache', f'video_{video_hash}')
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        logger.info(f'📁 Using persistent cache directory: {cache_dir}')
+        
+        # Check if frames are already cached
+        cached_frames = len([f for f in os.listdir(cache_dir) if f.endswith('.jpg')])
+        if cached_frames >= frames_to_track:
+            logger.info(f'✅ Found {cached_frames} cached frames - skipping extraction')
+        else:
+            logger.info(f'📥 Extracting frames to cache (found {cached_frames} cached frames)...')
+        
+        # Use persistent directory instead of temporary
+        frames = list(self.split_frames(
+            video_path, cache_dir,
+            start_frame=first_frame_idx,
+            end_frame=first_frame_idx + frames_to_track
+        ))
+        
+        height, width, _ = frames[0][1].shape
+        logger.info(f'📐 Video dimensions: {width}x{height}')
 
-            # # use persisted dir for debug
-            # temp_dir = '/tmp/frames'
-            # os.makedirs(temp_dir, exist_ok=True)
+        # get inference state
+        logger.info(f'🧠 Initializing SAM2 inference state...')
+        init_start = time.time()
+        try:
+            inference_state = get_inference_state(cache_dir)
+            predictor.reset_state(inference_state)
+            init_elapsed = time.time() - init_start
+            logger.info(f'✅ Inference state initialized (took {init_elapsed:.2f}s)')
+        except Exception as e:
+            logger.error(f'❌ Failed to initialize inference state: {e}')
+            raise
 
-            # get all frames from first keyframe to end of tracking range
-            end_frame = first_frame_idx + frames_to_track
-            frames = list(self.split_frames(
-                video_path, temp_dir,
-                start_frame=first_frame_idx,
-                end_frame=end_frame
-            ))
-            height, width, _ = frames[0][1].shape
-            logger.info(f'📐 Video dimensions: {width}x{height}')
+        logger.info(f'📌 Adding {len(prompts)} tracking prompt(s) to SAM2...')
+        for idx, prompt in enumerate(prompts, 1):
+            # multiply points by the frame size
+            prompt['points'][:, 0] *= width
+            prompt['points'][:, 1] *= height
 
-            # get inference state
-            logger.info(f'🧠 Initializing SAM2 inference state...')
-            init_start = time.time()
-            try:
-                inference_state = get_inference_state(temp_dir)
-                predictor.reset_state(inference_state)
-                init_elapsed = time.time() - init_start
-                logger.info(f'✅ Inference state initialized (took {init_elapsed:.2f}s)')
-            except Exception as e:
-                logger.error(f'❌ Failed to initialize inference state: {e}')
-                raise
-
-            logger.info(f'📌 Adding {len(prompts)} tracking prompt(s) to SAM2...')
-            for idx, prompt in enumerate(prompts, 1):
-                # multiply points by the frame size
-                prompt['points'][:, 0] *= width
-                prompt['points'][:, 1] *= height
-
-                _, out_obj_ids, out_mask_logits = predictor.add_new_points(
-                    inference_state=inference_state,
-                    frame_idx=prompt['frame_idx'],
-                    obj_id=obj_ids[prompt['obj_id']],
-                    points=prompt['points'],
-                    labels=prompt['labels']
-                )
-                logger.info(f'  ✓ Prompt {idx}/{len(prompts)}: frame={prompt["frame_idx"]}, obj_id={prompt["obj_id"]}, points={len(prompt["points"])}')
-
-            logger.info(f'✅ All prompts added successfully')
-
-            # Dictionary to store sequences per object (for multi-person tracking)
-            from collections import defaultdict
-            sequences_by_obj = defaultdict(list)
-
-            debug_dir = './debug-frames'
-            os.makedirs(debug_dir, exist_ok=True)
-
-            logger.info(f'🚀 Starting SAM2 video propagation from frame {first_frame_idx} to {end_frame}')
-            logger.info(f'🎯 Tracking {len(obj_ids)} object(s) across {frames_to_track} frames')
-
-            # Create progress bar for tracking
-            pbar = tqdm(
-                total=frames_to_track,
-                desc="🎥 Tracking frames",
-                unit="frame",
-                ncols=100
-            )
-
-            last_heartbeat = time.time()
-            last_memory_check = time.time()
-            HEARTBEAT_INTERVAL = 30  # seconds
-            MEMORY_CHECK_INTERVAL = 60  # seconds
-            propagation_start = time.time()
-
-            for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(
+            _, out_obj_ids, out_mask_logits = predictor.add_new_points(
                 inference_state=inference_state,
-                start_frame_idx=first_frame_idx,
-                max_frame_num_to_track=frames_to_track
-            ):
-                real_frame_idx = out_frame_idx + first_frame_idx
+                frame_idx=prompt['frame_idx'],
+                obj_id=obj_ids[prompt['obj_id']],
+                points=prompt['points'],
+                labels=prompt['labels']
+            )
+            logger.info(f'  ✓ Prompt {idx}/{len(prompts)}: frame={prompt["frame_idx"]}, obj_id={prompt["obj_id"]}, points={len(prompt["points"])}')
 
-                # Heartbeat logging
-                now = time.time()
-                if now - last_heartbeat > HEARTBEAT_INTERVAL:
-                    elapsed = now - propagation_start
-                    logger.info(f'💓 Heartbeat: Processing frame {real_frame_idx}, '
-                               f'elapsed: {elapsed:.1f}s, progress: {out_frame_idx}/{frames_to_track}')
-                    last_heartbeat = now
+        logger.info(f'✅ All prompts added successfully')
 
-                # Memory monitoring
-                if DEVICE == 'cuda' and now - last_memory_check > MEMORY_CHECK_INTERVAL:
-                    allocated = torch.cuda.memory_allocated(0) / 1024**3
-                    reserved = torch.cuda.memory_reserved(0) / 1024**3
-                    logger.info(f'💾 GPU Memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved')
-                    last_memory_check = now
+        # Dictionary to store sequences per object (for multi-person tracking)
+        from collections import defaultdict
+        sequences_by_obj = defaultdict(list)
 
-                for i, out_obj_id in enumerate(out_obj_ids):
-                    mask = (out_mask_logits[i] > 0.0).cpu().numpy()
+        debug_dir = './debug-frames'
+        os.makedirs(debug_dir, exist_ok=True)
 
-                    # to debug, save the mask as an image
-                    # self.dump_image_with_mask(frames[out_frame_idx][1], mask, f'{debug_dir}/{out_frame_idx:05d}_{out_obj_id}.jpg', obj_id=out_obj_id, random_color=True)
+        logger.info(f'🚀 Starting SAM2 video propagation from frame {first_frame_idx} to {end_frame}')
+        logger.info(f'🎯 Tracking {len(obj_ids)} object(s) across {frames_to_track} frames')
 
-                    bbox = self.convert_mask_to_bbox(mask)
-                    if bbox:
-                        # Append to the specific object's sequence
-                        sequences_by_obj[out_obj_id].append({
-                            'frame': real_frame_idx + 1,
-                            'x': bbox['x'],
-                            'y': bbox['y'],
-                            'width': bbox['width'],
-                            'height': bbox['height'],
-                            'enabled': True,
-                            'rotation': 0,
-                            'time': real_frame_idx / fps
-                        })
+        # Create progress bar for tracking
+        pbar = tqdm(
+            total=frames_to_track,
+            desc="🎥 Tracking frames",
+            unit="frame",
+            ncols=100
+        )
 
-                # Update progress bar
-                pbar.update(1)
-                pbar.set_postfix({
-                    'frame': real_frame_idx + 1,
-                    'objects': len(out_obj_ids)
-                })
+        last_heartbeat = time.time()
+        last_memory_check = time.time()
+        HEARTBEAT_INTERVAL = 30  # seconds
+        MEMORY_CHECK_INTERVAL = 60  # seconds
+        propagation_start = time.time()
 
-            pbar.close()
-            propagation_elapsed = time.time() - propagation_start
-            logger.info(f'✅ Video propagation complete in {propagation_elapsed:.2f}s!')
+        for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(
+            inference_state=inference_state,
+            start_frame_idx=first_frame_idx,
+            max_frame_num_to_track=frames_to_track
+        ):
+            real_frame_idx = out_frame_idx + first_frame_idx
+
+            # Heartbeat logging
+            now = time.time()
+            if now - last_heartbeat > HEARTBEAT_INTERVAL:
+                elapsed = now - propagation_start
+                logger.info(f'💓 Heartbeat: Processing frame {real_frame_idx}, '
+                           f'elapsed: {elapsed:.1f}s, progress: {out_frame_idx}/{frames_to_track}')
+                last_heartbeat = now
+
+            # Memory monitoring
+            if DEVICE == 'cuda' and now - last_memory_check > MEMORY_CHECK_INTERVAL:
+                allocated = torch.cuda.memory_allocated(0) / 1024**3
+                reserved = torch.cuda.memory_reserved(0) / 1024**3
+                logger.info(f'💾 GPU Memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved')
+                last_memory_check = now
+
+            for i, out_obj_id in enumerate(out_obj_ids):
+                mask = (out_mask_logits[i] > 0.0).cpu().numpy()
+
+                # to debug, save the mask as an image
+                # self.dump_image_with_mask(frames[out_frame_idx][1], mask, f'{debug_dir}/{out_frame_idx:05d}_{out_obj_id}.jpg', obj_id=out_obj_id, random_color=True)
+
+                bbox = self.convert_mask_to_bbox(mask)
+                if bbox:
+                    # Append to the specific object's sequence
+                    sequences_by_obj[out_obj_id].append({
+                        'frame': real_frame_idx + 1,
+                        'x': bbox['x'],
+                        'y': bbox['y'],
+                        'width': bbox['width'],
+                        'height': bbox['height'],
+                        'enabled': True,
+                        'rotation': 0,
+                        'time': real_frame_idx / fps
+                    })
+
+            # Update progress bar
+            pbar.update(1)
+            pbar.set_postfix({
+                'frame': real_frame_idx + 1,
+                'objects': len(out_obj_ids)
+            })
+
+        pbar.close()
+        propagation_elapsed = time.time() - propagation_start
+        logger.info(f'✅ Video propagation complete in {propagation_elapsed:.2f}s!')
 
             # Create a map from obj_id (SAM2 internal ID) to original annotation ID
-            # obj_ids maps original annotation ID -> SAM2 internal ID
-            # We need the reverse: SAM2 internal ID -> original annotation ID
-            reverse_obj_ids = {v: k for k, v in obj_ids.items()}
+        # obj_ids maps original annotation ID -> SAM2 internal ID
+        # We need the reverse: SAM2 internal ID -> original annotation ID
+        reverse_obj_ids = {v: k for k, v in obj_ids.items()}
 
-            # Get keyframes from context (one result per person)
-            context_results = {r['id']: r for r in context['result']}
+        # Get keyframes from context (one result per person)
+        context_results = {r['id']: r for r in context['result']}
 
-            # Build separate regions for each tracked person (multi-person tracking)
-            regions = []
-            for sam_obj_id, predicted_sequence in sequences_by_obj.items():
-                # Get the original annotation ID
-                original_obj_id = reverse_obj_ids.get(sam_obj_id)
+        # Build separate regions for each tracked person (multi-person tracking)
+        regions = []
+        for sam_obj_id, predicted_sequence in sequences_by_obj.items():
+            # Get the original annotation ID
+            original_obj_id = reverse_obj_ids.get(sam_obj_id)
 
-                if original_obj_id not in context_results:
-                    logger.warning(f'Could not find context result for obj_id {original_obj_id}')
-                    continue
+            if original_obj_id not in context_results:
+                logger.warning(f'Could not find context result for obj_id {original_obj_id}')
+                continue
 
-                # Get the original keyframes from context
-                context_result = context_results[original_obj_id]
-                original_keyframes = context_result['value'].get('sequence', [])
+            # Get the original keyframes from context
+            context_result = context_results[original_obj_id]
+            original_keyframes = context_result['value'].get('sequence', [])
 
-                # Get labels from context
-                labels = context_result['value'].get('labels', ['Person'])
+            # Get labels from context
+            labels = context_result['value'].get('labels', ['Person'])
 
-                # Merge original keyframes with predicted sequence
-                # Sort by frame number to maintain temporal order
-                merged_sequence = original_keyframes + predicted_sequence
-                merged_sequence = sorted(merged_sequence, key=lambda x: x['frame'])
+            # Merge original keyframes with predicted sequence
+            # Sort by frame number to maintain temporal order
+            merged_sequence = original_keyframes + predicted_sequence
+            merged_sequence = sorted(merged_sequence, key=lambda x: x['frame'])
 
-                # Calculate score (use 1.0 as default for SAM2 tracking)
-                avg_score = 1.0
+            # Calculate score (use 1.0 as default for SAM2 tracking)
+            avg_score = 1.0
 
-                region = {
-                    'value': {
-                        'framesCount': frames_count,
-                        'duration': duration,
-                        'sequence': merged_sequence,
-                        'labels': labels,
-                    },
-                    'from_name': 'box',
-                    'to_name': 'video',
-                    'type': 'videorectangle',
-                    'origin': 'manual',
-                    'id': original_obj_id,
-                    'score': avg_score,
-                }
-                regions.append(region)
-                logger.info(
-                    f'Created region for person {original_obj_id}: '
-                    f'{len(original_keyframes)} keyframes + {len(predicted_sequence)} tracked frames = '
-                    f'{len(merged_sequence)} total frames'
-                )
+            region = {
+                'value': {
+                    'framesCount': frames_count,
+                    'duration': duration,
+                    'sequence': merged_sequence,
+                    'labels': labels,
+                },
+                'from_name': 'box',
+                'to_name': 'video',
+                'type': 'videorectangle',
+                'origin': 'manual',
+                'id': original_obj_id,
+                'score': avg_score,
+            }
+            regions.append(region)
+            logger.info(
+                f'Created region for person {original_obj_id}: '
+                f'{len(original_keyframes)} keyframes + {len(predicted_sequence)} tracked frames = '
+                f'{len(merged_sequence)} total frames'
+            )
 
-            prediction = PredictionValue(result=regions)
-            logger.debug(f'Prediction with {len(regions)} regions: {prediction.model_dump()}')
+        prediction = PredictionValue(result=regions)
+        logger.debug(f'Prediction with {len(regions)} regions: {prediction.model_dump()}')
 
-            logger.info('='*80)
-            logger.info(f'✅ SAM2 TRACKING COMPLETE!')
-            logger.info(f'📊 Summary:')
-            logger.info(f'   • Objects tracked: {len(regions)}')
-            logger.info(f'   • Total frames processed: {frames_to_track}')
-            for region in regions:
-                obj_id = region['id']
-                total_frames = len(region['value']['sequence'])
-                logger.info(f'   • Object {obj_id}: {total_frames} frames')
-            logger.info('='*80)
+        logger.info('='*80)
+        logger.info(f'✅ SAM2 TRACKING COMPLETE!')
+        logger.info(f'📊 Summary:')
+        logger.info(f'   • Objects tracked: {len(regions)}')
+        logger.info(f'   • Total frames processed: {frames_to_track}')
+        for region in regions:
+            obj_id = region['id']
+            total_frames = len(region['value']['sequence'])
+            logger.info(f'   • Object {obj_id}: {total_frames} frames')
+        logger.info('='*80)
 
-            return ModelResponse(predictions=[prediction])
+        return ModelResponse(predictions=[prediction])
