@@ -21,7 +21,7 @@ services:
       # Label Studio connectivity
       - LABEL_STUDIO_HOST=https://app.heartex.com
       - LABEL_STUDIO_URL=https://app.heartex.com
-      - LABEL_STUDIO_API_KEY=
+      - LABEL_STUDIO_API_KEY=${LABEL_STUDIO_API_KEY}
 
       # Grounding DINO configuration
       - GROUNDING_DINO_PROMPT=person

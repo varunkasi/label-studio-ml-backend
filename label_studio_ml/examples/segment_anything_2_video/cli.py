@@ -2,6 +2,7 @@ import os
 import logging
 import json
 import cv2
+from urllib.parse import urljoin
 
 from tqdm import tqdm
 from argparse import ArgumentParser
@@ -175,6 +176,17 @@ class LabelStudioSAM2Predictor:
             if not video_url:
                 logger.warning("Could not find video URL in task data")
                 return None
+
+            # Resolve relative URL if needed
+            if not video_url.startswith("http") and video_url.startswith("/"):
+                host = os.getenv("LABEL_STUDIO_HOST") or os.getenv("LABEL_STUDIO_URL")
+                if host:
+                    video_url = urljoin(host.rstrip("/"), video_url)
+                else:
+                    logger.debug(
+                        "Relative video URL %s found but LABEL_STUDIO_HOST/LABEL_STUDIO_URL is not set",
+                        video_url,
+                    )
 
             # Download/cache video
             video_path = get_local_path(video_url, task_id=task['id'])

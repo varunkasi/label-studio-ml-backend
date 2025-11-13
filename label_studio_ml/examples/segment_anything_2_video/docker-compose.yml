@@ -33,8 +33,9 @@ services:
       # Do not use 'localhost' as it does not work within Docker containers.
       # Use prefix 'http://' or 'https://' for the URL always.
       # Determine the actual IP using 'ifconfig' (Linux/Mac) or 'ipconfig' (Windows).
-      - LABEL_STUDIO_URL=
-      - LABEL_STUDIO_API_KEY=
+      - LABEL_STUDIO_HOST=https://app.heartex.com
+      - LABEL_STUDIO_URL=https://app.heartex.com
+      - LABEL_STUDIO_API_KEY=${LABEL_STUDIO_API_KEY}
       # Set MAX_FRAMES_TO_TRACK to 0 or empty for no limit (tracks full video)
       # Or set to a specific number to limit tracking
       - MAX_FRAMES_TO_TRACK=0

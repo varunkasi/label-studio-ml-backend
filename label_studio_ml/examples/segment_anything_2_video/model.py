@@ -5,6 +5,7 @@ import pathlib
 import cv2
 import tempfile
 import logging
+from urllib.parse import urljoin
 
 from typing import List, Dict, Optional
 from uuid import uuid4
@@ -221,6 +222,17 @@ class NewModel(LabelStudioMLBase):
         task_id = task['id']
         # Get the video URL from the task
         video_url = task['data'][value]
+
+        # Resolve relative URL if needed
+        if not video_url.startswith("http") and video_url.startswith("/"):
+            host = os.getenv("LABEL_STUDIO_HOST") or os.getenv("LABEL_STUDIO_URL")
+            if host:
+                video_url = urljoin(host.rstrip("/"), video_url)
+            else:
+                logger.debug(
+                    "Relative video URL %s found but LABEL_STUDIO_HOST/LABEL_STUDIO_URL is not set",
+                    video_url,
+                )
 
         # cache the video locally
         video_path = get_local_path(video_url, task_id=task_id)
