@@ -5,7 +5,10 @@ import pathlib
 import cv2
 import tempfile
 import logging
+import signal
+import time
 from urllib.parse import urljoin
+from contextlib import contextmanager
 
 from typing import List, Dict, Optional
 from uuid import uuid4
@@ -19,6 +22,49 @@ from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
+@contextmanager
+def timeout_context(seconds, operation_name):
+    """Context manager for operation timeouts using SIGALRM"""
+    def timeout_handler(signum, frame):
+        raise TimeoutError(f"Operation '{operation_name}' timed out after {seconds}s")
+
+    # Set up the signal handler (Unix only)
+    if hasattr(signal, 'SIGALRM'):
+        old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+        signal.alarm(seconds)
+        try:
+            yield
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_handler)
+    else:
+        # Windows fallback - no timeout
+        logger.warning(f'Timeout not supported on this platform for operation: {operation_name}')
+        yield
+
+def check_gpu_health():
+    """Check GPU availability and memory before inference"""
+    if DEVICE == 'cuda':
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA not available but DEVICE=cuda")
+
+        gpu_id = 0
+        props = torch.cuda.get_device_properties(gpu_id)
+        total_memory = props.total_memory / 1024**3  # GB
+        allocated = torch.cuda.memory_allocated(gpu_id) / 1024**3
+        cached = torch.cuda.memory_reserved(gpu_id) / 1024**3
+
+        logger.info(f'🎮 GPU: {props.name}')
+        logger.info(f'💾 GPU Memory: {allocated:.2f}GB allocated, '
+                   f'{cached:.2f}GB reserved, {total_memory:.2f}GB total')
+
+        if allocated > total_memory * 0.9:
+            logger.warning(f'⚠️  GPU memory usage high: {allocated/total_memory*100:.1f}%')
+
+        return True
+    else:
+        logger.info(f'💻 Running on CPU (DEVICE={DEVICE})')
+        return False
 
 DEVICE = os.getenv('DEVICE', 'cuda')
 MODEL_CONFIG = os.getenv('MODEL_CONFIG', 'sam2_hiera_l.yaml')
@@ -60,7 +106,12 @@ class NewModel(LabelStudioMLBase):
     def split_frames(self, video_path, temp_dir, start_frame=0, end_frame=100):
         # Open the video file
         logger.info(f'📹 Opening video file: {video_path}')
-        video = cv2.VideoCapture(video_path)
+
+        try:
+            video = cv2.VideoCapture(video_path)
+        except Exception as e:
+            logger.error(f'❌ Failed to open video with cv2: {e}')
+            raise ValueError(f"Could not open video file: {video_path}") from e
 
         # check if loaded correctly
         if not video.isOpened():
@@ -73,9 +124,23 @@ class NewModel(LabelStudioMLBase):
 
         frame_count = 0
         extracted_count = 0
+        last_heartbeat = time.time()
+        HEARTBEAT_INTERVAL = 30  # Log every 30 seconds
+
         while True:
+            # Heartbeat logging for long operations
+            now = time.time()
+            if now - last_heartbeat > HEARTBEAT_INTERVAL:
+                logger.info(f'💓 Heartbeat: Extracted {extracted_count}/{frames_to_extract} frames, reading frame {frame_count}')
+                last_heartbeat = now
+
             # Read a frame from the video
-            success, frame = video.read()
+            try:
+                success, frame = video.read()
+            except Exception as e:
+                logger.error(f'❌ Exception reading frame {frame_count}: {e}')
+                break
+
             if frame_count < start_frame:
                 frame_count += 1
                 continue
@@ -102,6 +167,11 @@ class NewModel(LabelStudioMLBase):
                     logger.debug(f'Frame {frame_count}: {frame_filename}')
                 except Exception as e:
                     logger.error(f'❌ Error writing frame {frame_count}: {e}')
+                    # Check disk space
+                    import shutil
+                    stat = shutil.disk_usage(temp_dir)
+                    free_gb = stat.free / 1024**3
+                    logger.error(f'💾 Disk space: {free_gb:.2f}GB free')
                     raise
                 yield frame_filename, frame
 
@@ -238,6 +308,13 @@ class NewModel(LabelStudioMLBase):
         logger.info('🎬 SAM2 VIDEO TRACKING STARTED')
         logger.info('='*80)
 
+        # Check GPU health before starting
+        try:
+            check_gpu_health()
+        except Exception as e:
+            logger.error(f'❌ GPU health check failed: {e}')
+            raise
+
         from_name, to_name, value = self.get_first_tag_occurence('VideoRectangle', 'Video')
 
         task = tasks[0]
@@ -261,8 +338,22 @@ class NewModel(LabelStudioMLBase):
 
         # cache the video locally
         logger.info(f'⬇️  Downloading/caching video...')
-        video_path = get_local_path(video_url, task_id=task_id)
-        logger.info(f'💾 Video cached at: {video_path}')
+        download_start = time.time()
+        try:
+            video_path = get_local_path(video_url, task_id=task_id)
+            download_elapsed = time.time() - download_start
+            logger.info(f'💾 Video cached at: {video_path} (took {download_elapsed:.2f}s)')
+
+            # Verify file exists and is readable
+            if not os.path.exists(video_path):
+                raise FileNotFoundError(f'Video file not found after download: {video_path}')
+
+            file_size_mb = os.path.getsize(video_path) / 1024**2
+            logger.info(f'📦 Video file size: {file_size_mb:.2f}MB')
+
+        except Exception as e:
+            logger.error(f'❌ Video download/caching failed: {e}')
+            raise
 
         # get prompts from context
         logger.info(f'🔍 Extracting prompts from annotation context...')
@@ -309,9 +400,15 @@ class NewModel(LabelStudioMLBase):
 
             # get inference state
             logger.info(f'🧠 Initializing SAM2 inference state...')
-            inference_state = get_inference_state(temp_dir)
-            predictor.reset_state(inference_state)
-            logger.info(f'✅ Inference state initialized')
+            init_start = time.time()
+            try:
+                inference_state = get_inference_state(temp_dir)
+                predictor.reset_state(inference_state)
+                init_elapsed = time.time() - init_start
+                logger.info(f'✅ Inference state initialized (took {init_elapsed:.2f}s)')
+            except Exception as e:
+                logger.error(f'❌ Failed to initialize inference state: {e}')
+                raise
 
             logger.info(f'📌 Adding {len(prompts)} tracking prompt(s) to SAM2...')
             for idx, prompt in enumerate(prompts, 1):
@@ -348,12 +445,34 @@ class NewModel(LabelStudioMLBase):
                 ncols=100
             )
 
+            last_heartbeat = time.time()
+            last_memory_check = time.time()
+            HEARTBEAT_INTERVAL = 30  # seconds
+            MEMORY_CHECK_INTERVAL = 60  # seconds
+            propagation_start = time.time()
+
             for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(
                 inference_state=inference_state,
                 start_frame_idx=first_frame_idx,
                 max_frame_num_to_track=frames_to_track
             ):
                 real_frame_idx = out_frame_idx + first_frame_idx
+
+                # Heartbeat logging
+                now = time.time()
+                if now - last_heartbeat > HEARTBEAT_INTERVAL:
+                    elapsed = now - propagation_start
+                    logger.info(f'💓 Heartbeat: Processing frame {real_frame_idx}, '
+                               f'elapsed: {elapsed:.1f}s, progress: {out_frame_idx}/{frames_to_track}')
+                    last_heartbeat = now
+
+                # Memory monitoring
+                if DEVICE == 'cuda' and now - last_memory_check > MEMORY_CHECK_INTERVAL:
+                    allocated = torch.cuda.memory_allocated(0) / 1024**3
+                    reserved = torch.cuda.memory_reserved(0) / 1024**3
+                    logger.info(f'💾 GPU Memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved')
+                    last_memory_check = now
+
                 for i, out_obj_id in enumerate(out_obj_ids):
                     mask = (out_mask_logits[i] > 0.0).cpu().numpy()
 
@@ -382,7 +501,8 @@ class NewModel(LabelStudioMLBase):
                 })
 
             pbar.close()
-            logger.info(f'✅ Video propagation complete!')
+            propagation_elapsed = time.time() - propagation_start
+            logger.info(f'✅ Video propagation complete in {propagation_elapsed:.2f}s!')
 
             # Create a map from obj_id (SAM2 internal ID) to original annotation ID
             # obj_ids maps original annotation ID -> SAM2 internal ID

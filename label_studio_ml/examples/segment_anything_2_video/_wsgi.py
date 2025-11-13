@@ -35,6 +35,49 @@ from model import NewModel
 
 _DEFAULT_CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'config.json')
 
+def validate_startup_environment():
+    """Validate environment before starting server"""
+    logger = logging.getLogger(__name__)
+    logger.info('🔍 Running startup validation...')
+
+    # Check GPU availability if CUDA is configured
+    device = os.getenv('DEVICE', 'cuda')
+    if device == 'cuda':
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                logger.error('❌ CUDA not available but DEVICE=cuda')
+                raise RuntimeError('GPU required but not available')
+            logger.info(f'✅ GPU available: {torch.cuda.get_device_name(0)}')
+        except ImportError:
+            logger.error('❌ PyTorch not installed')
+            raise RuntimeError('PyTorch is required')
+
+    # Check SAM2 model checkpoint exists
+    model_checkpoint = os.getenv('MODEL_CHECKPOINT', 'sam2_hiera_large.pt')
+    checkpoint_path = f'/sam2/checkpoints/{model_checkpoint}'
+    if not os.path.exists(checkpoint_path):
+        logger.warning(f'⚠️  SAM2 checkpoint not found at {checkpoint_path}')
+        logger.info(f'Model will attempt to download on first use')
+    else:
+        logger.info(f'✅ SAM2 checkpoint found: {checkpoint_path}')
+
+    # Check Label Studio connectivity
+    ls_host = os.getenv('LABEL_STUDIO_HOST') or os.getenv('LABEL_STUDIO_URL')
+    ls_api_key = os.getenv('LABEL_STUDIO_API_KEY')
+
+    if not ls_host:
+        logger.warning('⚠️  LABEL_STUDIO_HOST/LABEL_STUDIO_URL not set')
+    else:
+        logger.info(f'✅ Label Studio URL configured: {ls_host}')
+
+    if not ls_api_key:
+        logger.warning('⚠️  LABEL_STUDIO_API_KEY not set')
+    else:
+        logger.info(f'✅ Label Studio API key configured')
+
+    logger.info('✅ Startup validation complete')
+
 
 def get_kwargs_from_config(config_path=_DEFAULT_CONFIG_PATH):
     if not os.path.exists(config_path):
@@ -111,6 +154,7 @@ if __name__ == "__main__":
 
     if args.check:
         print('Check "' + NewModel.__name__ + '" instance creation..')
+        validate_startup_environment()
         model = NewModel(**kwargs)
 
     app = init_app(model_class=NewModel, basic_auth_user=args.basic_auth_user, basic_auth_pass=args.basic_auth_pass)
@@ -119,4 +163,10 @@ if __name__ == "__main__":
 
 else:
     # for uWSGI use
+    try:
+        validate_startup_environment()
+    except Exception as e:
+        logging.getLogger(__name__).error(f'❌ Startup validation failed: {e}')
+        # Continue anyway for uWSGI - errors will be caught on first request
+
     app = init_app(model_class=NewModel)
