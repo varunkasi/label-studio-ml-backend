@@ -8,6 +8,14 @@ services:
         TEST_ENV: ${TEST_ENV:-}
         BASE_IMAGE: ${BASE_IMAGE:-}
         SAM2_REF: ${SAM2_REF:-main}
+    # Memory and shared memory limits for video processing
+    # mem_limit: Maximum memory the container can use (prevents system crashes)
+    # shm_size: Shared memory size (critical for video frame processing and GPU operations)
+    #   - Default Docker shm is only 64MB which causes hangs during cv2.imwrite
+    #   - Increase if processing very large videos or experiencing memory errors
+    #   - Adjust based on your system RAM (24g mem_limit and 16g shm_size for systems with 32GB+ RAM)
+    mem_limit: 24g
+    shm_size: '16g'
     environment:
       # specify these parameters if you want to use basic auth for the model server
       - BASIC_AUTH_USER=
