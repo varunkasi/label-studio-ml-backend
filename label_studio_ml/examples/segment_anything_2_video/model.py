@@ -94,8 +94,15 @@ class NewModel(LabelStudioMLBase):
                 yield frame_filename, frame
             else:
                 # Save the frame as an image file
-                cv2.imwrite(frame_filename, frame)
-                logger.debug(f'Frame {frame_count}: {frame_filename}')
+                try:
+                    success_write = cv2.imwrite(frame_filename, frame)
+                    if not success_write:
+                        logger.error(f'❌ Failed to write frame {frame_count} to {frame_filename}')
+                        raise IOError(f'cv2.imwrite failed for frame {frame_count}')
+                    logger.debug(f'Frame {frame_count}: {frame_filename}')
+                except Exception as e:
+                    logger.error(f'❌ Error writing frame {frame_count}: {e}')
+                    raise
                 yield frame_filename, frame
 
             extracted_count += 1
