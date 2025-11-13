@@ -98,11 +98,10 @@ def fetch_task_data(ls, project_id: int, task_id: int, annotation_id: int):
         
         # Fetch annotation
         logger.info(f'📥 Fetching annotation {annotation_id}...')
-        annotations = ls.annotations.list(task=task_id)
-        annotation = next((a for a in annotations if a.id == annotation_id), None)
+        annotation = ls.annotations.get(id=annotation_id)
         
         if not annotation:
-            raise CLIError(f'Annotation {annotation_id} not found in task {task_id}')
+            raise CLIError(f'Annotation {annotation_id} not found')
         
         # Convert annotation to dict format
         annotation_dict = {
