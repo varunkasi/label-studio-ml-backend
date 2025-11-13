@@ -14,7 +14,8 @@ RUN --mount=type=cache,target="/var/cache/apt",sharing=locked \
     && apt-get install -y curl \
     && apt-get install -y g++ freeglut3-dev build-essential libx11-dev \
     libxmu-dev libxi-dev libglu1-mesa libglu1-mesa-dev libfreeimage-dev \
-    && apt-get -y install ffmpeg libsm6 libxext6 libffi-dev python3-dev python3-pip gcc
+    && apt-get -y install ffmpeg libsm6 libxext6 libffi-dev python3-dev python3-pip gcc \
+    && apt-get install -y tmux 
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \

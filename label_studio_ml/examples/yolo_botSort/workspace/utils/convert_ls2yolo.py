@@ -3,6 +3,7 @@ import cv2
 from tqdm import tqdm
 import subprocess
 import tempfile
+import re
 
 
 def convert_labelstudio_to_yolo(
@@ -80,17 +81,42 @@ def convert_labelstudio_to_yolo(
             temp_dir = tempfile.mkdtemp()
             reencoded_path = os.path.join(temp_dir, "reencoded_video.mp4")
             target_fps = reencode_fps if reencode_fps else fps
+
             ffmpeg_cmd = [
                 "ffmpeg", "-y", "-i", video_path,
                 "-vf", f"fps={target_fps}",
                 "-c:v", "libx264", "-preset", "fast", "-crf", "18",
                 "-an", reencoded_path
             ]
-            subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            video_path = reencoded_path
+
+            # Launch ffmpeg and capture stderr for progress updates
+            process = subprocess.Popen(
+                ffmpeg_cmd,
+                stderr=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                universal_newlines=True,
+                bufsize=1
+            )
+
+            # tqdm progress bar
+            pbar = tqdm(total=total_frames, desc="Re-encoding", unit="frame")
+            frame_pattern = re.compile(r"frame=\s*(\d+)")
+
+            for line in process.stderr:
+                match = frame_pattern.search(line)
+                if match:
+                    frame = int(match.group(1))
+                    pbar.n = frame
+                    pbar.refresh()
+
+            process.wait()
+            pbar.close()
+
+            if process.returncode != 0:
+                raise RuntimeError("❌ ffmpeg re-encoding failed")
 
             # Update properties after re-encoding
-            cap = cv2.VideoCapture(video_path)
+            cap = cv2.VideoCapture(reencoded_path)
             image_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             image_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))

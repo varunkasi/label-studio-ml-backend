@@ -1,5 +1,6 @@
 workspace/temp/*
 workspace/autotrain/temp/*
+workspace/autotrain/train_weights/*
 .env
 run.sh
 cache.db

@@ -253,7 +253,7 @@ class YOLO(LabelStudioMLBase):
                                                     jpeg_quality = 95,
                                                     class_names=None,
                                                     save_empty_labels = False,
-                                                    reencode_video = False,
+                                                    reencode_video = True,
                                                     reencode_fps = None
                                                 )
 
@@ -305,6 +305,6 @@ class YOLO(LabelStudioMLBase):
             training_result = model.fit(data_yaml = yaml_file_path, **kwargs)
 
             # TODO: Cleanup files (downloaded video, dataset split, etc.)
-            # delete_folder(temp_folder)
+            delete_folder(temp_folder)
 
         return results

@@ -8,7 +8,8 @@ services:
       context: .
       args:
         TEST_ENV: ${TEST_ENV}
-    mem_limit: 16g
+    mem_limit: 32g
+    shm_size: '1g'
     cpus: 4.0
     environment:
       - NVIDIA_VISIBLE_DEVICES=0 # allocate GPU 0 and 1 only
@@ -21,7 +22,7 @@ services:
       - ANY=PARAMETER
       # specify the number of workers and threads for the model server
       - WORKERS=1
-      - THREADS=8
+      - THREADS=2
       # specify the model directory (likely you don't need to change this)
       - MODEL_DIR=/data/models
       - PYTHONPATH=/app
@@ -54,7 +55,6 @@ services:
     volumes:
       - .:/app
       - ./data/server:/data
-    shm_size: '8g'
 
     deploy:
       resources:

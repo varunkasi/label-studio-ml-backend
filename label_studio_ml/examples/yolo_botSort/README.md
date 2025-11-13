@@ -36,27 +36,72 @@ making it easier to annotate large datasets and ensure high-quality predictions.
 
 ## Table of Contents
 
-1. [YOLO ML backend for Label Studio](#yolo-ml-backend-for-label-studio)
-    1. [Supported Features](#supported-features)
-    1. [Before you begin](#before-you-begin)
-    1. [Quick start](#quick-start)
-    1. [Labeling configurations](#labeling-configurations)
-    1. [Supported YOLO Versions: YOLOv5, YOLO11, and others](#supported-yolo-versions-yolov5-yolo11-and-others)
-    1. [Your own custom YOLO models](#your-own-custom-yolo-models)
-    1. [Training](#training)
-    1. [Classification using `<Choices>`](#classification-using-choices)
-    1. [Object detection using `RectangleLabels`](#object-detection-using-rectanglelabels)
-    1. [Segmentation using `PolygonLabels`](#segmentation-using-polygonlabels)
-    1. [Keypoint detection using `KeyPointLabels`](#keypoint-detection-using-keypointlabels)
-    1. [Video object tracking using `VideoRectangle`](#video-object-tracking-using-videorectangle)
-    1. [Video temporal classification using `TimelineLabels`](#video-temporal-classification-using-timelinelabels)
-1. [Run the YOLO ML backend](#run-the-yolo-ml-backend)
-    1. [Running with Docker (recommended)](#running-with-docker-recommended)
-    1. [Building from source (advanced)](#building-from-source-advanced)
-    1. [Running without Docker (advanced)](#running-without-docker-advanced)
-    1. [Parameters](#parameters)
-    1. [Command line interface for the terminal](#command-line-interface-for-the-terminal)
-1. [For developers](#for-developers)
+- [YOLO ML backend for Label Studio](#yolo-ml-backend-for-label-studio)
+  - [Table of Contents](#table-of-contents)
+  - [Supported Features](#supported-features)
+  - [Before you begin](#before-you-begin)
+  - [Quick start](#quick-start)
+  - [Labeling configurations](#labeling-configurations)
+    - [Supported object \& control tags](#supported-object--control-tags)
+    - [Mixed object and control tags](#mixed-object-and-control-tags)
+    - [Label and choice mapping](#label-and-choice-mapping)
+  - [Supported YOLO Versions: YOLOv5, YOLO11, and others](#supported-yolo-versions-yolov5-yolo11-and-others)
+  - [Your own custom YOLO models](#your-own-custom-yolo-models)
+    - [Step 0: Install Label Studio and clone this Github repository](#step-0-install-label-studio-and-clone-this-github-repository)
+    - [Step 1: Prepare your custom YOLOv8 model](#step-1-prepare-your-custom-yolov8-model)
+    - [Step 2: Place your model](#step-2-place-your-model)
+    - [Step 3: Ensure environment variables are set correctly](#step-3-ensure-environment-variables-are-set-correctly)
+    - [Step 4: Update your Labeling Configuration in Label Studio](#step-4-update-your-labeling-configuration-in-label-studio)
+    - [Step 5: Restart the ML Backend](#step-5-restart-the-ml-backend)
+    - [Step 6: Connect the ML Backend to your Label Studio project](#step-6-connect-the-ml-backend-to-your-label-studio-project)
+    - [Step 7: Test your setup](#step-7-test-your-setup)
+    - [Common pitfalls](#common-pitfalls)
+  - [Training](#training)
+    - [Notes](#notes)
+  - [Classification using `<Choices>`](#classification-using-choices)
+    - [Labeling config](#labeling-config)
+    - [Parameters](#parameters)
+    - [Default model](#default-model)
+  - [Object detection using `RectangleLabels`](#object-detection-using-rectanglelabels)
+    - [Labeling config](#labeling-config-1)
+    - [Parameters](#parameters-1)
+    - [Default model](#default-model-1)
+    - [Oriented Bounding Boxes (YOLO OBB)](#oriented-bounding-boxes-yolo-obb)
+  - [Segmentation using `PolygonLabels`](#segmentation-using-polygonlabels)
+    - [Labeling config](#labeling-config-2)
+    - [Parameters](#parameters-2)
+    - [Default model](#default-model-2)
+  - [Keypoint detection using `KeyPointLabels`](#keypoint-detection-using-keypointlabels)
+    - [Labeling config](#labeling-config-3)
+    - [Parameters](#parameters-3)
+    - [Default model](#default-model-3)
+    - [Grouping keypoints with bounding boxes](#grouping-keypoints-with-bounding-boxes)
+    - [Point mapping](#point-mapping)
+    - [Recommendations](#recommendations)
+  - [Video object tracking using `VideoRectangle`](#video-object-tracking-using-videorectangle)
+    - [Labeling config](#labeling-config-4)
+    - [Trackers](#trackers)
+    - [Parameters for bounding boxes](#parameters-for-bounding-boxes)
+    - [Parameters for trackers](#parameters-for-trackers)
+    - [Default model](#default-model-4)
+    - [Recommendations](#recommendations-1)
+  - [Video temporal classification using `TimelineLabels`](#video-temporal-classification-using-timelinelabels)
+    - [Labeling config](#labeling-config-5)
+    - [Model training](#model-training)
+    - [Default model](#default-model-5)
+  - [Run the YOLO ML backend](#run-the-yolo-ml-backend)
+    - [Running with Docker (recommended)](#running-with-docker-recommended)
+    - [Building from source (advanced)](#building-from-source-advanced)
+    - [Running without Docker (advanced)](#running-without-docker-advanced)
+    - [Parameters](#parameters-4)
+  - [Command line interface for the terminal](#command-line-interface-for-the-terminal)
+    - [Overview](#overview)
+    - [When to use the CLI](#when-to-use-the-cli)
+    - [How it works](#how-it-works)
+    - [Usage](#usage)
+    - [Parameters](#parameters-5)
+    - [Logging](#logging)
+  - [For developers](#for-developers)
 
 For a more detailed table of contents, you can use GitHub's native menu located at the top-right corner <img src="https://github.com/user-attachments/assets/049b052b-da87-48bb-9c8c-53f7bce704f4" width="35px">.
 
@@ -64,7 +109,7 @@ For a more detailed table of contents, you can use GitHub's native menu located 
 ## Supported Features
 
 | YOLO Task Name                                               | LS Control Tag                       | Prediction Supported | LS Import Supported | LS Export Supported |
-|--------------------------------------------------------------|--------------------------------------|----------------------|---------------------|---------------------|
+| ------------------------------------------------------------ | ------------------------------------ | -------------------- | ------------------- | ------------------- |
 | Object Detection                                             | `<RectangleLabels>`                  | ✅                    | YOLO, COCO          | YOLO, COCO          |
 | Oriented Bounding Boxes (OBB)                                | `<RectangleLabels model_obb="true">` | ✅                    | YOLO                | YOLO                |
 | Image Instance Segmentation: Polygons                        | `<PolygonLabels>`                    | ✅                    | COCO                | YOLO, COCO          |
@@ -421,8 +466,26 @@ The ML backend should now use your custom model to generate predictions.
 
 ## Training
 
-The current Label Studio ML backend doesn't support training YOLO models. You have to do it manually on your side.
-Or you can contribute to this repository and add training support for this ML backend.
+This ML backend now supports **training YOLO models directly through cli.py**. 
+
+### Notes
+> **⚙️ System Memory Note:**  
+> When running YOLO training inside Docker, it is strongly recommended to specify `mem_limit` in your `docker-compose.yml` or Docker run command.  
+> Insufficient RAM may cause training to crash and potentially hang your PC.
+>
+> Example configuration:
+>
+> ```yaml
+> services:
+>   yolo:
+>     container_name: yolo_backend
+>     build: .
+>     shm_size: "1g"
+>     mem_limit: "32g"
+> ```
+>
+> Adjust these values according to your available system RAM and GPU memory.
+
 
 <br>
 
@@ -455,7 +518,7 @@ https://github.com/user-attachments/assets/30c5ce43-2c89-4ddf-a77d-9d1d75ac3419
 ### Parameters
 
 | Parameter               | Type   | Default | Description                                                                                                                                                                                                                                                                                                                                                                  |
-|-------------------------|--------|---------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| ----------------------- | ------ | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `model_score_threshold` | float  | 0.5     | Sets the minimum confidence threshold for detections. Objects detected with confidence below this threshold will be disregarded. Adjusting this value can help reduce false positives.                                                                                                                                                                                       |
 | `model_path`            | string | None    | Path to the custom YOLO model. See more in the section [Your own custom YOLO models](#your-own-custom-yolo-models).                                                                                                                                                                                                                                                          |
 | `choice`                | string | single  | Possible values: `single`, `single-radio`, `multiple`. If you use `choice="single"` (default) you can select only one label. The ML backend will return the label with the highest confidence using argmax strategy. If you use `choice="multiple"` you can select multiple labels. The ML backend will return all labels with confidence above the `model_score_threshold`. |
@@ -503,7 +566,7 @@ https://github.com/user-attachments/assets/413b4650-422d-43dc-809d-51c08f0ad434
 ### Parameters
 
 | Parameter               | Type   | Default | Description                                                                                                                                                                            |
-|-------------------------|--------|---------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| ----------------------- | ------ | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `model_score_threshold` | float  | 0.5     | Sets the minimum confidence threshold for detections. Objects detected with confidence below this threshold will be disregarded. Adjusting this value can help reduce false positives. |
 | `model_path`            | string | None    | Path to the custom YOLO model. See more in the section [Your own custom YOLO models](#your-own-custom-yolo-models).                                                                    |
 | `model_obb`             | bool   | False   | Enables Oriented Bounding Boxes (OBB) mode. Typically it uses `*-obb.pt` yolo models.                                                                                                  |
@@ -562,7 +625,7 @@ https://github.com/user-attachments/assets/9b2447d3-392d-42be-bc7f-ef2b6c81d54c
 ### Parameters
 
 | Parameter               | Type   | Default | Description                                                                                                                                                                            |
-|-------------------------|--------|---------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| ----------------------- | ------ | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `model_score_threshold` | float  | 0.5     | Sets the minimum confidence threshold for detections. Objects detected with confidence below this threshold will be disregarded. Adjusting this value can help reduce false positives. |
 | `model_path`            | string | None    | Path to the custom YOLO model. See more in the section [Your own custom YOLO models](#your-own-custom-yolo-models).                                                                    |
 
@@ -640,7 +703,7 @@ More info: [Ultralytics YOLO Keypoint Documentation](https://docs.ultralytics.co
 ### Parameters
 
 | Parameter               | Type   | Default | Description                                                                                                                                                                    |
-|-------------------------|--------|---------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| ----------------------- | ------ | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `model_path`            | string | None    | Path to the custom YOLO model. See more in the section [Your own custom YOLO models](#your-own-custom-yolo-models).                                                            |
 | `model_score_threshold` | float  | 0.5     | Sets the minimum confidence threshold for bounding box detections. Keypoints that are related to the detected bbox with a confidence below this threshold will be disregarded. |
 | `model_point_threshold` | float  | 0.0     | Minimum confidence threshold for keypoints. Keypoints with confidence below this value will be ignored.                                                                        |
@@ -810,7 +873,7 @@ Read more about these parameters:
 https://docs.ultralytics.com/modes/track/?h=track#tracking-arguments
 
 | Parameter       | Type   | Default   | Description                                                                                                                                                                            |
-|-----------------|--------|-----------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| --------------- | ------ | --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `model_conf`    | float  | 0.25      | Sets the minimum confidence threshold for detections. Objects detected with confidence below this threshold will be disregarded. Adjusting this value can help reduce false positives. |
 | `model_iou`     | float  | 0.7       | Intersection Over Union (IoU) threshold for Non-Maximum Suppression (NMS). Lower values result in fewer detections by eliminating overlapping boxes, useful for reducing duplicates.   |
 | `model_tracker` | string | `botsort` | Sets the tracker to use for multi-object tracking. Options include `botsort`, `bytetrack`, or a custom YAML file.                                                                      |
