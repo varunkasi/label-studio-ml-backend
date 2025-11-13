@@ -15,6 +15,7 @@ from label_studio_sdk._extensions.label_studio_tools.core.utils.io import get_lo
 from label_studio_sdk.label_interface.objects import PredictionValue
 from PIL import Image
 from sam2.build_sam import build_sam2, build_sam2_video_predictor
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -58,28 +59,32 @@ class NewModel(LabelStudioMLBase):
 
     def split_frames(self, video_path, temp_dir, start_frame=0, end_frame=100):
         # Open the video file
-        logger.debug(f'Opening video file: {video_path}')
+        logger.info(f'📹 Opening video file: {video_path}')
         video = cv2.VideoCapture(video_path)
 
         # check if loaded correctly
         if not video.isOpened():
             raise ValueError(f"Could not open video file: {video_path}")
-        else:
-            # display number of frames
-            logger.debug(f'Number of frames: {int(video.get(cv2.CAP_PROP_FRAME_COUNT))}')
+
+        total_frames_in_video = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
+        frames_to_extract = end_frame - start_frame
+        logger.info(f'📊 Video has {total_frames_in_video} total frames')
+        logger.info(f'🎬 Extracting frames {start_frame} to {end_frame} ({frames_to_extract} frames)')
 
         frame_count = 0
+        extracted_count = 0
         while True:
             # Read a frame from the video
             success, frame = video.read()
             if frame_count < start_frame:
+                frame_count += 1
                 continue
-            if frame_count + start_frame >= end_frame:
+            if frame_count >= end_frame:
                 break
 
             # If frame is read correctly, success is True
             if not success:
-                logger.error(f'Failed to read frame {frame_count}')
+                logger.error(f'❌ Failed to read frame {frame_count}')
                 break
 
             # Generate a filename for the frame using the pattern with frame number: '%05d.jpg'
@@ -93,10 +98,16 @@ class NewModel(LabelStudioMLBase):
                 logger.debug(f'Frame {frame_count}: {frame_filename}')
                 yield frame_filename, frame
 
+            extracted_count += 1
+            # Log progress every 10 frames
+            if extracted_count % 10 == 0:
+                logger.info(f'⏳ Extracted {extracted_count}/{frames_to_extract} frames...')
+
             frame_count += 1
 
         # Release the video object
         video.release()
+        logger.info(f'✅ Frame extraction complete: {extracted_count} frames extracted')
 
     def get_prompts(self, context) -> List[Dict]:
         logger.debug(f'Extracting keypoints from context: {context}')
@@ -216,12 +227,19 @@ class NewModel(LabelStudioMLBase):
     def predict(self, tasks: List[Dict], context: Optional[Dict] = None, **kwargs) -> ModelResponse:
         """ Returns the predicted mask for a smart keypoint that has been placed."""
 
+        logger.info('='*80)
+        logger.info('🎬 SAM2 VIDEO TRACKING STARTED')
+        logger.info('='*80)
+
         from_name, to_name, value = self.get_first_tag_occurence('VideoRectangle', 'Video')
 
         task = tasks[0]
         task_id = task['id']
+        logger.info(f'📋 Processing task ID: {task_id}')
+
         # Get the video URL from the task
         video_url = task['data'][value]
+        logger.info(f'🔗 Video URL: {video_url}')
 
         # Resolve relative URL if needed
         if not video_url.startswith("http") and video_url.startswith("/"):
@@ -235,10 +253,12 @@ class NewModel(LabelStudioMLBase):
                 )
 
         # cache the video locally
+        logger.info(f'⬇️  Downloading/caching video...')
         video_path = get_local_path(video_url, task_id=task_id)
-        logger.debug(f'Video path: {video_path}')
+        logger.info(f'💾 Video cached at: {video_path}')
 
         # get prompts from context
+        logger.info(f'🔍 Extracting prompts from annotation context...')
         prompts = self.get_prompts(context)
         all_obj_ids = set(p['obj_id'] for p in prompts)
         # create a map from obj_id to integer
@@ -249,11 +269,10 @@ class NewModel(LabelStudioMLBase):
         frames_count, duration = self._get_fps(context)
         fps = frames_count / duration
 
-        logger.debug(
-            f'Number of prompts: {len(prompts)}, '
-            f'first frame index: {first_frame_idx}, '
-            f'last frame index: {last_frame_idx}, '
-            f'obj_ids: {obj_ids}')
+        logger.info(
+            f'📍 Found {len(prompts)} prompt(s) for {len(obj_ids)} object(s), '
+            f'keyframes range: [{first_frame_idx}, {last_frame_idx}]')
+        logger.debug(f'Object ID mapping: {obj_ids}')
 
         # Calculate frames to track: from first keyframe to end of video
         # If MAX_FRAMES_TO_TRACK is set (not None), use it as a limit
@@ -279,13 +298,16 @@ class NewModel(LabelStudioMLBase):
                 end_frame=end_frame
             ))
             height, width, _ = frames[0][1].shape
-            logger.debug(f'Video width={width}, height={height}')
+            logger.info(f'📐 Video dimensions: {width}x{height}')
 
             # get inference state
+            logger.info(f'🧠 Initializing SAM2 inference state...')
             inference_state = get_inference_state(temp_dir)
             predictor.reset_state(inference_state)
+            logger.info(f'✅ Inference state initialized')
 
-            for prompt in prompts:
+            logger.info(f'📌 Adding {len(prompts)} tracking prompt(s) to SAM2...')
+            for idx, prompt in enumerate(prompts, 1):
                 # multiply points by the frame size
                 prompt['points'][:, 0] *= width
                 prompt['points'][:, 1] *= height
@@ -297,6 +319,9 @@ class NewModel(LabelStudioMLBase):
                     points=prompt['points'],
                     labels=prompt['labels']
                 )
+                logger.info(f'  ✓ Prompt {idx}/{len(prompts)}: frame={prompt["frame_idx"]}, obj_id={prompt["obj_id"]}, points={len(prompt["points"])}')
+
+            logger.info(f'✅ All prompts added successfully')
 
             # Dictionary to store sequences per object (for multi-person tracking)
             from collections import defaultdict
@@ -305,7 +330,17 @@ class NewModel(LabelStudioMLBase):
             debug_dir = './debug-frames'
             os.makedirs(debug_dir, exist_ok=True)
 
-            logger.info(f'Propagating in video from frame {first_frame_idx} to {end_frame}')
+            logger.info(f'🚀 Starting SAM2 video propagation from frame {first_frame_idx} to {end_frame}')
+            logger.info(f'🎯 Tracking {len(obj_ids)} object(s) across {frames_to_track} frames')
+
+            # Create progress bar for tracking
+            pbar = tqdm(
+                total=frames_to_track,
+                desc="🎥 Tracking frames",
+                unit="frame",
+                ncols=100
+            )
+
             for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(
                 inference_state=inference_state,
                 start_frame_idx=first_frame_idx,
@@ -331,6 +366,16 @@ class NewModel(LabelStudioMLBase):
                             'rotation': 0,
                             'time': real_frame_idx / fps
                         })
+
+                # Update progress bar
+                pbar.update(1)
+                pbar.set_postfix({
+                    'frame': real_frame_idx + 1,
+                    'objects': len(out_obj_ids)
+                })
+
+            pbar.close()
+            logger.info(f'✅ Video propagation complete!')
 
             # Create a map from obj_id (SAM2 internal ID) to original annotation ID
             # obj_ids maps original annotation ID -> SAM2 internal ID
@@ -388,5 +433,16 @@ class NewModel(LabelStudioMLBase):
 
             prediction = PredictionValue(result=regions)
             logger.debug(f'Prediction with {len(regions)} regions: {prediction.model_dump()}')
+
+            logger.info('='*80)
+            logger.info(f'✅ SAM2 TRACKING COMPLETE!')
+            logger.info(f'📊 Summary:')
+            logger.info(f'   • Objects tracked: {len(regions)}')
+            logger.info(f'   • Total frames processed: {frames_to_track}')
+            for region in regions:
+                obj_id = region['id']
+                total_frames = len(region['value']['sequence'])
+                logger.info(f'   • Object {obj_id}: {total_frames} frames')
+            logger.info('='*80)
 
             return ModelResponse(predictions=[prediction])
