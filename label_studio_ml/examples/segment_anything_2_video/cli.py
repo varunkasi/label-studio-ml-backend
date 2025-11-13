@@ -16,7 +16,16 @@ LABEL_STUDIO_API_KEY = os.getenv("LABEL_STUDIO_API_KEY", "your_api_key")
 PROJECT_ID = os.getenv("LABEL_STUDIO_PROJECT_ID", "1")
 
 if not logging.getLogger().handlers:
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    # Force flush to ensure logs appear immediately in Docker
+    import sys
+    for handler in logging.getLogger().handlers:
+        handler.stream = sys.stdout
+        handler.flush = lambda: sys.stdout.flush()
 
 logger = logging.getLogger(__name__)
 
@@ -75,18 +84,25 @@ class LabelStudioSAM2Predictor:
     def run(self, project, task_id, annotation_id, max_frames=None):
         # Initialize Label Studio SDK client
         ls = self.ls
-        project = ls.projects.get(id=project)
-        logger.info(f"Project retrieved: {project.id}")
 
-        # Fetch task
+        logger.info("━" * 80)
+        logger.info("STEP 1/6: Retrieving project information")
+        logger.info("━" * 80)
+        project = ls.projects.get(id=project)
+        logger.info(f"✅ Project retrieved: {project.id}")
+
+        logger.info("━" * 80)
+        logger.info("STEP 2/6: Fetching task")
+        logger.info("━" * 80)
         task = ls.tasks.get(task_id)
         task_dict = {"id": task.id, "data": task.data}
-        logger.info(f"Task {task_id} retrieved")
+        logger.info(f"✅ Task {task_id} retrieved")
 
-        # Fetch annotation
-        logger.info(f"Fetching annotation {annotation_id}...")
+        logger.info("━" * 80)
+        logger.info("STEP 3/6: Fetching annotation keyframes")
+        logger.info("━" * 80)
         annotation = ls.annotations.get(id=annotation_id)
-        logger.info(f"Annotation {annotation_id} retrieved with {len(annotation.result)} regions")
+        logger.info(f"✅ Annotation {annotation_id} retrieved with {len(annotation.result)} regions")
 
         # Validate annotation
         if not annotation.result:
@@ -101,32 +117,38 @@ class LabelStudioSAM2Predictor:
         if fps:
             logger.info(f"Using FPS: {fps}")
 
-        # Load SAM2 model
+        logger.info("━" * 80)
+        logger.info("STEP 4/6: Initializing SAM2 model")
+        logger.info("━" * 80)
         model = NewModel(
             project_id=str(project.id),
             label_config=project.label_config
         )
-        logger.info("SAM2 ML backend initialized")
+        logger.info("✅ SAM2 ML backend initialized")
 
         # Override max_frames if specified
         if max_frames:
             os.environ['MAX_FRAMES_TO_TRACK'] = str(max_frames)
-            logger.info(f"Set MAX_FRAMES_TO_TRACK to {max_frames}")
+            logger.info(f"📊 Set MAX_FRAMES_TO_TRACK to {max_frames}")
 
-        # Run prediction
-        logger.info(f"Running SAM2 tracking on task {task_id}...")
+        logger.info("━" * 80)
+        logger.info("STEP 5/6: Running SAM2 tracking (this may take a while)")
+        logger.info("━" * 80)
         response = model.predict([task_dict], context=context)
         predictions = self.postprocess_response(model, response, task_dict)
 
         if not predictions:
-            logger.error("No predictions generated")
+            logger.error("❌ No predictions generated")
             return
 
+        logger.info("━" * 80)
+        logger.info("STEP 6/6: Submitting predictions to Label Studio")
+        logger.info("━" * 80)
         # Send predictions to Label Studio
         for prediction in predictions:
             score = prediction.get("score", 0)
             logger.info(
-                f"Submitting prediction for task {task_id} with score={score:.4f}, "
+                f"📤 Submitting prediction for task {task_id} with score={score:.4f}, "
                 f"{len(prediction['result'])} regions"
             )
             ls.predictions.create(
@@ -136,7 +158,7 @@ class LabelStudioSAM2Predictor:
                 result=prediction["result"],
             )
 
-        logger.info("SAM2 tracking predictions complete!")
+        logger.info("✅ All predictions submitted successfully!")
 
     def _annotation_to_context(self, annotation, task):
         """Convert Label Studio annotation to context format expected by model."""
@@ -241,10 +263,36 @@ class LabelStudioSAM2Predictor:
 
 if __name__ == "__main__":
     args = arg_parser()
-    predictor = LabelStudioSAM2Predictor(args.ls_url, args.ls_api_key)
-    predictor.run(
-        args.project,
-        args.task,
-        args.annotation,
-        max_frames=args.max_frames,
-    )
+
+    # Print startup banner
+    print("="*80)
+    print("🚀 SAM2 VIDEO TRACKING CLI")
+    print("="*80)
+    print(f"Label Studio URL:  {args.ls_url}")
+    print(f"Project ID:        {args.project}")
+    print(f"Task ID:           {args.task}")
+    print(f"Annotation ID:     {args.annotation}")
+    if args.max_frames:
+        print(f"Max Frames:        {args.max_frames}")
+    print("="*80)
+    print()
+
+    try:
+        predictor = LabelStudioSAM2Predictor(args.ls_url, args.ls_api_key)
+        predictor.run(
+            args.project,
+            args.task,
+            args.annotation,
+            max_frames=args.max_frames,
+        )
+        print()
+        print("="*80)
+        print("✅ SUCCESS! Predictions have been submitted to Label Studio")
+        print("="*80)
+    except Exception as e:
+        print()
+        print("="*80)
+        print(f"❌ ERROR: {str(e)}")
+        print("="*80)
+        logger.exception("Full error traceback:")
+        raise
