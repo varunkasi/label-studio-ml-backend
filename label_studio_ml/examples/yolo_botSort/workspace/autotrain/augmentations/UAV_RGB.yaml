@@ -1,0 +1,23 @@
+# --- Geometric augmentations ---
+degrees: 20           # ↑ allow more rotation; gimbal footage often introduces roll/tilt
+translate: 0.2        # ↑ increase translation; framing varies as drone pans
+scale: 0.4            # smaller min scale for high-altitude; allows wider zoom changes
+shear: 2.0            # small shear to simulate gimbal pitch/yaw distortion
+perspective: 0.001    # slightly stronger than pure top-down; mimics tilt
+
+# --- Flips ---
+fliplr: 0.5           # horizontal flip more likely (drone yaw changes)
+flipud: 0.2           # keep lower; vertical flips less realistic for oblique angles
+
+# --- Photometric augmentations ---
+hsv_h: 0.02           # slightly larger hue variation (sunlight, reflection)
+hsv_s: 0.7            # keep strong saturation variation (weather/scene contrast)
+hsv_v: 0.5            # ↑ brighter/dimmer variation due to angle of sunlight
+
+# --- Advanced mix augmentations ---
+mosaic: 1.0           # keep enabled; still very helpful for background diversity
+mixup: 0.15           # slightly higher to help generalization with angle variation
+copy_paste: 0.1       # still useful if available
+
+# --- Additional useful options ---
+crop_fraction: 0.0    # no cropping; oblique scenes rely on context for detection

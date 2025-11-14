@@ -1,0 +1,20 @@
+# --- Geometric augmentations ---
+degrees: 25           # rotation range (simulate lying/tilted persons)
+translate: 0.1        # shift bbox position
+scale: 0.5            # zoom in/out
+shear: 0.2            # simulate perspective
+perspective: 0.001    # small 3D perspective
+
+# --- Flips ---
+flipud: 0.0           # disable vertical flip (unnatural for people)
+fliplr: 0.5           # enable horizontal flip
+
+# --- Advanced mix augmentations ---
+mosaic: 1.0           # keep mosaic augmentation
+mixup: 0.2            # mix images
+copy_paste: 0.0       # disable object copy-paste (can distort person shape)
+
+# --- Photometric augmentations ---
+hsv_h: 0.015          # hue variation
+hsv_s: 0.7            # saturation variation
+hsv_v: 0.4            # brightness variation

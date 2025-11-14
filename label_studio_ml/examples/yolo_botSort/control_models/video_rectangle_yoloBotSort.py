@@ -102,7 +102,7 @@ class VideoRectangleModelYoloBotSort(ControlModel):
             logger.error(f"Training failed: {str(e)}")
             return {"status": "error", "message": str(e)}
 
-    def predict_regions(self, path) -> List[Dict]:
+    def predict_regions(self, path, keyframe_interval = 5) -> List[Dict]:
         # bounding box parameters
         # https://docs.ultralytics.com/modes/track/?h=track#tracking-arguments
         conf = float(self.control.attr.get("model_conf", 0.25))
@@ -139,7 +139,7 @@ class VideoRectangleModelYoloBotSort(ControlModel):
                 **track_kwargs
             )
             # convert model results to label studio regions while tracker config exists
-            return self.create_video_rectangles(results, path)
+            return self.create_video_rectangles_in_steps(results, path, keyframe_interval=keyframe_interval)
         finally:
             # clean temporary file after inference completes
             if tmp_yaml and os.path.exists(tmp_yaml):
@@ -210,11 +210,9 @@ class VideoRectangleModelYoloBotSort(ControlModel):
 
         return regions
 
-    def create_video_rectangles_in_steps(self, results, path, keyframe_step=5):
-        """Create regions of video rectangles from the yolo tracker results.
-        Generates keyframes every `keyframe_step` frames, but ensures the last
-        frame of each track is always included for proper lifespan termination.
-        """
+    def create_video_rectangles_in_steps(self, results, path, keyframe_interval=5):
+        """Create regions of video rectangles from YOLO tracker results 
+        with keyframe sampling per track"""
         frames_count, duration = self.get_video_duration(path)
         model_names = self.model.names
         logger.debug(
@@ -225,28 +223,22 @@ class VideoRectangleModelYoloBotSort(ControlModel):
         track_labels = dict()
         frame = -1
 
-        # Pass 1: Collect keyframes every N frames
+        # Collect all frames
         for result in results:
             frame += 1
             data = result.boxes
             if not data.is_track:
                 continue
 
-            # Only process every Nth frame
-            if frame % keyframe_step != 0:
-                continue
-
             for i, track_id in enumerate(data.id.tolist()):
                 score = float(data.conf[i])
                 x, y, w, h = data.xywhn[i].tolist()
-
                 model_label = model_names[int(data.cls[i])]
                 if model_label not in self.label_map:
                     continue
                 output_label = self.label_map[model_label]
                 if output_label.strip().lower() not in ALLOWED_LABELS:
                     continue
-
                 track_labels[track_id] = output_label
 
                 box = {
@@ -262,38 +254,20 @@ class VideoRectangleModelYoloBotSort(ControlModel):
                 }
                 tracks[track_id].append(box)
 
-        # Pass 2: Ensure each track includes its last frame (if missing)
-        final_frame_index = len(results) - 1
-        if final_frame_index >= 0:
-            last_result = results[final_frame_index]
-            data = last_result.boxes
-            if data.is_track:
-                for i, track_id in enumerate(data.id.tolist()):
-                    # Skip if already included
-                    if track_id not in tracks:
-                        continue
-                    last_frame_number = final_frame_index + 1
-                    if not any(b["frame"] == last_frame_number for b in tracks[track_id]):
-                        score = float(data.conf[i])
-                        x, y, w, h = data.xywhn[i].tolist()
-
-                        box = {
-                            "frame": last_frame_number,
-                            "enabled": True,
-                            "rotation": 0,
-                            "x": (x - w / 2) * 100,
-                            "y": (y - h / 2) * 100,
-                            "width": w * 100,
-                            "height": h * 100,
-                            "time": last_frame_number * (duration / frames_count),
-                            "score": score,
-                        }
-                        tracks[track_id].append(box)
-
-        # Pass 3: Build Label Studio regions
         regions = []
         for track_id, sequence in tracks.items():
             sequence = self.process_lifespans_enabled(sequence)
+
+            # Sample keyframes for the track
+            sampled_sequence = []
+            for idx, box in enumerate(sequence):
+                if idx % keyframe_interval == 0:
+                    sampled_sequence.append(box)
+            # Always include last frame of the track
+            if sequence[-1]["frame"] != sampled_sequence[-1]["frame"]:
+                sampled_sequence.append(sequence[-1])
+            sequence = sampled_sequence
+
             label = track_labels[track_id]
             region = {
                 "from_name": self.from_name,
@@ -305,12 +279,13 @@ class VideoRectangleModelYoloBotSort(ControlModel):
                     "sequence": sequence,
                     "labels": [label],
                 },
-                "score": max(frame_info["score"] for frame_info in sequence),
+                "score": max([frame_info["score"] for frame_info in sequence]),
                 "origin": "manual",
             }
             regions.append(region)
 
         return regions
+
 
 
     @staticmethod

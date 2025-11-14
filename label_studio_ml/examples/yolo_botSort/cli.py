@@ -86,6 +86,13 @@ def arg_parser():
         help="Annotation ID to use for training (if mode is 'train')",
     )
 
+    parser.add_argument(
+        "--keyframe_interval",
+        type=int,
+        default=2,
+        help="Keyframe interval for video track generation",
+    )
+
     
     return parser.parse_args()
 
@@ -143,7 +150,7 @@ class LabelStudioMLPredictor:
         else:
             # predict and send prediction to Label Studio
             for task in tqdm(tasks, desc="Predict tasks"):
-                response = model.predict([task], model_version = self.args.model_version)
+                response = model.predict([task], model_version = self.args.model_version, keyframe_interval=self.args.keyframe_interval)
                 predictions = self.postprocess_response(model, response, task)
 
                 # send predictions to Label Studio

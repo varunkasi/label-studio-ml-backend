@@ -115,7 +115,6 @@ class ControlModel(BaseModel):
             model_path = custom_model_path
             logger.info(f"Using custom model path from argument: {model_path}")
 
-
         else:
             # read `model_path` attribute from the control tag
             model_path = (
@@ -144,9 +143,15 @@ class ControlModel(BaseModel):
 
     @classmethod
     def load_yolo_model(cls, filename) -> YOLO:
-        """Load YOLO model from the file."""
-        path = os.path.join(MODEL_ROOT, filename)
-        logger.info(f"Loading yolo model: {path}")
+        """Load YOLO model from an absolute path or from MODEL_ROOT."""
+        
+        # If filename is an absolute path, use it directly
+        if os.path.isabs(filename):
+            path = filename
+        else:
+            path = os.path.join(MODEL_ROOT, filename)
+
+        logger.info(f"Loading YOLO model: {path}")
         model = YOLO(path)
         logger.info(f"Model {path} names:\n{model.names}")
         return model
