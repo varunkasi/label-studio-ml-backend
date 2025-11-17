@@ -5,3 +5,5 @@ workspace/autotrain/train_weights/*
 run.sh
 cache.db
 .specstory
+*.pt
+

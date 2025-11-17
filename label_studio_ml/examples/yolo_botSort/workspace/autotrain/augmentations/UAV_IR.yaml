@@ -1,0 +1,18 @@
+# --- Geometric Augmentations ---
+degrees: 10           # small gimbal tilt or roll
+translate: 0.15       # simulate UAV drift or vibration
+scale: 0.3            # slight zooms due to altitude changes
+shear: 0.05           # mild shear for off-axis shots
+perspective: 0.002    # small perspective warps for oblique angles
+flipud: 0.0           # IR people upside-down unrealistic
+fliplr: 0.5           # people can appear mirrored on turns
+
+# --- Photometric (Intensity) Augmentations ---
+hsv_h: 0.0            # IR has no hue
+hsv_s: 0.0            # no saturation
+hsv_v: 0.1            # slight brightness variation
+
+# --- Structural ---
+mosaic: 0.8           # helps simulate multi-scene context
+mixup: 0.1            # low-level mixing for robustness
+copy_paste: 0.0       # not useful for thermal imagery

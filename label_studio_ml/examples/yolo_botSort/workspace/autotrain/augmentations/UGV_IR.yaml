@@ -1,0 +1,18 @@
+# --- Geometric Augmentations ---
+degrees: 15           # small handheld tilt
+translate: 0.1        # small translation
+scale: 0.2            # zoom in/out
+shear: 0.05           # mild shear
+perspective: 0.002    # mild perspective
+flipud: 0.0           # no vertical flip
+fliplr: 0.5           # horizontal flip ok
+
+# --- Structural ---
+mosaic: 0.8           # optional, mostly keep natural context
+mixup: 0.1            # optional mixing
+copy_paste: 0.0       # avoid copy-paste
+
+# --- Photometric (Intensity) Augmentations ---
+hsv_h: 0.0            # no hue
+hsv_s: 0.0            # no saturation
+hsv_v: 0.3            # brightness variation

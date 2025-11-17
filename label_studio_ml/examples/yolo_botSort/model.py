@@ -137,11 +137,18 @@ class YOLO(LabelStudioMLBase):
         )
 
         model_version = kwargs.get("model_version", "yolo11m.pt")
+        keyframe_interval = int(kwargs.get("keyframe_interval", 5))
 
         # Get weights path based on model version
         # TODO: Support saving weights from training sessions (and store data on mAP etc.)
-        model_path = f"workspace/autolabel/saved_weights/{model_version}"
-        model_path = glob.glob(os.path.join(model_path, "*.pt"))
+        model_dir = f"/app/workspace/autolabel/saved_weights/{model_version}"
+        model_files = glob.glob(os.path.join(model_dir, "*.pt"))
+
+        if not model_files:
+            raise FileNotFoundError(f"No .pt file found in {model_dir}")
+
+        # Get the most recently modified file
+        model_path = max(model_files, key=os.path.getmtime)
 
         # Creates VideoRectangleModelYoloBotSort instances for each control tag
         control_models = self.detect_control_models(custom_model_path=model_path)
@@ -153,7 +160,7 @@ class YOLO(LabelStudioMLBase):
             for model in control_models:
                 path = model.get_path(task) # returns path of media
                 print(f"[YOLO] {model.__class__.__name__} using media at {path}")
-                regions += model.predict_regions(path)
+                regions += model.predict_regions(path, keyframe_interval=keyframe_interval)
 
             # calculate final score
             all_scores = [region["score"] for region in regions if "score" in region]
@@ -263,7 +270,7 @@ class YOLO(LabelStudioMLBase):
                                                     jpeg_quality = 95,
                                                     class_names=None,
                                                     save_empty_labels = False,
-                                                    reencode_video = True,
+                                                    reencode_video = False,
                                                     reencode_fps = None
                                                 )
 

@@ -1,0 +1,15 @@
+# --- Geometric ---
+degrees: 10           # small camera tilt
+translate: 0.05       # minor shifts
+scale: 0.15           # slight zoom variation
+shear: 0.05           # subtle shear
+perspective: 0.001    # low perspective
+
+# --- Flips ---
+flipud: 0.0           # thermal inversion unrealistic vertically
+fliplr: 0.5           # horizontal flips OK
+
+# --- Composition ---
+mosaic: 0.3           # modest
+mixup: 0.1            # slight blend for variety
+copy_paste: 0.0       # not natural for thermal
