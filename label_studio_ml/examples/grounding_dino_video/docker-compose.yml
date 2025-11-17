@@ -10,28 +10,29 @@ services:
         TEST_ENV: ${TEST_ENV}
     environment:
       # specify these parameters if you want to use basic auth for the model server
-      - BASIC_AUTH_USER=
-      - BASIC_AUTH_PASS=
+      BASIC_AUTH_USER: ""
+      BASIC_AUTH_PASS: ""
       # set the log level for the model server
-      - LOG_LEVEL=INFO
-      - WORKERS=1
-      - THREADS=8
-      - PYTHONPATH=/app
+      LOG_LEVEL: INFO
+      WORKERS: "1"
+      THREADS: "8"
+      PYTHONPATH: /app
 
       # Label Studio connectivity
-      - LABEL_STUDIO_HOST=https://app.heartex.com
-      - LABEL_STUDIO_URL=https://app.heartex.com
-      - LABEL_STUDIO_API_KEY=${LABEL_STUDIO_API_KEY}
+      LABEL_STUDIO_HOST: https://app.heartex.com
+      LABEL_STUDIO_URL: https://app.heartex.com
+      LABEL_STUDIO_API_KEY: ${LABEL_STUDIO_API_KEY}
 
       # Grounding DINO configuration
-      - GROUNDING_DINO_PROMPT=person
-      - GROUNDING_DINO_BOX_THRESHOLD=0.20
-      - GROUNDING_DINO_TEXT_THRESHOLD=0.25
-      - GROUNDING_DINO_DEVICE=cuda
-      - GROUNDING_DINO_CONFIG=GroundingDINO_SwinB_cfg.py
-      - GROUNDING_DINO_CONFIG=GroundingDINO_SwinT_OGC.py
-      - GROUNDING_DINO_WEIGHTS=groundingdino_swinb_cogcoor.pth
-      - GROUNDING_DINO_WEIGHTS=gdino_swint_darpa-ir-v1-1k_20_1.pth
+      GROUNDING_DINO_PROMPT: person
+      GROUNDING_DINO_BOX_THRESHOLD: "0.20"
+      GROUNDING_DINO_TEXT_THRESHOLD: "0.25"
+      GROUNDING_DINO_DEVICE: cuda
+      GROUNDING_DINO_CONFIG: GroundingDINO_SwinT_OGC.py
+      GROUNDING_DINO_WEIGHTS: gdino_swint_darpa-ir-v1-1k_20_1.pth
+      MODEL_SCORE_THRESHOLD: "0.5"
+
+      SPARSIFY_KF_FOR_SAM: "false"
 
       # track_activation_threshold (float): Detection confidence threshold for track activation.
       #   Increasing track_activation_threshold improves accuracy and stability but might miss
@@ -47,10 +48,10 @@ services:
       #   valid. Increasing minimum_consecutive_frames prevents accidental tracks from false or
       #   duplicate detections but may miss shorter tracks.
       # Tracker configuration defaults mirror ByteTrack
-      - TRACKER_ACTIVATION_THRESHOLD=0.2
-      - TRACKER_LOST_BUFFER=100
-      - TRACKER_MATCH_THRESHOLD=0.5
-      - TRACKER_MIN_CONSECUTIVE_FRAMES=5
+      TRACKER_ACTIVATION_THRESHOLD: "0.2"
+      TRACKER_LOST_BUFFER: "100"
+      TRACKER_MATCH_THRESHOLD: "0.5"
+      TRACKER_MIN_CONSECUTIVE_FRAMES: "5"
 
       # ===================================================================
       # SAHI Sliced Inference Configuration (Optional)
@@ -61,55 +62,55 @@ services:
 
       # Enable/disable SAHI sliced inference (default: false)
       # Set to 'true' to activate slicing for improved small-object detection
-      - SAHI_ENABLED=false
+      SAHI_ENABLED: "false"
 
       # Score threshold used by SAHI to filter slice predictions before merging.
       # If not set, it inherits GROUNDING_DINO_BOX_THRESHOLD (recommended).
       # Raise only if you see too many low-confidence duplicates.
-      - SAHI_SCORE_THRESHOLD=
+      SAHI_SCORE_THRESHOLD: ""
 
       # Slice dimensions (default: 640x640 pixels)
       # Smaller slices improve small-object recall but increase processing time
       # Recommended: 512-800 for most use cases; use 320-512 for very small objects
-      - SAHI_SLICE_HEIGHT=640
-      - SAHI_SLICE_WIDTH=640
+      SAHI_SLICE_HEIGHT: "640"
+      SAHI_SLICE_WIDTH: "640"
 
       # Overlap ratios between adjacent slices (default: 0.2 = 20% overlap)
       # Higher overlap (0.3-0.5) improves detection of objects at slice boundaries
       # but increases computational cost. Lower overlap (0.1-0.2) is faster but may
       # miss objects spanning multiple slices.
-      - SAHI_OVERLAP_HEIGHT_RATIO=0.2
-      - SAHI_OVERLAP_WIDTH_RATIO=0.2
+      SAHI_OVERLAP_HEIGHT_RATIO: "0.2"
+      SAHI_OVERLAP_WIDTH_RATIO: "0.2"
 
       # Postprocessing algorithm for merging overlapping detections (default: NMS)
       # - NMS: Non-Maximum Suppression (fastest, standard approach)
       # - NMM: Non-Maximum Merging (merges boxes instead of suppressing)
       # - GREEDYNMM: Greedy Non-Maximum Merging (more aggressive merging)
       # Use NMS for most cases; NMM/GREEDYNMM if objects are very close together
-      - SAHI_POSTPROCESS_TYPE=NMS
+      SAHI_POSTPROCESS_TYPE: NMS
 
       # Match metric for duplicate detection (default: IOS)
       # - IOS: Intersection Over Smaller area (better for different-sized boxes)
       # - IOU: Intersection Over Union (standard metric, stricter matching)
       # Use IOS when detecting objects of varying scales; IOU for uniform sizes
-      - SAHI_POSTPROCESS_MATCH_METRIC=IOS
+      SAHI_POSTPROCESS_MATCH_METRIC: IOS
 
       # Overlap threshold for considering detections as duplicates (default: 0.5)
       # Lower values (0.3-0.5) merge more aggressively, reducing duplicate boxes
       # Higher values (0.6-0.8) keep more boxes, useful for densely packed objects
-      - SAHI_POSTPROCESS_MATCH_THRESHOLD=0.5
+      SAHI_POSTPROCESS_MATCH_THRESHOLD: "0.5"
 
       # Class-agnostic duplicate suppression (default: true)
       # true: Suppresses duplicates regardless of class (recommended for most cases)
       # false: Only suppresses duplicates within the same class (use for overlapping
       #        objects of different types, e.g., person holding a phone)
-      - SAHI_POSTPROCESS_CLASS_AGNOSTIC=true
+      SAHI_POSTPROCESS_CLASS_AGNOSTIC: "true"
 
       # Minimum detection area as ratio of frame area (default: 0.0 = no filtering)
       # Filters out detections smaller than this ratio to reduce false positives
       # at slice boundaries. Example: 0.0001 filters boxes < 0.01% of frame area.
       # Increase to 0.001-0.01 if seeing many tiny spurious detections.
-      - SAHI_MIN_AREA_RATIO=0.0
+      SAHI_MIN_AREA_RATIO: "0.0"
 
     extra_hosts:
       - "host.docker.internal:host-gateway"  # for macos and unix      

@@ -1,0 +1,10 @@
+version: "3.11"
+
+services:
+  grounding_dino_video:
+    environment:
+      # Override only the parameters relevant for SAM-oriented sparse keyframes
+      # Lower the model score threshold to keep some moderate-confidence boxes
+      MODEL_SCORE_THRESHOLD: "0.35"
+      # Enable temporal sparsification within ~2000-frame chunks for each track
+      SPARSIFY_KF_FOR_SAM: "true"

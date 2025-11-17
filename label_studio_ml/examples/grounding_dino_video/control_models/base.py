@@ -18,7 +18,13 @@ from utils.grounding import GroundingDINOInference
 
 
 DEBUG_PLOT = os.getenv("DEBUG_PLOT", "false").lower() in ["1", "true"]
-MODEL_SCORE_THRESHOLD = float(os.getenv("MODEL_SCORE_THRESHOLD", 0.5))
+MODEL_SCORE_THRESHOLD_ENV = os.getenv("MODEL_SCORE_THRESHOLD")
+MODEL_SCORE_THRESHOLD_DEFAULT = 0.5
+MODEL_SCORE_THRESHOLD = (
+    float(MODEL_SCORE_THRESHOLD_ENV)
+    if MODEL_SCORE_THRESHOLD_ENV not in (None, "")
+    else MODEL_SCORE_THRESHOLD_DEFAULT
+)
 
 logger = logging.getLogger(__name__)
 
@@ -90,13 +96,19 @@ class ControlModel(BaseModel):
             )
             return None
         # read threshold attribute from the control tag, e.g.: <RectangleLabels model_score_threshold="0.5">
-        model_score_threshold = float(
+        control_threshold = (
             control.attr.get("model_score_threshold")
             or control.attr.get(
                 "score_threshold"
             )  # not recommended option, use `model_score_threshold`
-            or MODEL_SCORE_THRESHOLD
         )
+
+        if MODEL_SCORE_THRESHOLD_ENV not in (None, ""):
+            model_score_threshold = MODEL_SCORE_THRESHOLD
+        elif control_threshold is not None:
+            model_score_threshold = float(control_threshold)
+        else:
+            model_score_threshold = MODEL_SCORE_THRESHOLD_DEFAULT
         inference = GroundingDINOInference.get_instance()
         model_names = inference.names.values()
         # from_name for label mapping can be differed from control.name (e.g. VideoRectangle)

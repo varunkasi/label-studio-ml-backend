@@ -1,0 +1,23 @@
+version: "3.11"
+
+services:
+  grounding_dino_video:
+    environment:
+      # Enable SAHI sliced inference for better small-object (small person) recall
+      SAHI_ENABLED: "true"
+
+      # Keep score threshold inherited from GROUNDING_DINO_BOX_THRESHOLD unless
+      # you see too many low-confidence duplicate boxes
+      SAHI_SCORE_THRESHOLD: ""
+
+      # Slice dimensions tuned for typical HD/4K video with persons
+      SAHI_SLICE_HEIGHT: "640"
+      SAHI_SLICE_WIDTH: "640"
+
+      # Moderate overlap for balance between recall and speed
+      SAHI_OVERLAP_HEIGHT_RATIO: "0.2"
+      SAHI_OVERLAP_WIDTH_RATIO: "0.2"
+
+      # Slight area filter to reduce tiny spurious boxes at slice boundaries
+      # Adjust upward (e.g. 0.001) if you still see many tiny false positives
+      SAHI_MIN_AREA_RATIO: "0.0001"

@@ -16,6 +16,12 @@ ALLOWED_LABELS = {
     if label.strip()
 }
 
+SPARSIFY_KF_FOR_SAM = os.getenv("SPARSIFY_KF_FOR_SAM", "false").lower() in [
+    "1",
+    "true",
+    "yes",
+]
+
 TRACKER_ENV_MAP = {
     "lost_track_buffer": "TRACKER_LOST_BUFFER",
     "minimum_matching_threshold": "TRACKER_MATCH_THRESHOLD",
@@ -143,6 +149,8 @@ class VideoRectangleModel(ControlModel):
         regions: List[Dict] = []
         for track_id, sequence in tracks.items():
             sequence.sort(key=lambda item: item["frame"])
+            if SPARSIFY_KF_FOR_SAM:
+                sequence = self._sparsify_sequence_for_sam(sequence)
             sequence = self.process_lifespans_enabled(sequence)
 
             label = track_labels.get(track_id)
@@ -180,6 +188,51 @@ class VideoRectangleModel(ControlModel):
         if sequence:
             sequence[-1]["enabled"] = False
         return sequence
+
+    @staticmethod
+    def _sparsify_sequence_for_sam(sequence: List[Dict]) -> List[Dict]:
+        if not sequence:
+            return sequence
+
+        chunk_size = 2000
+        max_kf_per_chunk = 5
+
+        by_chunk: Dict[int, List[Dict]] = {}
+        for box in sequence:
+            frame = box.get("frame")
+            if frame is None:
+                continue
+            chunk_index = (frame - 1) // chunk_size
+            if chunk_index not in by_chunk:
+                by_chunk[chunk_index] = []
+            by_chunk[chunk_index].append(box)
+
+        result: List[Dict] = []
+        for chunk_index in sorted(by_chunk.keys()):
+            chunk_boxes = by_chunk[chunk_index]
+            count = len(chunk_boxes)
+            if count <= max_kf_per_chunk:
+                result.extend(chunk_boxes)
+                continue
+
+            desired = max_kf_per_chunk
+            if desired <= 0:
+                continue
+
+            indices = set()
+            if desired == 1:
+                indices.add(count // 2)
+            else:
+                for i in range(desired):
+                    pos = int(round(i * (count - 1) / (desired - 1)))
+                    indices.add(pos)
+
+            for idx, box in enumerate(chunk_boxes):
+                if idx in indices:
+                    result.append(box)
+
+        result.sort(key=lambda item: item["frame"])
+        return result
 
     def _build_tracker_kwargs(self) -> Dict:
         kwargs: Dict = {}
