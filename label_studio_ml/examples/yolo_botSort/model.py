@@ -268,9 +268,9 @@ class YOLO(LabelStudioMLBase):
                                                     output_frames_dir = temp_folder + "/images",
                                                     video_path = video_path,
                                                     jpeg_quality = 95,
-                                                    class_names=None,
+                                                    class_names=classes,
                                                     save_empty_labels = False,
-                                                    reencode_video = False,
+                                                    reencode_video = True,
                                                     reencode_fps = None
                                                 )
 

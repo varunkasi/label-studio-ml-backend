@@ -21,8 +21,7 @@ RUN --mount=type=cache,target="/var/cache/apt",sharing=locked \
     && update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1
 
 # Install PyTorch for ARM64 with CUDA 13.0 support
-RUN --mount=type=cache,target=/.cache/pip,sharing=locked \
-    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130 --break-system-packages --ignore-installed
+## Remove initial torch install (will reinstall at the end)
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -43,7 +42,6 @@ COPY requirements.txt .
 RUN --mount=type=cache,target=${PIP_CACHE_DIR},sharing=locked \
     pip3 install -r requirements.txt --break-system-packages --ignore-installed
 
-# install test requirements if needed
 COPY requirements-test.txt .
 # build only when TEST_ENV="true"
 RUN --mount=type=cache,target=${PIP_CACHE_DIR},sharing=locked \
@@ -67,6 +65,11 @@ RUN ls -l /app/tests/car.jpg && file /app/tests/car.jpg
 #     && yolo predict model=/app/models/yolov8n-cls.pt source=/app/tests/car.jpg \
 #     && yolo predict model=/app/models/yolov8n-seg.pt source=/app/tests/car.jpg; \
 #     fi'
+
+# Ensure correct CUDA-enabled torch is installed last
+RUN --mount=type=cache,target=/.cache/pip,sharing=locked \
+    pip uninstall torch torchvision torchaudio -y --break-system-packages && \
+    pip install torch==2.9.0+cu130 torchvision==0.24.0 --index-url https://download.pytorch.org/whl/cu130 --break-system-packages --ignore-installed
 
 ENV PYTHONPATH=/app
 

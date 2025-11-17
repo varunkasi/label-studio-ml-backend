@@ -13,7 +13,7 @@ services:
     shm_size: '1g'
     cpus: 4.0
     environment:
-      - NVIDIA_VISIBLE_DEVICES=0 # allocate GPU 0 and 1 only
+      - NVIDIA_VISIBLE_DEVICES=all # allocate GPU 0 and 1 only
       # specify these parameters if you want to use basic auth for the model server
       - BASIC_AUTH_USER=
       - BASIC_AUTH_PASS=
@@ -57,10 +57,12 @@ services:
       - .:/app
       - ./data/server:/data
 
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [ gpu ]
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [ gpu ]
+
+    runtime: nvidia
