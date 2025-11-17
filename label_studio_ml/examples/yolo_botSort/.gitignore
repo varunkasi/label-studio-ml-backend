@@ -4,3 +4,4 @@ workspace/autotrain/train_weights/*
 .env
 run.sh
 cache.db
+.specstory
