@@ -1,38 +1,106 @@
 import os
 import cv2
-import json
 from tqdm import tqdm
 import subprocess
 import tempfile
 import re
+from pathlib import Path
 
 
-def convert_labelstudio_to_coco(
+def video_to_images(video_path: str, images_dir_path: str, target_frame_rate: float):
+    """
+    Extract frames from video at a target frame rate, handling non-standard FPS.
+    This function addresses frame synchronization issues with Label Studio by using
+    time-based frame extraction instead of sequential frame reading.
+    
+    Args:
+        video_path (str): Path to input video file
+        images_dir_path (str): Directory to save extracted frames
+        target_frame_rate (float): Target FPS for frame extraction
+    
+    Returns:
+        int: Number of frames extracted
+    """
+    def _save_frame(frame_number, img):
+        # Frame numbering starts at 1 to match YOLO annotation convention
+        save_path = Path(images_dir_path) / f'frame_{(frame_number + 1):06d}.jpg'
+        cv2.imwrite(str(save_path), img)
+
+    if not os.path.exists(images_dir_path):
+        os.makedirs(images_dir_path)
+        print(f'Directory did not exist. Created {images_dir_path}')
+    
+    cap = cv2.VideoCapture(video_path)
+    orig_frame_rate = cap.get(cv2.CAP_PROP_FPS)
+    orig_length = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    target_length = round(orig_length / orig_frame_rate * target_frame_rate)
+    
+    print(f'Original frames: {orig_length} at {orig_frame_rate:.2f} FPS')
+    print(f'Target frames: {target_length} at {target_frame_rate:.2f} FPS')
+    
+    pbar = tqdm(total=target_length, desc="Extracting frames (time-based)")
+
+    # Start from first frame
+    frame_id = 0
+    success, frame = cap.read()
+    if success:
+        _save_frame(frame_id, frame)
+        pbar.update(1)
+    
+    last_position_s = 0
+    while True:
+        success, frame = cap.read()
+        if not success:
+            break
+        
+        position_s = float(cap.get(cv2.CAP_PROP_POS_MSEC)) / 1000
+        delta_s = position_s - last_position_s
+        
+        if delta_s >= (1 / target_frame_rate):
+            frame_id += 1
+            if frame_id < target_length:  # Ensure we don't exceed target
+                _save_frame(frame_id, frame)
+                pbar.update(1)
+                last_position_s += 1 / target_frame_rate
+            else:
+                break
+
+    cap.release()
+    pbar.close()
+    print(f'Done. Wrote video from {video_path} to {images_dir_path}. Last frame was {frame_id}.')
+    return frame_id + 1  # Return actual number of frames extracted
+
+
+def convert_labelstudio_to_yolo(
     labelstudio_json: dict,
-    output_coco_file: str,
+    output_labels_dir: str,
     output_frames_dir: str = None,
     video_path: str = None,
     jpeg_quality: int = 95,
     class_names=None,
+    save_empty_labels: bool = True,
     reencode_video: bool = False,
-    reencode_fps: float = None
+    reencode_fps: float = None,
+    use_time_based_extraction: bool = True
 ):
     """
-    Converts Label Studio video annotations (given as a Python dict) into COCO format 
+    Converts Label Studio video annotations (given as a Python dict) into YOLO format 
     and optionally extracts video frames.
 
     Args:
         labelstudio_json (dict): Parsed Label Studio JSON data (not a file path).
-        output_coco_file (str): Path to save COCO format JSON file.
+        output_labels_dir (str): Directory to save YOLO label .txt files.
         output_frames_dir (str, optional): Directory to save extracted video frames. Ignored if `video_path` is None.
         video_path (str, optional): Path to the source video for frame extraction.
         jpeg_quality (int, optional): JPEG quality for frame extraction (0-100). Default is 95.
-        class_names (list[str], optional): List of class names. Default is ["Person"].
+        class_names (list[str], optional): List of YOLO class names. Default is ["Person"].
+        save_empty_labels (bool, optional): Whether to save empty .txt files for frames without labels.
         reencode_video (bool, optional): Whether to re-encode the video before frame extraction. Default False.
         reencode_fps (float, optional): Target FPS for re-encoding. If None, original FPS is preserved.
+        use_time_based_extraction (bool, optional): Use time-based frame extraction for better sync with Label Studio. Default True.
 
     Returns:
-        tuple[str, Optional[str]]: Paths to (output_coco_file, output_frames_dir)
+        tuple[str, Optional[str]]: Paths to (output_labels_dir, output_frames_dir)
     """
     if class_names is None:
         class_names = ["Person"]
@@ -61,8 +129,8 @@ def convert_labelstudio_to_coco(
             })
         return interpolated
 
-    # --- Prepare output directory for COCO file ---
-    os.makedirs(os.path.dirname(output_coco_file), exist_ok=True)
+    # --- Prepare output directories ---
+    os.makedirs(output_labels_dir, exist_ok=True)
     if video_path and output_frames_dir:
         os.makedirs(output_frames_dir, exist_ok=True)
 
@@ -74,6 +142,8 @@ def convert_labelstudio_to_coco(
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         fps = cap.get(cv2.CAP_PROP_FPS)
         cap.release()
+
+        reencoded_path = None  # Track re-encoded video path
 
         if reencode_video:
             print("🔄 Re-encoding video for consistent frame extraction...")
@@ -122,35 +192,21 @@ def convert_labelstudio_to_coco(
             fps = cap.get(cv2.CAP_PROP_FPS)
             cap.release()
             print(f"✅ Video re-encoded to {target_fps:.2f} FPS ({total_frames} frames)")
+
+            video_path = reencoded_path
     else:
         image_width = 1920
         image_height = 1080
         total_frames = None
         fps = None
 
-    # --- Initialize COCO format structure ---
-    coco_data = {
-        "images": [],
-        "annotations": [],
-        "categories": []
-    }
-
-    # Add categories
-    for i, class_name in enumerate(class_names):
-        coco_data["categories"].append({"id": i + 1, "name": class_name})
-
     # --- Use provided Label Studio JSON data ---
     data = labelstudio_json
     annotations = data["result"]
-    frames_dict_all = {}  # frame_number -> list of annotation dicts
-    annotation_id = 1
+    frames_dict_all = {}  # frame_number -> list of YOLO lines
 
     # --- Process annotations ---
     for ann in tqdm(annotations, desc="Processing tracks"):
-        # Skip tracks that don't have labels
-        if "labels" not in ann["value"] or not ann["value"]["labels"]:
-            continue
-        
         seq = ann["value"]["sequence"]
         seq = sorted(seq, key=lambda x: x["frame"])
         last_enabled_frame = None
@@ -163,42 +219,22 @@ def convert_labelstudio_to_coco(
             # Interpolate between frames
             if last_enabled_frame is not None:
                 for f in interpolate(last_enabled_frame, frame):
-                    class_id = class_names.index(ann["value"]["labels"][0]) + 1
-                    # Convert from percentage to pixel coordinates
-                    x = f["x"] * image_width / 100
-                    y = f["y"] * image_height / 100
-                    w = f["width"] * image_width / 100
-                    h = f["height"] * image_height / 100
-                    
-                    annotation = {
-                        "id": annotation_id,
-                        "image_id": f["frame"],
-                        "category_id": class_id,
-                        "bbox": [x, y, w, h],
-                        "area": w * h,
-                        "iscrowd": 0
-                    }
-                    frames_dict_all.setdefault(f["frame"], []).append(annotation)
-                    annotation_id += 1
+                    class_id = class_names.index(ann["value"]["labels"][0])
+                    x_center = (f["x"] + f["width"] / 2) / 100
+                    y_center = (f["y"] + f["height"] / 2) / 100
+                    w = f["width"] / 100
+                    h = f["height"] / 100
+                    yolo_line = f"{class_id} {x_center:.6f} {y_center:.6f} {w:.6f} {h:.6f}"
+                    frames_dict_all.setdefault(f["frame"], []).append(yolo_line)
 
             # Current frame
-            class_id = class_names.index(ann["value"]["labels"][0]) + 1
-            # Convert from percentage to pixel coordinates
-            x = frame["x"] * image_width / 100
-            y = frame["y"] * image_height / 100
-            w = frame["width"] * image_width / 100
-            h = frame["height"] * image_height / 100
-            
-            annotation = {
-                "id": annotation_id,
-                "image_id": frame["frame"],
-                "category_id": class_id,
-                "bbox": [x, y, w, h],
-                "area": w * h,
-                "iscrowd": 0
-            }
-            frames_dict_all.setdefault(frame["frame"], []).append(annotation)
-            annotation_id += 1
+            class_id = class_names.index(ann["value"]["labels"][0])
+            x_center = (frame["x"] + frame["width"] / 2) / 100
+            y_center = (frame["y"] + frame["height"] / 2) / 100
+            w = frame["width"] / 100
+            h = frame["height"] / 100
+            yolo_line = f"{class_id} {x_center:.6f} {y_center:.6f} {w:.6f} {h:.6f}"
+            frames_dict_all.setdefault(frame["frame"], []).append(yolo_line)
 
             last_enabled_frame = frame
 
@@ -206,75 +242,53 @@ def convert_labelstudio_to_coco(
     if total_frames is None:
         total_frames = max(frames_dict_all.keys()) if frames_dict_all else 0
 
-    # --- Build COCO images and annotations ---
-    for frame_number in tqdm(range(1, total_frames + 1), desc="Building COCO annotations"):
-        # Add image info
-        coco_data["images"].append({
-            "id": frame_number,
-            "file_name": f"frame_{frame_number:06d}.jpg",
-            "width": image_width,
-            "height": image_height
-        })
-        
-        # Add annotations for this frame
-        annotations_for_frame = frames_dict_all.get(frame_number, [])
-        coco_data["annotations"].extend(annotations_for_frame)
+    # --- Write YOLO annotations ---
+    for frame_number in tqdm(range(1, total_frames + 1), desc="Writing YOLO annotations"):
+        lines = frames_dict_all.get(frame_number, [])
+        if lines or save_empty_labels:
+            txt_file = os.path.join(output_labels_dir, f"frame_{frame_number:06d}.txt")
+            with open(txt_file, "w") as f:
+                f.write("\n".join(lines) + ("\n" if lines else ""))
 
-    # --- Write COCO JSON file ---
-    with open(output_coco_file, 'w') as f:
-        json.dump(coco_data, f, indent=2)
-
-    # --- Extract frames using time-based approach for Label Studio compatibility ---
+    # --- Extract frames ---
     if video_path and output_frames_dir:
-        def _save_frame(frame_number, img):
-            frame_file = os.path.join(output_frames_dir, f"frame_{frame_number:06d}.jpg")
-            cv2.imwrite(frame_file, img, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality])
-
-        cap = cv2.VideoCapture(video_path)
-        orig_frame_rate = cap.get(cv2.CAP_PROP_FPS)
-        orig_length = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        
-        # Use original frame rate if no reencode_fps specified
-        target_frame_rate = reencode_fps if reencode_fps else orig_frame_rate
-        target_length = round(orig_length / orig_frame_rate * target_frame_rate)
-        
-        print(f'Original frames: {orig_length}, Original FPS: {orig_frame_rate:.2f}')
-        print(f'Target frames: {target_length}, Target FPS: {target_frame_rate:.2f}')
-        
-        pbar = tqdm(total=target_length, desc="Extracting frames")
-        
-        # Start from first frame
-        frame_id = 1  # Start from 1 to match COCO image IDs
-        success, frame = cap.read()
-        if success:
-            _save_frame(frame_id, frame)
-            pbar.update(1)
-        
-        last_position_s = 0
-        while True:
-            success, frame = cap.read()
-            if not success:
-                break
-            position_s = float(cap.get(cv2.CAP_PROP_POS_MSEC)) / 1000
-            delta_s = position_s - last_position_s
-            if delta_s >= (1 / target_frame_rate):
-                frame_id += 1
-                if frame_id > target_length:  # Don't exceed expected frame count
+        if use_time_based_extraction:
+            # Use time-based extraction for better synchronization with Label Studio
+            target_fps = reencode_fps if reencode_fps else fps
+            actual_frames = video_to_images(video_path, output_frames_dir, target_fps)
+            
+            # Update total_frames if it was estimated incorrectly
+            if actual_frames != total_frames:
+                print(f"⚠️  Frame count mismatch: expected {total_frames}, extracted {actual_frames}")
+                total_frames = actual_frames
+                
+                # Re-write YOLO annotations with correct frame count
+                print("🔄 Updating YOLO annotations for correct frame count...")
+                for frame_number in tqdm(range(1, total_frames + 1), desc="Updating YOLO annotations"):
+                    lines = frames_dict_all.get(frame_number, [])
+                    if lines or save_empty_labels:
+                        txt_file = os.path.join(output_labels_dir, f"frame_{frame_number:06d}.txt")
+                        with open(txt_file, "w") as f:
+                            f.write("\n".join(lines) + ("\n" if lines else ""))
+        else:
+            # Use sequential frame extraction (original method)
+            cap = cv2.VideoCapture(video_path)
+            frame_idx = 0
+            pbar = tqdm(total=total_frames, desc="Extracting frames (sequential)")
+            while True:
+                ret, frame = cap.read()
+                if not ret or frame_idx >= total_frames:
                     break
-                _save_frame(frame_id, frame)
+                frame_idx += 1
+                frame_file = os.path.join(output_frames_dir, f"frame_{frame_idx:06d}.jpg")
+                cv2.imwrite(frame_file, frame, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality])
                 pbar.update(1)
-                last_position_s += 1 / target_frame_rate
-        
-        cap.release()
-        pbar.close()
-        print(f'Done. Extracted {frame_id} frames to {output_frames_dir}/')
-        
-        # Update total_frames to match actual extracted frames
-        total_frames = frame_id
+            cap.release()
+            pbar.close()
 
-    print(f"✅ COCO annotations saved to {output_coco_file}")
+    print(f"✅ YOLO annotations saved to {output_labels_dir}/")
     if video_path and output_frames_dir:
         print(f"✅ Video frames saved to {output_frames_dir}/")
 
-    # --- Return output paths ---
-    return output_coco_file, output_frames_dir
+    # --- Return output directories ---
+    return output_labels_dir, output_frames_dir
