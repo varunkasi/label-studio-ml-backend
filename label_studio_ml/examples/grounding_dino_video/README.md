@@ -19,6 +19,22 @@ image: "/tutorials/yolo.png"
 
 # YOLO ML backend for Label Studio
 
+> **Note for this folder (`grounding_dino_video`):**
+> This example extends the generic YOLO ML backend documentation to a **Grounding DINO + ByteTrack**
+> video pipeline. The code in this directory uses:
+>
+> - Grounding DINO (SwinT) weights (e.g. `gdino_swint_darpa-ir-v1-1k_20_1.pth`) for person detection.
+> - ByteTrack (via `supervision.ByteTrack`) for multi-object tracking in long videos.
+> - Configuration primarily through `docker-compose.yml` using environment variables, with
+>   env values taking precedence over Label Studio control tag attributes for key thresholds
+>   such as `MODEL_SCORE_THRESHOLD` and tracker parameters.
+> - Optional override compose files such as:
+>   - `docker-compose.sparse-sam.yml` for SAM-oriented, temporally sparse keyframes.
+>
+> The generic YOLO documentation below still applies to shared concepts (control tags,
+> Label Studio integration, etc.), but the detection/tracking implementation in this
+> sub-example is based on Grounding DINO rather than Ultralytics YOLO models.
+
 The YOLO ML backend for Label Studio is designed to integrate advanced object detection, 
 segmentation, classification, and video object tracking capabilities directly into Label Studio. 
 

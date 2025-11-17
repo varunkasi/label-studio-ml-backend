@@ -26,7 +26,7 @@ class YOLO(LabelStudioMLBase):
 
     def setup(self):
         """Configure any parameters of your model here"""
-        self.set("model_version", "yolo")
+        self.set("model_version", "gdino")
 
     def detect_control_models(self) -> List[ControlModel]:
         """Detect control models based on the labeling config.

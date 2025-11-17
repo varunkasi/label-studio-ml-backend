@@ -84,10 +84,10 @@ class LabelStudioMLPredictor:
 
         tasks = self.prepare_tasks(ls, tasks)
 
-        # load YOLO model
+        # load Grounding DINO video model
         # TODO: use get_all_classes_inherited_LabelStudioMLBase to detect model classes
         model = YOLO(project_id=str(project.id), label_config=project.label_config)
-        logger.info(f"YOLO ML backend is created")
+        logger.info("Grounding DINO ML backend is created")
 
         # Setup output directory if saving frames
         if save_frames and not output_dir:
