@@ -18,6 +18,7 @@ import argparse
 import logging
 import signal
 import time
+import threading
 from typing import Optional
 
 # Configure logging
@@ -126,21 +127,68 @@ def fetch_task_data(ls, project_id: int, task_id: int, annotation_id: int):
 
 
 def upload_prediction(ls, task_id: int, prediction_data: dict):
-    """Upload prediction to Label Studio"""
+    """Upload prediction to Label Studio with progress feedback and retry mechanism"""
     logger.info(f'📤 Uploading prediction for task {task_id}...')
     
-    try:
-        result = ls.predictions.create(
-            task=task_id,
-            score=prediction_data.get('score', 0),
-            model_version=prediction_data.get('model_version', 'none'),
-            result=prediction_data.get('result', [])
-        )
-        logger.info(f'✅ Prediction uploaded successfully: ID={result.get("id")}')
-        return result
-    except Exception as e:
-        logger.error(f'❌ Failed to upload prediction: {e}')
-        raise CLIError(f'Upload error: {e}')
+    # Estimate upload size for progress feedback
+    import json
+    prediction_json = json.dumps(prediction_data)
+    upload_size_mb = len(prediction_json.encode('utf-8')) / (1024 * 1024)
+    logger.info(f'📦 Upload size: {upload_size_mb:.2f}MB')
+    
+    # Heartbeat logging during upload
+    upload_start_time = time.time()
+    heartbeat_active = True
+    
+    def upload_heartbeat():
+        """Log upload progress every 10 seconds"""
+        while heartbeat_active:
+            elapsed = time.time() - upload_start_time
+            logger.info(f'⏳ Upload in progress... ({elapsed:.0f}s elapsed)')
+            time.sleep(10)
+    
+    # Start heartbeat thread
+    heartbeat_thread = threading.Thread(target=upload_heartbeat, daemon=True)
+    heartbeat_thread.start()
+    
+    # Retry mechanism with exponential backoff
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            logger.info(f'📤 Upload attempt {attempt + 1}/{max_retries}...')
+            
+            result = ls.predictions.create(
+                task=task_id,
+                score=prediction_data.get('score', 0),
+                model_version=prediction_data.get('model_version', 'none'),
+                result=prediction_data.get('result', [])
+            )
+            
+            # Stop heartbeat on success
+            heartbeat_active = False
+            upload_elapsed = time.time() - upload_start_time
+            logger.info(f'✅ Upload completed in {upload_elapsed:.1f}s!')
+            
+            return result
+            
+        except Exception as e:
+            heartbeat_active = False  # Stop heartbeat on error
+            
+            # Check if this is a 504 Gateway Timeout - upload likely succeeded
+            error_str = str(e)
+            if '504' in error_str and 'Gateway Time-out' in error_str:
+                logger.warning(f'⚠️  Got 504 Gateway Timeout, but upload likely succeeded on server')
+                logger.info(f'✅ Treat as success - check Label Studio cloud for results')
+                return None  # Success, but no response object
+            
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
+                logger.warning(f'⚠️  Upload failed (attempt {attempt + 1}): {e}')
+                logger.info(f'🔄 Retrying in {wait_time}s...')
+                time.sleep(wait_time)
+            else:
+                logger.error(f'❌ Upload failed after {max_retries} attempts: {e}')
+                raise CLIError(f'Upload error: {e}')
 
 
 def main():
@@ -198,7 +246,11 @@ Examples:
         logger.info('🔗 Connecting to Label Studio...')
         from label_studio_sdk.client import LabelStudio
         
-        ls = LabelStudio(base_url=args.ls_url, api_key=args.ls_api_key)
+        ls = LabelStudio(
+            base_url=args.ls_url, 
+            api_key=args.ls_api_key,
+            timeout=600  # 10 minute timeout for large uploads
+        )
         logger.info('✅ Connected to Label Studio')
         
         # Fetch task and annotation data

@@ -14,8 +14,8 @@ services:
     #   - Default Docker shm is only 64MB which causes hangs during cv2.imwrite
     #   - Increase if processing very large videos or experiencing memory errors
     #   - Adjust based on your system RAM (24g mem_limit and 16g shm_size for systems with 32GB+ RAM)
-    mem_limit: 32g
-    shm_size: '16g'
+    mem_limit: 48g
+    shm_size: '32g'
     environment:
       # specify these parameters if you want to use basic auth for the model server
       - BASIC_AUTH_USER=
@@ -47,6 +47,7 @@ services:
       # Set MAX_FRAMES_TO_TRACK to 0 or empty for no limit (tracks full video)
       # Or set to a specific number to limit tracking
       - MAX_FRAMES_TO_TRACK=6000
+      - TRACK_FPS=2
     ports:
       - "9090:9090"
     deploy:

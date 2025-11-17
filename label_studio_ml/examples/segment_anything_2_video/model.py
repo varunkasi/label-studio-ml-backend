@@ -69,7 +69,8 @@ def check_gpu_health():
 DEVICE = os.getenv('DEVICE', 'cuda')
 MODEL_CONFIG = os.getenv('MODEL_CONFIG', 'sam2_hiera_l.yaml')
 MODEL_CHECKPOINT = os.getenv('MODEL_CHECKPOINT', 'sam2_hiera_large.pt')
-MAX_FRAMES_TO_TRACK = int(os.getenv('MAX_FRAMES_TO_TRACK', 10))
+MAX_FRAMES_TO_TRACK = int(os.getenv('MAX_FRAMES_TO_TRACK', 1000))
+TRACK_FPS = float(os.getenv('TRACK_FPS', '0'))  # 0 means use original FPS (no temporal downsampling)
 
 if DEVICE == 'cuda':
     # use bfloat16 for the entire notebook
@@ -103,7 +104,11 @@ class NewModel(LabelStudioMLBase):
     """Custom ML Backend model
     """
 
-    def split_frames(self, video_path, temp_dir, start_frame=0, end_frame=100):
+    def setup(self):
+        """Configure any parameters of your model here"""
+        self.set("model_version", "sam2")
+
+    def split_frames(self, video_path, temp_dir, start_frame=0, end_frame=100, stride: int = 1):
         # Open the video file
         logger.info(f'📹 Opening video file: {video_path}')
 
@@ -170,6 +175,11 @@ class NewModel(LabelStudioMLBase):
                 continue
             if frame_count >= end_frame:
                 break
+
+            # Apply temporal downsampling if stride > 1
+            if stride > 1 and (frame_count - start_frame) % stride != 0:
+                frame_count += 1
+                continue
 
             # If frame is read correctly, success is True
             if not success:
@@ -307,6 +317,39 @@ class NewModel(LabelStudioMLBase):
         }
 
 
+    def _bbox_iou(self, box1: Dict, box2: Dict) -> float:
+        """Compute IoU between two bboxes in percentage coordinates.
+
+        Boxes use Label Studio-style percentages: x, y (top-left) and width/height in [0, 100].
+        """
+        x1_min = box1["x"]
+        y1_min = box1["y"]
+        x1_max = x1_min + box1["width"]
+        y1_max = y1_min + box1["height"]
+
+        x2_min = box2["x"]
+        y2_min = box2["y"]
+        x2_max = x2_min + box2["width"]
+        y2_max = y2_min + box2["height"]
+
+        inter_x_min = max(x1_min, x2_min)
+        inter_y_min = max(y1_min, y2_min)
+        inter_x_max = min(x1_max, x2_max)
+        inter_y_max = min(y1_max, y2_max)
+
+        inter_w = max(0.0, inter_x_max - inter_x_min)
+        inter_h = max(0.0, inter_y_max - inter_y_min)
+        inter_area = inter_w * inter_h
+
+        area1 = (x1_max - x1_min) * (y1_max - y1_min)
+        area2 = (x2_max - x2_min) * (y2_max - y2_min)
+
+        union = area1 + area2 - inter_area
+        if union <= 0:
+            return 0.0
+        return inter_area / union
+
+
     def dump_image_with_mask(self, frame, mask, output_file, obj_id=None, random_color=False):
         from matplotlib import pyplot as plt
         if random_color:
@@ -399,6 +442,14 @@ class NewModel(LabelStudioMLBase):
             f'keyframes range: [{first_frame_idx}, {last_frame_idx}]')
         logger.debug(f'Object ID mapping: {obj_ids}')
 
+        # Temporal downsampling: determine stride between original frames fed into SAM2
+        if TRACK_FPS > 0 and fps > 0:
+            stride = max(1, round(fps / TRACK_FPS))
+            logger.info(f'🎞️  Temporal downsampling enabled: original FPS={fps:.2f}, TRACK_FPS={TRACK_FPS:.2f}, stride={stride}')
+        else:
+            stride = 1
+            logger.info(f'🎞️  Temporal downsampling disabled (TRACK_FPS={TRACK_FPS}, stride=1)')
+
         # Calculate frames to track: from first keyframe to end of video
         # If MAX_FRAMES_TO_TRACK is set (not None), use it as a hard limit
         if MAX_FRAMES_TO_TRACK > 0:
@@ -407,12 +458,24 @@ class NewModel(LabelStudioMLBase):
         else:
             frames_to_track = frames_count - first_frame_idx
             logger.info(f'Tracking full video: {frames_to_track} frames from frame {first_frame_idx} to {frames_count}')
+
+        # Effective number of frames that SAM2 will actually see after temporal downsampling
+        frames_to_track_sam2 = (frames_to_track + stride - 1) // stride
+        logger.info(f'🎯 SAM2 will process approximately {frames_to_track_sam2} frames after downsampling (stride={stride})')
         
         # HARD LIMIT: Prevent SAM2 memory crashes for large videos
         # SAM2 loads all frames into memory during init_state(), estimate memory usage
-        ESTIMATED_MEMORY_PER_FRAME_GB = 0.003  # ~3MB per frame at 1280x720 (float32)
-        estimated_memory_gb = frames_to_track * ESTIMATED_MEMORY_PER_FRAME_GB
-        MAX_SAFE_MEMORY_GB = 20  # Conservative limit to prevent crashes
+        ESTIMATED_MEMORY_PER_FRAME_GB = 0.005  # ~5MB per frame at 1280x720 (more realistic)
+        estimated_memory_gb = frames_to_track_sam2 * ESTIMATED_MEMORY_PER_FRAME_GB
+        
+        # Dynamic memory limit based on available GPU memory
+        if DEVICE == 'cuda':
+            total_gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
+            # Use 90% of available GPU memory for safety
+            MAX_SAFE_MEMORY_GB = total_gpu_memory * 0.9
+            logger.info(f'🎮 GPU Memory Limit: {MAX_SAFE_MEMORY_GB:.1f}GB (90% of {total_gpu_memory:.1f}GB available)')
+        else:
+            MAX_SAFE_MEMORY_GB = 20  # Conservative limit for CPU
         
         if estimated_memory_gb > MAX_SAFE_MEMORY_GB:
             error_msg = (f'❌ SAM2 MEMORY LIMIT EXCEEDED: {frames_to_track} frames require '
@@ -433,27 +496,18 @@ class NewModel(LabelStudioMLBase):
         cache_params = f"{video_hash}_{first_frame_idx}_{frames_to_track}"
         cache_hash = hashlib.md5(cache_params.encode()).hexdigest()[:8]
         
-        # Use RAM disk for maximum I/O performance
-        system = platform.system()
-        if system == "Darwin":  # macOS
-            ram_disk_path = "/tmp/video_cache_ram"  # Use /tmp which is typically memory-backed
-        elif system == "Linux":
-            ram_disk_path = "/dev/shm/video_cache_ram"  # Use shared memory
-        else:
-            ram_disk_path = "./video_cache"  # Fallback to regular disk
-            
+        ram_disk_path = "./video_cache"
         cache_dir = os.path.join(ram_disk_path, f'video_{cache_hash}')
         os.makedirs(cache_dir, exist_ok=True)
         
         logger.info(f'📁 Using high-performance cache directory: {cache_dir}')
-        logger.info(f'💾 Platform: {system}, using {"RAM disk" if system in ["Darwin", "Linux"] else "regular disk"}')
         
         # Check if frames are already cached
         cached_frames = len([f for f in os.listdir(cache_dir) if f.endswith('.jpg')])
         if cached_frames >= frames_to_track:
             logger.info(f'✅ Found {cached_frames} cached frames - skipping extraction')
         else:
-            logger.info(f'📥 Extracting frames to high-performance cache (found {cached_frames} cached frames)...')
+            logger.info(f'📥 Extracting frames to cache (found {cached_frames} cached frames)...')
         
         # Extract frames to high-performance cache (streaming, no memory accumulation)
         # Run split_frames as generator to avoid loading all frames into memory
@@ -461,7 +515,8 @@ class NewModel(LabelStudioMLBase):
         frame_generator = self.split_frames(
             video_path, cache_dir,
             start_frame=first_frame_idx,
-            end_frame=first_frame_idx + frames_to_track
+            end_frame=first_frame_idx + frames_to_track,
+            stride=stride,
         )
         
         # Consume generator to extract frames to disk without storing in memory
@@ -487,14 +542,41 @@ class NewModel(LabelStudioMLBase):
         # get inference state
         logger.info(f'🧠 Initializing SAM2 inference state...')
         init_start = time.time()
+        
+        # Monitor memory before SAM2 init to catch OOM issues
+        if DEVICE == 'cuda':
+            gpu_allocated = torch.cuda.memory_allocated(0) / 1024**3
+            gpu_reserved = torch.cuda.memory_reserved(0) / 1024**3
+            logger.info(f'💾 GPU Memory before SAM2 init: {gpu_allocated:.2f}GB allocated, {gpu_reserved:.2f}GB reserved')
+        
         try:
-            inference_state = get_inference_state(cache_dir)
-            predictor.reset_state(inference_state)
+            # Wrap SAM2 init in timeout context and detailed logging
+            with timeout_context(300, "SAM2 initialization"):  # 5 minute timeout
+                inference_state = get_inference_state(cache_dir)
+                predictor.reset_state(inference_state)
+            
             init_elapsed = time.time() - init_start
             logger.info(f'✅ Inference state initialized (took {init_elapsed:.2f}s)')
+            
+            # Check memory after successful init
+            if DEVICE == 'cuda':
+                gpu_allocated = torch.cuda.memory_allocated(0) / 1024**3
+                gpu_reserved = torch.cuda.memory_reserved(0) / 1024**3
+                logger.info(f'💾 GPU Memory after SAM2 init: {gpu_allocated:.2f}GB allocated, {gpu_reserved:.2f}GB reserved')
+                
+        except TimeoutError as e:
+            logger.error(f'❌ SAM2 initialization timed out: {e}')
+            raise RuntimeError(f'SAM2 initialization timed out after 300 seconds. Try reducing MAX_FRAMES_TO_TRACK or using a smaller video.')
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower() or "allocate" in str(e).lower():
+                logger.error(f'❌ SAM2 OOM during init: {e}')
+                raise RuntimeError(f'SAM2 ran out of memory during initialization. Try reducing MAX_FRAMES_TO_TRACK from {frames_to_track} to {frames_to_track//2}.')
+            else:
+                logger.error(f'❌ SAM2 runtime error during init: {e}')
+                raise
         except Exception as e:
-            logger.error(f'❌ Failed to initialize inference state: {e}')
-            raise
+            logger.error(f'❌ Unexpected error during SAM2 initialization: {e}')
+            raise RuntimeError(f'SAM2 initialization failed: {e}')
 
         logger.info(f'📌 Adding {len(prompts)} tracking prompt(s) to SAM2...')
         for idx, prompt in enumerate(prompts, 1):
@@ -520,12 +602,12 @@ class NewModel(LabelStudioMLBase):
         debug_dir = './debug-frames'
         os.makedirs(debug_dir, exist_ok=True)
 
-        logger.info(f'🚀 Starting SAM2 video propagation from frame {first_frame_idx} to {end_frame}')
-        logger.info(f'🎯 Tracking {len(obj_ids)} object(s) across {frames_to_track} frames')
+        logger.info(f'🚀 Starting SAM2 video propagation from frame {first_frame_idx} to {first_frame_idx + frames_to_track}')
+        logger.info(f'🎯 Tracking {len(obj_ids)} object(s) across {frames_to_track} frames (SAM2 frames={frames_to_track_sam2}, stride={stride})')
 
-        # Create progress bar for tracking
+        # Create progress bar for tracking (SAM2-local frames)
         pbar = tqdm(
-            total=frames_to_track,
+            total=frames_to_track_sam2,
             desc="🎥 Tracking frames",
             unit="frame",
             ncols=100
@@ -539,17 +621,18 @@ class NewModel(LabelStudioMLBase):
 
         for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(
             inference_state=inference_state,
-            start_frame_idx=first_frame_idx,
-            max_frame_num_to_track=frames_to_track
+            start_frame_idx=0,
+            max_frame_num_to_track=frames_to_track_sam2,
         ):
-            real_frame_idx = out_frame_idx + first_frame_idx
+            # Map SAM2-local frame index back to original video frame index
+            real_frame_idx = first_frame_idx + out_frame_idx * stride
 
             # Heartbeat logging
             now = time.time()
             if now - last_heartbeat > HEARTBEAT_INTERVAL:
                 elapsed = now - propagation_start
-                logger.info(f'💓 Heartbeat: Processing frame {real_frame_idx}, '
-                           f'elapsed: {elapsed:.1f}s, progress: {out_frame_idx}/{frames_to_track}')
+                logger.info(f'💓 Heartbeat: Processing original frame {real_frame_idx}, '
+                           f'elapsed: {elapsed:.1f}s, progress: {out_frame_idx}/{frames_to_track_sam2}')
                 last_heartbeat = now
 
             # Memory monitoring
@@ -615,9 +698,76 @@ class NewModel(LabelStudioMLBase):
             # Get labels from context
             labels = context_result['value'].get('labels', ['Person'])
 
-            # Merge original keyframes with predicted sequence
+            # Sort predicted sequence to ensure temporal order
+            predicted_sequence = sorted(predicted_sequence, key=lambda x: x['frame'])
+
+            # Downsample tracked frames into sparse keyframes using IoU threshold
+            sparse_tracked = []
+            last_kept_box = None
+
+            for item in predicted_sequence:
+                current_box = {
+                    "x": item["x"],
+                    "y": item["y"],
+                    "width": item["width"],
+                    "height": item["height"],
+                }
+
+                if last_kept_box is None:
+                    sparse_tracked.append(item)
+                    last_kept_box = current_box
+                    continue
+
+                iou = self._bbox_iou(last_kept_box, current_box)
+                if iou < 0.2:
+                    sparse_tracked.append(item)
+                    last_kept_box = current_box
+
+            # Always ensure we keep the last tracked frame if any tracking exists
+            if predicted_sequence:
+                last_tracked = predicted_sequence[-1]
+                if not sparse_tracked or sparse_tracked[-1]["frame"] != last_tracked["frame"]:
+                    sparse_tracked.append(last_tracked)
+
+            # Lifecycle handling within a single region:
+            # - Start enabled when the object first appears
+            # - If there is a frame gap > 1, mark the previous frame as disabled
+            if sparse_tracked:
+                prev = None
+                for i, box in enumerate(sparse_tracked):
+                    # Default: object is visible on each sparsified frame
+                    box["enabled"] = True
+
+                    if prev is not None and box["frame"] - prev["frame"] > 1:
+                        # Close the previous stint when there is a temporal gap
+                        sparse_tracked[i - 1]["enabled"] = False
+
+                    prev = box
+
+            # Merge original keyframes with sparsified tracked frames
+            merged_sequence = original_keyframes + sparse_tracked
+
+            # If we have any tracking, add an explicit disabled frame right after
+            # the last tracked frame so the region lifecycle ends with tracking
+            if predicted_sequence:
+                last_tracked_frame = predicted_sequence[-1]["frame"]
+                off_frame = min(last_tracked_frame + 1, frames_count)
+
+                if sparse_tracked:
+                    last_box = sparse_tracked[-1]
+                    off_item = {
+                        "frame": off_frame,
+                        "x": last_box["x"],
+                        "y": last_box["y"],
+                        "width": last_box["width"],
+                        "height": last_box["height"],
+                        "enabled": False,
+                        "rotation": last_box.get("rotation", 0),
+                        "time": (off_frame - 1) / fps,
+                    }
+                    merged_sequence.append(off_item)
+
             # Sort by frame number to maintain temporal order
-            merged_sequence = original_keyframes + predicted_sequence
             merged_sequence = sorted(merged_sequence, key=lambda x: x['frame'])
 
             # Calculate score (use 1.0 as default for SAM2 tracking)
@@ -644,8 +794,15 @@ class NewModel(LabelStudioMLBase):
                 f'{len(merged_sequence)} total frames'
             )
 
-        prediction = PredictionValue(result=regions)
-        logger.debug(f'Prediction with {len(regions)} regions: {prediction.model_dump()}')
+        # Calculate score (use 1.0 as default for SAM2 tracking)
+        avg_score = 1.0
+
+        prediction = {
+            "result": regions,
+            "score": avg_score,
+            "model_version": self.model_version,
+        }
+        logger.debug(f'Prediction with {len(regions)} regions: {prediction}')
 
         logger.info('='*80)
         logger.info(f'✅ SAM2 TRACKING COMPLETE!')
@@ -657,5 +814,13 @@ class NewModel(LabelStudioMLBase):
             total_frames = len(region['value']['sequence'])
             logger.info(f'   • Object {obj_id}: {total_frames} frames')
         logger.info('='*80)
+
+        # Clean up frame cache directory for this run
+        try:
+            import shutil
+            shutil.rmtree(cache_dir)
+            logger.info(f'🧹 Deleted frame cache: {cache_dir}')
+        except Exception as e:
+            logger.warning(f'⚠️ Failed to delete frame cache {cache_dir}: {e}')
 
         return ModelResponse(predictions=[prediction])
