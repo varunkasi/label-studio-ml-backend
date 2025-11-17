@@ -1,8 +1,9 @@
 ultralytics~=8.3.120
 tqdm
 torchmetrics<1.8.0
-numpy<2
 lap==0.5.12
 boto3
 scikit-learn
+numpy>=1.24.0
+scipy>=1.10.0
 

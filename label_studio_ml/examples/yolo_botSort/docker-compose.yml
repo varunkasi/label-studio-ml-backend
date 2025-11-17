@@ -5,6 +5,7 @@ services:
     container_name: yolo_botSort_joshua
     image: humansignal/yolo_botsort_joshua:v0
     build:
+      dockerfile: ${DOCKERFILE}
       context: .
       args:
         TEST_ENV: ${TEST_ENV}

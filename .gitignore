@@ -133,7 +133,6 @@ dmypy.json
 
 .idea/
 
-*.jpg
 *.pt
 *.pth
 .DS_Store

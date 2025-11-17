@@ -43,7 +43,7 @@ COPY requirements-test.txt .
 # build only when TEST_ENV="true"
 RUN --mount=type=cache,target=${PIP_CACHE_DIR},sharing=locked \
     if [ "$TEST_ENV" = "true" ]; then \
-      pip3 install -r requirements-test.txt; \
+    pip3 install -r requirements-test.txt; \
     fi
 
 WORKDIR /app
