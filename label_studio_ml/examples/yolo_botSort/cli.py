@@ -168,7 +168,7 @@ class LabelStudioMLPredictor:
                         result=prediction["result"],
                     )
 
-            logger.info("Model predictions are done!")
+                logger.info(f"Model predictions are done for task {task['id']}!")
 
     @staticmethod
     def postprocess_response(model, response, task):
