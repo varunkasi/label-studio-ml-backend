@@ -19,6 +19,7 @@ from pathlib import Path
 import yaml
 from workspace.utils.convert_ls2yolo import convert_labelstudio_to_yolo
 from workspace.utils.YOLO_helper import get_augmentation_config, generate_unique_dataset_dirs, combine_yolo_datasets, delete_folder
+from workspace.utils.reencode_video import reencode_video
 from datetime import datetime
 import glob
 
@@ -121,61 +122,6 @@ class YOLO(LabelStudioMLBase):
 
         return control_models
 
-    def predict(
-        self, tasks: List[Dict], context: Optional[Dict] = None, **kwargs
-    ) -> ModelResponse:
-        """Run YOLO predictions on the tasks
-        :param tasks: [Label Studio tasks in JSON format](https://labelstud.io/guide/task_format.html)
-        :param context: [Label Studio context in JSON format](https://labelstud.io/guide/ml_create)
-        :return model_response
-            ModelResponse(predictions=predictions) with
-            predictions [Predictions array in JSON format]
-            (https://labelstud.io/guide/export.html#Label-Studio-JSON-format-of-annotated-tasks)
-        """
-        logger.info(
-            f"Run prediction on {len(tasks)} tasks, project ID = {self.project_id}"
-        )
-
-        model_version = kwargs.get("model_version", "yolo11m.pt")
-        keyframe_interval = int(kwargs.get("keyframe_interval", 5))
-
-        # Get weights path based on model version
-        # TODO: Support saving weights from training sessions (and store data on mAP etc.)
-        model_dir = f"/app/workspace/autolabel/saved_weights/{model_version}"
-        model_files = glob.glob(os.path.join(model_dir, "*.pt"))
-
-        if not model_files:
-            raise FileNotFoundError(f"No .pt file found in {model_dir}")
-
-        # Get the most recently modified file
-        model_path = max(model_files, key=os.path.getmtime)
-
-        # Creates VideoRectangleModelYoloBotSort instances for each control tag
-        control_models = self.detect_control_models(custom_model_path=model_path)
-
-        predictions = []
-        for task in tasks:
-
-            regions = []
-            for model in control_models:
-                path = model.get_path(task) # returns path of media
-                print(f"[YOLO] {model.__class__.__name__} using media at {path}")
-                regions += model.predict_regions(path, keyframe_interval=keyframe_interval)
-
-            # calculate final score
-            all_scores = [region["score"] for region in regions if "score" in region]
-            avg_score = sum(all_scores) / max(len(all_scores), 1)
-
-            # compose final prediction
-            prediction = {
-                "result": regions,
-                "score": avg_score,
-                "model_version": self.model_version,
-            }
-            predictions.append(prediction)
-
-        return ModelResponse(predictions=predictions)
-    
     @staticmethod
     def get_augmentation_config(model_version: str) -> Dict:
         """Load augmentation configuration from YAML file based on model version.
@@ -240,6 +186,68 @@ class YOLO(LabelStudioMLBase):
         
         return max(numbers) + 1 if numbers else 1
 
+
+    def predict(
+        self, tasks: List[Dict], context: Optional[Dict] = None, **kwargs
+    ) -> ModelResponse:
+        """Run YOLO predictions on the tasks
+        :param tasks: [Label Studio tasks in JSON format](https://labelstud.io/guide/task_format.html)
+        :param context: [Label Studio context in JSON format](https://labelstud.io/guide/ml_create)
+        :return model_response
+            ModelResponse(predictions=predictions) with
+            predictions [Predictions array in JSON format]
+            (https://labelstud.io/guide/export.html#Label-Studio-JSON-format-of-annotated-tasks)
+        """
+        logger.info(
+            f"Run prediction on {len(tasks)} tasks, project ID = {self.project_id}"
+        )
+
+        model_version = kwargs.get("model_version", "yolo11m.pt")
+        reencode = kwargs.get("reencode", False)
+        keyframe_interval = int(kwargs.get("keyframe_interval", 5))
+
+        # Get weights path based on model version
+        # TODO: Support saving weights from training sessions (and store data on mAP etc.)
+        model_dir = f"/app/workspace/autolabel/saved_weights/{model_version}"
+        model_files = glob.glob(os.path.join(model_dir, "*.pt"))
+
+        if not model_files:
+            raise FileNotFoundError(f"No .pt file found in {model_dir}")
+
+        # Get the most recently modified file
+        model_path = max(model_files, key=os.path.getmtime)
+
+        # Creates VideoRectangleModelYoloBotSort instances for each control tag
+        control_models = self.detect_control_models(custom_model_path=model_path)
+
+        predictions = []
+        for task in tasks:
+
+            regions = []
+            for model in control_models:
+                path = model.get_path(task) # returns path of media
+
+                if reencode:
+                    path = reencode_video(path)
+                
+                print(f"[YOLO] {model.__class__.__name__} using media at {path}")
+                regions += model.predict_regions(path, keyframe_interval=keyframe_interval)
+
+            # calculate final score
+            all_scores = [region["score"] for region in regions if "score" in region]
+            avg_score = sum(all_scores) / max(len(all_scores), 1)
+
+            # compose final prediction
+            prediction = {
+                "result": regions,
+                "score": avg_score,
+                "model_version": self.model_version,
+            }
+            predictions.append(prediction)
+
+        return ModelResponse(predictions=predictions)
+    
+    
     def fit(self, event, task, **kwargs):
         """
         This method is called each time an annotation is created or updated.

@@ -7,7 +7,9 @@ python /app/cli.py \
  --ls-url "$LABEL_STUDIO_HOST" \
  --ls-api-key "$LABEL_STUDIO_API_KEY" \
  --project 198563 \
- --tasks 227374342 \
+ --tasks 226454006 \
  --yolo_botsort \
  --mode "inference" \
- --model_version "UAV_RGBr" 
+ --keyframe_interval 4 \
+ --model_version "UAV_RGB" \
+ --reencode 
