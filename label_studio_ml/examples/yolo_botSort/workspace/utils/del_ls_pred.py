@@ -5,7 +5,7 @@ from label_studio_sdk import LabelStudio
 import os
 
 # ---------------- CONFIG ----------------
-PREDICTION_ID_TO_DELETE = 51960452  # ID of the prediction to delete
+PREDICTION_ID_TO_DELETE = 51962059  # ID of the prediction to delete
 
 
 # ---------------- SETTINGS ----------------

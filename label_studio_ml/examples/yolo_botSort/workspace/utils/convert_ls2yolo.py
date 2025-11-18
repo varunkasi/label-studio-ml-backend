@@ -207,6 +207,10 @@ def convert_labelstudio_to_yolo(
 
     # --- Process annotations ---
     for ann in tqdm(annotations, desc="Processing tracks"):
+        # Skip tracks that don't have labels
+        if "labels" not in ann["value"] or not ann["value"]["labels"]:
+            continue
+        
         seq = ann["value"]["sequence"]
         seq = sorted(seq, key=lambda x: x["frame"])
         last_enabled_frame = None

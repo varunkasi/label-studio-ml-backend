@@ -67,7 +67,7 @@ def arg_parser():
     parser.add_argument(
         "--model_version",
         type=str,
-        choices=["UAV_RGB", "UAV_IR", "UAV_RGBr", "UGV_RGB", "UGV_IR", "UGV_THERMAL"],
+        choices=["UAV_RGB", "UAV_IR", "UAV_IR_GIMBAL", "UAV_RGBr", "UGV_RGB", "UGV_IR", "UGV_THERMAL"],
         default="UAV_RGB",
         help="Model version identifier to attach to predictions (for different scenarios)",
     )
