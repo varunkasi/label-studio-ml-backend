@@ -12,4 +12,4 @@ python /app/cli.py \
  --mode "inference" \
  --keyframe_interval 4 \
  --model_version "UGV_RGB" \
-#  --reencode 
+ --reencode 

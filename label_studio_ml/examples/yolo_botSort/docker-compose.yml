@@ -2,8 +2,8 @@ version: "3.8"
 
 services:
   yolo:
-    container_name: yolo_botSort_joshua
-    image: humansignal/yolo_botsort_joshua:v0
+    container_name: yolo_botSort
+    image: humansignal/yolo_botsort:v0
     build:
       dockerfile: ${DOCKERFILE}
       context: .

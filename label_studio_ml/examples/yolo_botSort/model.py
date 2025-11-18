@@ -140,9 +140,10 @@ class YOLO(LabelStudioMLBase):
         if not config_path.exists():
             logger.warning(
                 f"!!!Augmentation config for '{model_version}' not found at {config_path}. !!!"
-                f"Using default UAV_RGB config."
+                f"No augmentations used."
             )
-            config_path = Path("workspace/autotrain/augmentations/UAV_RGB.yaml")
+            return {}
+            # config_path = Path("workspace/autotrain/augmentations/UAV_RGB.yaml")
         
         try:
             with open(config_path, 'r') as f:
