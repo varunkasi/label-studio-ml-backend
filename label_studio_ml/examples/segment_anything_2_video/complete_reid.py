@@ -1,0 +1,748 @@
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import sys
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+import cv2
+import numpy as np
+from label_studio_sdk.client import LabelStudio
+from label_studio_sdk._extensions.label_studio_tools.core.utils.io import get_local_path
+
+from mergevideoregions import extract_merge_key_from_result
+
+
+logger = logging.getLogger(__name__)
+
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="[%(asctime)s] [%(levelname)s] [%(name)s::%(funcName)s::%(lineno)d] %(message)s",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
+
+
+class ReIDCLIError(Exception):
+    """Custom error type for the re-identification CLI."""
+
+
+@dataclass
+class TrackSequence:
+    """Container for a single video rectangle sequence (track)."""
+
+    region_id: str
+    merge_id: Optional[int]
+    result: Dict[str, Any]
+    sequence: List[Dict[str, Any]]
+    frames_count: Optional[int]
+    duration: Optional[float]
+
+    @property
+    def frame_range(self) -> Tuple[int, int]:
+        frames = [int(f.get("frame", 0)) for f in self.sequence if isinstance(f, dict)]
+        if not frames:
+            return 0, -1
+        return min(frames), max(frames)
+
+
+@dataclass
+class TrackFeatures:
+    """Aggregated appearance + geometry + shape features for a track."""
+
+    hist: np.ndarray
+    geom: np.ndarray
+    shape: np.ndarray
+    samples: int
+
+
+@dataclass
+class ReIDPreset:
+    name: str
+    max_samples_per_track: int
+    hist_bins: Tuple[int, int, int]
+    color_weight: float
+    geom_weight: float
+    shape_weight: float
+    min_sim_for_match: float
+    decisive_margin: float
+    decisive_min_top1: float
+
+
+PRESETS: Dict[str, ReIDPreset] = {
+    "uav": ReIDPreset(
+        name="uav",
+        max_samples_per_track=15,
+        hist_bins=(8, 8, 8),
+        color_weight=0.5,
+        geom_weight=0.25,
+        shape_weight=0.25,
+        min_sim_for_match=0.35,
+        decisive_margin=0.15,
+        decisive_min_top1=0.55,
+    ),
+    "ugv": ReIDPreset(
+        name="ugv",
+        max_samples_per_track=10,
+        hist_bins=(8, 8, 8),
+        color_weight=0.4,
+        geom_weight=0.3,
+        shape_weight=0.3,
+        min_sim_for_match=0.4,
+        decisive_margin=0.2,
+        decisive_min_top1=0.6,
+    ),
+}
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Compute automatic re-identification suggestions for video tracks "
+            "in a single Label Studio annotation and upload them as a prediction."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Example (inside Docker):\n\n"
+            "  docker compose exec segment_anything_2_video bash -lc '" "\\n"
+            "    export LABEL_STUDIO_HOST=https://app.heartex.com &&" "\\n"
+            "    export LABEL_STUDIO_URL=https://app.heartex.com &&" "\\n"
+            "    export LABEL_STUDIO_API_KEY=\"$LABEL_STUDIO_API_KEY\" &&" "\\n"
+            "    python /app/complete_reid.py \\\n"
+            "      --ls-url https://app.heartex.com \\\n"
+            "      --ls-api-key \"$LABEL_STUDIO_API_KEY\" \\\n"
+            "      --project 123 \\\n"
+            "      --task 456 \\\n"
+            "      --annotation 789 \\\n"
+            "      --profile uav\n" "\\n"
+            "  '"
+        ),
+    )
+
+    parser.add_argument(
+        "--ls-url",
+        required=True,
+        help="Label Studio URL (e.g., https://app.heartex.com)",
+    )
+    parser.add_argument(
+        "--ls-api-key",
+        required=True,
+        help="Label Studio API key",
+    )
+    parser.add_argument(
+        "--project",
+        type=int,
+        required=True,
+        help="Project ID (used for validation/logging)",
+    )
+    parser.add_argument(
+        "--task",
+        type=int,
+        required=True,
+        help="Task ID associated with the annotation",
+    )
+    parser.add_argument(
+        "--annotation",
+        type=int,
+        required=True,
+        help="Annotation ID to use as the source of tracks",
+    )
+    parser.add_argument(
+        "--profile",
+        choices=sorted(PRESETS.keys()),
+        default=os.getenv("REID_PROFILE", "uav"),
+        help=(
+            "Re-ID preset profile (affects sampling and thresholds). "
+            "Defaults to env REID_PROFILE or 'uav'."
+        ),
+    )
+    parser.add_argument(
+        "--log-level",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        default="INFO",
+        help="Logging level",
+    )
+    return parser.parse_args()
+
+
+def _build_ls_client(ls_url: str, ls_api_key: str):
+    if not ls_api_key or ls_api_key.strip() == "" or ls_api_key == "your_api_key":
+        raise ReIDCLIError(
+            "LABEL_STUDIO_API_KEY is required. "
+            "Provide it via --ls-api-key or the LABEL_STUDIO_API_KEY env var."
+        )
+
+    # Keep env in sync so get_local_path can reuse it
+    os.environ.setdefault("LABEL_STUDIO_URL", ls_url)
+    os.environ.setdefault("LABEL_STUDIO_API_KEY", ls_api_key)
+
+    logger.info("Connecting to Label Studio at %s", ls_url)
+    client = LabelStudio(base_url=ls_url, api_key=ls_api_key, timeout=600)
+    logger.info("Connected to Label Studio")
+    return client
+
+
+def _fetch_task(ls, project_id: int, task_id: int) -> Dict[str, Any]:
+    logger.info("Fetching task %s from project %s", task_id, project_id)
+    task_obj = ls.tasks.get(task_id)
+    if not task_obj:
+        raise ReIDCLIError(f"Task {task_id} not found")
+
+    task_project = getattr(task_obj, "project", None)
+    if task_project is not None and task_project != project_id:
+        logger.warning(
+            "Task %s belongs to project %s (not %s)",
+            getattr(task_obj, "id", task_id),
+            task_project,
+            project_id,
+        )
+
+    task = {"id": task_obj.id, "data": getattr(task_obj, "data", {})}
+    logger.info("Task fetched: %s", task.get("id"))
+    return task
+
+
+def _fetch_annotation(ls, annotation_id: int) -> Any:
+    logger.info("Fetching annotation %s", annotation_id)
+    ann = ls.annotations.get(id=annotation_id)
+    if not ann:
+        raise ReIDCLIError(f"Annotation {annotation_id} not found")
+
+    result = getattr(ann, "result", None)
+    if not result:
+        raise ReIDCLIError(f"Annotation {annotation_id} has no regions")
+
+    logger.info(
+        "Annotation fetched: id=%s with %d regions", getattr(ann, "id", annotation_id), len(result)
+    )
+    return ann
+
+
+def _detect_video_key(task_data: Dict[str, Any]) -> Tuple[str, str]:
+    """Heuristically detect the video field key in task data.
+
+    Prefer common keys like 'video', otherwise fall back to the first
+    string value that looks like a video file/URL.
+    """
+    preferred_keys = ["video", "video_url", "video_path"]
+    for key in preferred_keys:
+        if key in task_data and isinstance(task_data[key], str):
+            return key, task_data[key]
+
+    for key, value in task_data.items():
+        if not isinstance(value, str):
+            continue
+        lower = value.lower()
+        if lower.endswith((".mp4", ".avi", ".mov", ".mkv", ".webm")):
+            return key, value
+
+    raise ReIDCLIError(
+        "Could not detect video field in task data. "
+        "Ensure your task has a field like 'video' with a video URL/path."
+    )
+
+
+def _get_video_path(task: Dict[str, Any]) -> Tuple[str, str]:
+    data = task.get("data") or {}
+    key, video_url = _detect_video_key(data)
+    logger.info("Using video field '%s' with URL %s", key, video_url)
+
+    # Resolve relative URL if needed using LABEL_STUDIO_HOST/URL
+    if not video_url.startswith("http") and video_url.startswith("/"):
+        host = os.getenv("LABEL_STUDIO_HOST") or os.getenv("LABEL_STUDIO_URL")
+        if host:
+            from urllib.parse import urljoin
+
+            video_url = urljoin(host.rstrip("/"), video_url)
+            logger.info("Resolved relative video URL to %s", video_url)
+
+    logger.info("Downloading/caching video via get_local_path…")
+    local_path = get_local_path(video_url, task_id=task["id"])
+    if not os.path.exists(local_path):
+        raise ReIDCLIError(f"Video file not found after download: {local_path}")
+
+    size_mb = os.path.getsize(local_path) / 1024**2
+    logger.info("Video cached at: %s (%.2f MB)", local_path, size_mb)
+    return local_path, key
+
+
+def _extract_tracks_from_results(results: Iterable[Dict[str, Any]]) -> List[TrackSequence]:
+    tracks: List[TrackSequence] = []
+
+    for res in results:
+        if not isinstance(res, dict):
+            continue
+        value = res.get("value") or {}
+        seq = value.get("sequence")
+        if not isinstance(seq, list) or not seq:
+            continue
+
+        region_id = res.get("id")
+        if not isinstance(region_id, str):
+            logger.debug("Skipping result without string 'id': %r", res)
+            continue
+
+        merge_id = extract_merge_key_from_result(res)
+        frames_count = value.get("framesCount")
+        duration = value.get("duration")
+
+        track = TrackSequence(
+            region_id=region_id,
+            merge_id=merge_id,
+            result=res,
+            sequence=sorted(seq, key=lambda f: int(f.get("frame", 0))),
+            frames_count=frames_count if isinstance(frames_count, int) else None,
+            duration=float(duration) if isinstance(duration, (int, float)) else None,
+        )
+        tracks.append(track)
+
+    logger.info("Extracted %d track(s) with sequence data", len(tracks))
+    return tracks
+
+
+def _select_sample_frames(track: TrackSequence, max_samples: int) -> List[Dict[str, Any]]:
+    frames = [f for f in track.sequence if isinstance(f, dict) and f.get("enabled", True)]
+    if not frames:
+        return []
+    if len(frames) <= max_samples:
+        return frames
+
+    indices = np.linspace(0, len(frames) - 1, num=max_samples, dtype=int)
+    return [frames[i] for i in indices]
+
+
+def _compute_hist(crop: np.ndarray, bins: Tuple[int, int, int]) -> np.ndarray:
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1, 2], None, list(bins), [0, 180, 0, 256, 0, 256])
+    hist = hist.flatten().astype("float32")
+    s = float(hist.sum())
+    if s > 0:
+        hist /= s
+    return hist
+
+
+def _shape_descriptor(crop: np.ndarray, num_bins: int = 8) -> np.ndarray:
+    """Compute a simple gradient-orientation histogram as a shape descriptor.
+
+    This is loosely HOG-like: gradients are aggregated over the whole crop
+    and normalized, making it relatively robust to pose and scale changes.
+    """
+
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    mag, ang = cv2.cartToPolar(gx, gy, angleInDegrees=False)
+
+    # Use only non-zero gradients
+    valid = mag > 0
+    if not np.any(valid):
+        return np.zeros(num_bins, dtype="float32")
+
+    angles = ang[valid].flatten()
+    weights = mag[valid].flatten().astype("float32")
+
+    bin_edges = np.linspace(0.0, 2.0 * np.pi, num_bins + 1, dtype="float32")
+    bin_indices = np.searchsorted(bin_edges, angles, side="right") - 1
+    bin_indices = np.clip(bin_indices, 0, num_bins - 1)
+
+    hist = np.bincount(bin_indices, weights=weights, minlength=num_bins).astype(
+        "float32"
+    )
+    s = float(hist.sum())
+    if s > 0:
+        hist /= s
+    return hist
+
+
+def _geom_vector(item: Dict[str, Any]) -> np.ndarray:
+    x = float(item.get("x", 0.0))
+    y = float(item.get("y", 0.0))
+    w = float(item.get("width", 0.0))
+    h = float(item.get("height", 0.0))
+
+    cx = (x + w * 0.5) / 100.0
+    cy = (y + h * 0.5) / 100.0
+    area = (w * h) / (100.0 * 100.0)
+    aspect = w / (h + 1e-6)
+
+    # Scale area and aspect to comparable ranges
+    return np.array([cx, cy, area, aspect / 5.0], dtype="float32")
+
+
+def _compute_track_features(
+    video_path: str,
+    tracks: List[TrackSequence],
+    preset: ReIDPreset,
+) -> Dict[str, TrackFeatures]:
+    """Compute per-track appearance + geometry features.
+
+    Frames are read lazily via random access using OpenCV; only a bounded
+    number of samples per track are processed.
+    """
+    # Build sampling map: frame_idx (0-based) -> list of (track_id, frame_item)
+    frame_requests: Dict[int, List[Tuple[str, Dict[str, Any]]]] = {}
+    for track in tracks:
+        samples = _select_sample_frames(track, preset.max_samples_per_track)
+        for item in samples:
+            frame = int(item.get("frame", 0))
+            if frame <= 0:
+                continue
+            frame_idx = frame - 1
+            frame_requests.setdefault(frame_idx, []).append((track.region_id, item))
+
+    if not frame_requests:
+        logger.warning("No frames selected for feature extraction")
+        return {}
+
+    logger.info(
+        "Preparing to extract features from %d unique frame(s)", len(frame_requests)
+    )
+
+    # Prepare aggregators
+    feat_hist: Dict[str, np.ndarray] = {}
+    feat_geom: Dict[str, np.ndarray] = {}
+    feat_shape: Dict[str, np.ndarray] = {}
+    feat_count: Dict[str, int] = {}
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise ReIDCLIError(f"Could not open video file: {video_path}")
+
+    try:
+        for frame_idx in sorted(frame_requests.keys()):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            success, frame = cap.read()
+            if not success or frame is None:
+                logger.warning("Failed to read frame %d from video", frame_idx)
+                continue
+
+            h, w, _ = frame.shape
+            requests = frame_requests[frame_idx]
+            for region_id, item in requests:
+                x = float(item.get("x", 0.0)) / 100.0
+                y = float(item.get("y", 0.0)) / 100.0
+                bw = float(item.get("width", 0.0)) / 100.0
+                bh = float(item.get("height", 0.0)) / 100.0
+
+                x0 = max(0, min(w - 1, int(round(x * w))))
+                y0 = max(0, min(h - 1, int(round(y * h))))
+                x1 = max(0, min(w, int(round((x + bw) * w))))
+                y1 = max(0, min(h, int(round((y + bh) * h))))
+                if x1 <= x0 or y1 <= y0:
+                    continue
+
+                crop = frame[y0:y1, x0:x1]
+                if crop.size == 0:
+                    continue
+
+                hist = _compute_hist(crop, preset.hist_bins)
+                geom = _geom_vector(item)
+                shape = _shape_descriptor(crop)
+
+                if region_id not in feat_hist:
+                    feat_hist[region_id] = np.zeros_like(hist)
+                    feat_geom[region_id] = np.zeros_like(geom)
+                    feat_shape[region_id] = np.zeros_like(shape)
+                    feat_count[region_id] = 0
+
+                feat_hist[region_id] += hist
+                feat_geom[region_id] += geom
+                feat_shape[region_id] += shape
+                feat_count[region_id] += 1
+    finally:
+        cap.release()
+
+    features: Dict[str, TrackFeatures] = {}
+    for region_id, count in feat_count.items():
+        if count <= 0:
+            continue
+        hvec = feat_hist[region_id] / float(count)
+        gvec = feat_geom[region_id] / float(count)
+        svec = feat_shape[region_id] / float(count)
+        features[region_id] = TrackFeatures(
+            hist=hvec,
+            geom=gvec,
+            shape=svec,
+            samples=count,
+        )
+
+    logger.info("Computed features for %d track(s)", len(features))
+    return features
+
+
+def _hist_intersection(h1: np.ndarray, h2: np.ndarray) -> float:
+    return float(np.minimum(h1, h2).sum())
+
+
+def _geom_similarity(g1: np.ndarray, g2: np.ndarray) -> float:
+    dist = float(np.linalg.norm(g1 - g2))
+    return 1.0 / (1.0 + dist)
+
+
+def _compute_similarity(
+    ref_feat: TrackFeatures,
+    cand_feat: TrackFeatures,
+    preset: ReIDPreset,
+) -> float:
+    sim_color = _hist_intersection(ref_feat.hist, cand_feat.hist)
+    sim_geom = _geom_similarity(ref_feat.geom, cand_feat.geom)
+    sim_shape = _hist_intersection(ref_feat.shape, cand_feat.shape)
+
+    w_color = preset.color_weight
+    w_geom = preset.geom_weight
+    w_shape = preset.shape_weight
+    w_sum = w_color + w_geom + w_shape
+    if w_sum <= 0:
+        # Fallback: equal weighting if misconfigured
+        w_color = w_geom = w_shape = 1.0 / 3.0
+        w_sum = 1.0
+
+    w_color /= w_sum
+    w_geom /= w_sum
+    w_shape /= w_sum
+
+    sim = w_color * sim_color + w_geom * sim_geom + w_shape * sim_shape
+    return max(0.0, min(1.0, sim))
+
+
+def _build_reid_matches(
+    tracks: List[TrackSequence],
+    features: Dict[str, TrackFeatures],
+    preset: ReIDPreset,
+) -> Dict[str, Dict[str, Any]]:
+    """For each candidate track, compute top-3 reference matches and confidences.
+
+    Returns mapping: region_id -> {
+        "refs": List[Tuple[TrackSequence, float]],  # sorted by similarity desc
+        "decisive": bool,
+        "confidence": float,
+    }
+    """
+    refs = [t for t in tracks if t.merge_id is not None]
+    cands = [t for t in tracks if t.merge_id is None]
+
+    logger.info("Reference tracks: %d, candidate tracks: %d", len(refs), len(cands))
+
+    # Only consider tracks with computed features
+    def has_feat(t: TrackSequence) -> bool:
+        return t.region_id in features and features[t.region_id].samples > 0
+
+    refs = [t for t in refs if has_feat(t)]
+    cands = [t for t in cands if has_feat(t)]
+
+    if not refs:
+        logger.warning("No reference tracks with valid features; skipping re-ID")
+        return {}
+
+    matches: Dict[str, Dict[str, Any]] = {}
+
+    for cand in cands:
+        cand_feat = features[cand.region_id]
+        scored: List[Tuple[TrackSequence, float]] = []
+        for ref in refs:
+            ref_feat = features.get(ref.region_id)
+            if ref_feat is None:
+                continue
+            sim = _compute_similarity(ref_feat, cand_feat, preset)
+            if sim < preset.min_sim_for_match:
+                continue
+            scored.append((ref, sim))
+
+        if not scored:
+            continue
+
+        scored.sort(key=lambda rs: rs[1], reverse=True)
+        top_refs = scored[:3]
+        sims = [s for (_, s) in top_refs]
+        s1 = sims[0]
+        s2 = sims[1] if len(sims) > 1 else 0.0
+
+        decisive = bool(
+            s1 >= preset.decisive_min_top1 and (s1 - s2) >= preset.decisive_margin
+        )
+
+        # Region-level confidence is always the lowest similarity among the
+        # available top-k matches (k <= 3), as requested.
+        confidence = float(min(sims))
+
+        matches[cand.region_id] = {
+            "refs": top_refs,
+            "decisive": decisive,
+            "confidence": confidence,
+        }
+
+    logger.info("Built re-ID suggestions for %d candidate track(s)", len(matches))
+    return matches
+
+
+def _update_results_with_matches(
+    tracks: List[TrackSequence],
+    matches: Dict[str, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Produce a new result list with updated meta.text and per-region scores."""
+    new_results: List[Dict[str, Any]] = []
+
+    for track in tracks:
+        res = track.result
+        # Work on a shallow copy of the region dict to avoid mutating original
+        updated = dict(res)
+        meta = dict(updated.get("meta") or {})
+
+        match = matches.get(track.region_id)
+        if match is not None:
+            top_refs: List[Tuple[TrackSequence, float]] = match["refs"]
+            decisive: bool = match["decisive"]
+            confidence: float = match["confidence"]
+
+            # Collect id:<#> strings from matched references
+            id_strings: List[str] = []
+            for ref, _sim in top_refs:
+                if ref.merge_id is None:
+                    continue
+                id_strings.append(f"id:{ref.merge_id}")
+
+            if id_strings:
+                if decisive:
+                    # Only keep the strongest ID in decisive cases
+                    meta["text"] = id_strings[0]
+                else:
+                    # Keep all suggestions as a single multiline string so that
+                    # the Label Studio text box shows one id per line.
+                    # Example: "id:1\nid:2\nid:3".
+                    meta["text"] = "\n".join(id_strings)
+
+                updated["meta"] = meta
+                updated["score"] = float(confidence)
+        else:
+            # No match: leave region as-is
+            updated = res
+
+        new_results.append(updated)
+
+    return new_results
+
+
+def _build_prediction_payload(
+    results: List[Dict[str, Any]],
+    matches: Dict[str, Dict[str, Any]],
+    annotation_id: int,
+    profile: str,
+) -> Dict[str, Any]:
+    if matches:
+        confidences = [v["confidence"] for v in matches.values()]
+        overall_score = float(min(confidences))
+    else:
+        overall_score = 0.0
+
+    model_version = f"complete-reid-{profile}-ann-{annotation_id}"
+    prediction = {
+        "result": results,
+        "score": overall_score,
+        "model_version": model_version,
+    }
+    return prediction
+
+
+def _upload_prediction(ls, task_id: int, prediction: Dict[str, Any]):
+    logger.info(
+        "Uploading re-ID prediction for task %s (model_version=%s, regions=%d)…",
+        task_id,
+        prediction.get("model_version"),
+        len(prediction.get("result", [])),
+    )
+
+    result = ls.predictions.create(
+        task=task_id,
+        score=prediction.get("score", 0.0),
+        model_version=prediction.get("model_version", "complete-reid"),
+        result=prediction.get("result", []),
+    )
+
+    pred_id = getattr(result, "id", None)
+    if pred_id is not None:
+        logger.info("Upload complete, prediction id=%s", pred_id)
+    else:
+        logger.info("Upload request completed (no prediction id in response)")
+
+    return result
+
+
+def main() -> None:
+    args = _parse_args()
+
+    # Set global log level
+    logging.getLogger().setLevel(getattr(logging, args.log_level))
+
+    if args.profile not in PRESETS:
+        raise ReIDCLIError(f"Unknown profile '{args.profile}'. Choose from: {sorted(PRESETS.keys())}")
+    preset = PRESETS[args.profile]
+
+    logger.info("=" * 80)
+    logger.info("🤝 COMPLETE RE-ID CLI STARTED")
+    logger.info("=" * 80)
+    logger.info("📋 Parameters:")
+    logger.info("   • Label Studio URL: %s", args.ls_url)
+    logger.info("   • Project ID: %s", args.project)
+    logger.info("   • Task ID: %s", args.task)
+    logger.info("   • Annotation ID: %s", args.annotation)
+    logger.info("   • Profile: %s", args.profile)
+    logger.info("=" * 80)
+
+    exit_code = 0
+
+    try:
+        ls = _build_ls_client(args.ls_url, args.ls_api_key)
+
+        task = _fetch_task(ls, args.project, args.task)
+        ann = _fetch_annotation(ls, args.annotation)
+
+        video_path, _video_key = _get_video_path(task)
+
+        # Extract tracks from annotation results
+        tracks = _extract_tracks_from_results(getattr(ann, "result", []))
+        if not tracks:
+            logger.warning("No video rectangle sequences found in annotation; nothing to do")
+            return
+
+        # Compute features
+        features = _compute_track_features(video_path, tracks, preset)
+        if not features:
+            logger.warning("Failed to compute features for any track; aborting re-ID")
+            return
+
+        # Build matches for candidate tracks
+        matches = _build_reid_matches(tracks, features, preset)
+        if not matches:
+            logger.warning("No candidate tracks received confident matches; uploading copy-only prediction")
+
+        # Build updated results and prediction payload
+        updated_results = _update_results_with_matches(tracks, matches)
+        prediction = _build_prediction_payload(updated_results, matches, args.annotation, args.profile)
+        _upload_prediction(ls, args.task, prediction)
+
+        logger.info("=" * 80)
+        logger.info("✅ COMPLETE RE-ID CLI EXECUTION SUCCESSFUL")
+        logger.info("=" * 80)
+
+    except ReIDCLIError as e:
+        logger.error("❌ Re-ID CLI error: %s", e)
+        exit_code = 1
+    except KeyboardInterrupt:
+        logger.warning("\n⚠️  Interrupted by user")
+        exit_code = 130
+    except Exception as e:  # pragma: no cover - unexpected errors
+        logger.error("❌ Unexpected error: %s", e, exc_info=True)
+        exit_code = 1
+    finally:
+        if exit_code != 0:
+            logger.info("=" * 80)
+            logger.info("❌ COMPLETE RE-ID CLI EXECUTION FAILED (exit code: %s)", exit_code)
+            logger.info("=" * 80)
+
+    sys.exit(exit_code)
+
+
+if __name__ == "__main__":  # pragma: no cover
+    main()
