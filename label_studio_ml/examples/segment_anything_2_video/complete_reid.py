@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import re
 import sys
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -12,7 +13,7 @@ import numpy as np
 from label_studio_sdk.client import LabelStudio
 from label_studio_sdk._extensions.label_studio_tools.core.utils.io import get_local_path
 
-from mergevideoregions import extract_merge_key_from_result
+from mergevideoregions import extract_merge_key_from_result, merge_results_by_merge_id
 
 
 logger = logging.getLogger(__name__)
@@ -284,7 +285,40 @@ def _extract_tracks_from_results(results: Iterable[Dict[str, Any]]) -> List[Trac
             logger.debug("Skipping result without string 'id': %r", res)
             continue
 
-        merge_id = extract_merge_key_from_result(res)
+        # Interpret meta["text"] according to re-ID semantics:
+        # - "id:<number>"          -> confirmed reference (merge_id = number)
+        # - "id:" with no number   -> candidate (merge_id = None)
+        # - "id:20 35 47" (multi)  -> previous prediction; scrub to "id:" and
+        #                              treat as candidate (merge_id = None).
+        merge_id: Optional[int] = None
+        meta = res.get("meta")
+        text_field = None
+        if isinstance(meta, dict):
+            text_field = meta.get("text")
+
+        if isinstance(text_field, str):
+            m = re.match(r"^\s*id\s*:(.*)$", text_field, flags=re.IGNORECASE)
+            if m:
+                rest = m.group(1).strip()
+                if not rest:
+                    # "id:" or "id:   " -> candidate placeholder
+                    meta["text"] = "id:"
+                else:
+                    nums = re.findall(r"[0-9]+", rest)
+                    if len(nums) == 1:
+                        # Single confirmed ID from manual annotation
+                        try:
+                            merge_id = int(nums[0])
+                        except ValueError:
+                            merge_id = None
+                    else:
+                        # Multiple IDs from prior predictions; scrub and
+                        # treat as a candidate for this run.
+                        meta["text"] = "id:"
+
+        # Fallback to the standard extraction logic for any other cases
+        if merge_id is None:
+            merge_id = extract_merge_key_from_result(res)
         frames_count = value.get("framesCount")
         duration = value.get("duration")
 
@@ -396,8 +430,9 @@ def _compute_track_features(
         logger.warning("No frames selected for feature extraction")
         return {}
 
+    total_frames = len(frame_requests)
     logger.info(
-        "Preparing to extract features from %d unique frame(s)", len(frame_requests)
+        "Preparing to extract features from %d unique frame(s)", total_frames
     )
 
     # Prepare aggregators
@@ -411,7 +446,7 @@ def _compute_track_features(
         raise ReIDCLIError(f"Could not open video file: {video_path}")
 
     try:
-        for frame_idx in sorted(frame_requests.keys()):
+        for idx, frame_idx in enumerate(sorted(frame_requests.keys()), 1):
             cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
             success, frame = cap.read()
             if not success or frame is None:
@@ -451,6 +486,16 @@ def _compute_track_features(
                 feat_geom[region_id] += geom
                 feat_shape[region_id] += shape
                 feat_count[region_id] += 1
+
+            # Periodic progress feedback for long runs
+            if idx % 50 == 0 or idx == total_frames:
+                pct = 100.0 * float(idx) / float(total_frames)
+                logger.info(
+                    "Feature extraction progress: %d/%d frames (%.1f%%)",
+                    idx,
+                    total_frames,
+                    pct,
+                )
     finally:
         cap.release()
 
@@ -540,21 +585,45 @@ def _build_reid_matches(
 
     for cand in cands:
         cand_feat = features[cand.region_id]
-        scored: List[Tuple[TrackSequence, float]] = []
+
+        # First compute similarities to all reference tracks with features.
+        scored_all: List[Tuple[TrackSequence, float]] = []
         for ref in refs:
             ref_feat = features.get(ref.region_id)
             if ref_feat is None:
                 continue
             sim = _compute_similarity(ref_feat, cand_feat, preset)
-            if sim < preset.min_sim_for_match:
-                continue
-            scored.append((ref, sim))
+            scored_all.append((ref, sim))
 
-        if not scored:
+        if not scored_all:
+            # No usable references for this candidate
             continue
 
-        scored.sort(key=lambda rs: rs[1], reverse=True)
-        top_refs = scored[:3]
+        # Keep all matches above the configured threshold when possible.
+        scored = [(ref, sim) for (ref, sim) in scored_all if sim >= preset.min_sim_for_match]
+        if not scored:
+            # Fallback: even if all similarities are low, keep the top few
+            # so that every candidate still has at least one suggested match.
+            scored_all.sort(key=lambda rs: rs[1], reverse=True)
+            scored = scored_all[:3]
+        else:
+            scored.sort(key=lambda rs: rs[1], reverse=True)
+
+        # Deduplicate by merge_id (or region_id as a fallback) so that a
+        # single identity appears at most once in the candidate's top list.
+        dedup_scored: List[Tuple[TrackSequence, float]] = []
+        seen_keys = set()
+        for ref, sim in scored:
+            key = ref.merge_id if ref.merge_id is not None else ref.region_id
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            dedup_scored.append((ref, sim))
+
+        if not dedup_scored:
+            continue
+
+        top_refs = dedup_scored[:3]
         sims = [s for (_, s) in top_refs]
         s1 = sims[0]
         s2 = sims[1] if len(sims) > 1 else 0.0
@@ -592,32 +661,34 @@ def _update_results_with_matches(
 
         match = matches.get(track.region_id)
         if match is not None:
+            # Candidate track: attach suggested IDs and confidence.
             top_refs: List[Tuple[TrackSequence, float]] = match["refs"]
             decisive: bool = match["decisive"]
             confidence: float = match["confidence"]
 
-            # Collect id:<#> strings from matched references
-            id_strings: List[str] = []
+            # Collect numeric IDs from matched references, ordered by similarity.
+            merge_ids: List[int] = []
             for ref, _sim in top_refs:
                 if ref.merge_id is None:
                     continue
-                id_strings.append(f"id:{ref.merge_id}")
+                merge_ids.append(ref.merge_id)
 
-            if id_strings:
-                if decisive:
-                    # Only keep the strongest ID in decisive cases
-                    meta["text"] = id_strings[0]
+            if merge_ids:
+                if decisive or len(merge_ids) == 1:
+                    # Decisive case or only one ID: keep a single, clean marker.
+                    meta["text"] = f"id:{merge_ids[0]}"
                 else:
-                    # Keep all suggestions as a single multiline string so that
-                    # the Label Studio text box shows one id per line.
-                    # Example: "id:1\nid:2\nid:3".
-                    meta["text"] = "\n".join(id_strings)
+                    # Non-decisive: keep all suggestions on a single line in
+                    # decreasing order of similarity, e.g. "id:20 35 47".
+                    meta["text"] = "id:" + " ".join(str(mid) for mid in merge_ids)
 
                 updated["meta"] = meta
                 updated["score"] = float(confidence)
         else:
-            # No match: leave region as-is
-            updated = res
+            # Reference track (manual ID from user): keep its original meta.text
+            # but mark it as fully confident.
+            if track.merge_id is not None:
+                updated["score"] = 1.0
 
         new_results.append(updated)
 
@@ -700,8 +771,15 @@ def main() -> None:
 
         video_path, _video_key = _get_video_path(task)
 
-        # Extract tracks from annotation results
-        tracks = _extract_tracks_from_results(getattr(ann, "result", []))
+        # Merge reference sequences that share the same numeric id:<#> into
+        # single tracks, then extract TrackSequence objects from the merged
+        # results. This prevents duplicates like multiple separate regions
+        # all labeled "id:20".
+        raw_results = getattr(ann, "result", []) or []
+        merged_results = merge_results_by_merge_id(raw_results)
+
+        # Extract tracks from merged annotation results
+        tracks = _extract_tracks_from_results(merged_results)
         if not tracks:
             logger.warning("No video rectangle sequences found in annotation; nothing to do")
             return
