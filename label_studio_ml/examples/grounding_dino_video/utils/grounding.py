@@ -22,7 +22,7 @@ from PIL import Image
 
 import groundingdino.datasets.transforms as T
 from groundingdino.util import box_ops
-from groundingdino.util.inference import load_model, predict
+from groundingdino.util.inference import load_model, predict, get_phrases_from_posmap
 
 try:
     from torch.cuda.amp import autocast
@@ -116,12 +116,25 @@ class GroundingDINOInference:
         # Note: torch.compile is disabled for Grounding DINO due to compatibility issues
         # with the Swin Transformer backbone's dynamic slicing operations
         
-        # Use larger resolution for better GPU utilization
-        max_size = int(os.getenv("GROUNDING_DINO_MAX_SIZE", "1333"))
-        base_size = int(os.getenv("GROUNDING_DINO_BASE_SIZE", "800"))
+        # Resolution settings for inference
+        # For batched inference, we need fixed sizes (not RandomResize)
+        self.max_size = int(os.getenv("GROUNDING_DINO_MAX_SIZE", "1333"))
+        self.base_size = int(os.getenv("GROUNDING_DINO_BASE_SIZE", "800"))
+        
+        # Standard transform with RandomResize (for single-frame inference)
         self.transform = T.Compose(
             [
-                T.RandomResize([base_size], max_size=max_size),
+                T.RandomResize([self.base_size], max_size=self.max_size),
+                T.ToTensor(),
+                T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+            ]
+        )
+        
+        # Fixed-size transform for batched inference (all frames must be same size)
+        # We use ResizeDebug which takes a fixed (h, w) tuple
+        self.batch_transform = T.Compose(
+            [
+                T.ResizeDebug((self.base_size, self.max_size)),  # Fixed size for batching
                 T.ToTensor(),
                 T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
             ]
@@ -299,10 +312,14 @@ class GroundingDINOInference:
         box_threshold: Optional[float] = None,
         text_threshold: Optional[float] = None,
     ) -> List[sv.Detections]:
-        """Perform batched inference on multiple frames for better GPU utilization.
+        """Perform TRUE batched inference on multiple frames for better GPU utilization.
+
+        This method stacks all frames into a single batch tensor and runs a single
+        forward pass through the model, significantly improving GPU utilization
+        compared to sequential frame-by-frame inference.
 
         Args:
-            frames: List of frames (numpy arrays in RGB format)
+            frames: List of frames (numpy arrays in RGB/BGR format from OpenCV)
             prompt: Text prompt for detection
             box_threshold: Confidence threshold for bounding boxes
             text_threshold: Confidence threshold for text matching
@@ -313,15 +330,115 @@ class GroundingDINOInference:
         if not frames:
             return []
 
-        resolved_prompt = (prompt or self.prompt).strip()
-        detections_list: List[sv.Detections] = []
-
-        for frame in frames:
-            detections = self.infer_frame(
-                frame,
-                prompt=resolved_prompt,
+        # For single frame, use standard inference (no batching overhead)
+        if len(frames) == 1:
+            return [self.infer_frame(
+                frames[0],
+                prompt=prompt,
                 box_threshold=box_threshold,
                 text_threshold=text_threshold,
+            )]
+
+        resolved_prompt = (prompt or self.prompt).strip()
+        if not resolved_prompt.endswith("."):
+            resolved_prompt = resolved_prompt + "."
+
+        box_threshold = (
+            float(box_threshold)
+            if box_threshold is not None
+            else float(os.getenv("GROUNDING_DINO_BOX_THRESHOLD", 0.35))
+        )
+        text_threshold = (
+            float(text_threshold)
+            if text_threshold is not None
+            else float(os.getenv("GROUNDING_DINO_TEXT_THRESHOLD", 0.25))
+        )
+
+        # Store original frame dimensions for coordinate scaling
+        frame_sizes: List[Tuple[int, int]] = []  # (height, width) for each frame
+
+        # Transform all frames to fixed-size tensors and stack into batch
+        tensors: List[torch.Tensor] = []
+        for frame in frames:
+            h, w = frame.shape[:2]
+            frame_sizes.append((h, w))
+            
+            # Convert BGR (OpenCV) to RGB PIL Image
+            pil_image = Image.fromarray(frame).convert("RGB")
+            tensor, _ = self.batch_transform(pil_image, None)
+            tensors.append(tensor)
+
+        # Stack into batch tensor: (batch_size, 3, H, W)
+        batch_tensor = torch.stack(tensors, dim=0).to(self.device)
+        batch_size = batch_tensor.shape[0]
+
+        # Run batched inference
+        with torch.no_grad():
+            if self.use_amp:
+                with autocast():
+                    outputs = self.model(
+                        batch_tensor,
+                        captions=[resolved_prompt] * batch_size,
+                    )
+            else:
+                outputs = self.model(
+                    batch_tensor,
+                    captions=[resolved_prompt] * batch_size,
+                )
+
+        # outputs["pred_logits"]: (batch_size, num_queries, 256)
+        # outputs["pred_boxes"]: (batch_size, num_queries, 4) in cxcywh normalized format
+        pred_logits = outputs["pred_logits"].cpu().sigmoid()
+        pred_boxes = outputs["pred_boxes"].cpu()
+
+        # Process each frame's predictions
+        detections_list: List[sv.Detections] = []
+        tokenizer = self.model.tokenizer
+        tokenized = tokenizer(resolved_prompt)
+
+        for i in range(batch_size):
+            frame_logits = pred_logits[i]  # (num_queries, 256)
+            frame_boxes = pred_boxes[i]    # (num_queries, 4)
+            orig_h, orig_w = frame_sizes[i]
+
+            # Filter by box threshold
+            max_logits = frame_logits.max(dim=1)[0]
+            mask = max_logits > box_threshold
+
+            if not mask.any():
+                detections_list.append(self._empty_detections())
+                continue
+
+            filtered_logits = frame_logits[mask]
+            filtered_boxes = frame_boxes[mask]
+            filtered_scores = max_logits[mask]
+
+            # Convert boxes from cxcywh normalized to xyxy pixel coordinates
+            # The boxes are normalized to the resized image, need to scale to original
+            xyxy = box_ops.box_cxcywh_to_xyxy(filtered_boxes)
+            xyxy = xyxy * torch.tensor([orig_w, orig_h, orig_w, orig_h])
+            xyxy = xyxy.numpy().astype(np.float32)
+            confidences = filtered_scores.numpy().astype(np.float32)
+
+            # Extract phrases for each detection
+            phrases = []
+            for logit in filtered_logits:
+                phrase = get_phrases_from_posmap(
+                    logit > text_threshold, tokenized, tokenizer
+                ).replace(".", "")
+                phrases.append(phrase)
+
+            # Filter by allowed labels
+            matches = self._filter_detections(phrases, xyxy, confidences)
+            if not matches:
+                detections_list.append(self._empty_detections())
+                continue
+
+            filtered_xyxy, filtered_scores_final, class_ids = zip(*matches)
+            detections = sv.Detections(
+                xyxy=np.stack(filtered_xyxy, axis=0),
+                confidence=np.array(filtered_scores_final, dtype=np.float32),
+                class_id=np.array(class_ids, dtype=np.int32),
             )
             detections_list.append(detections)
 
@@ -373,28 +490,31 @@ class GroundingDINOInference:
             fps,
         )
 
-        # Get batch size from parameter or environment. Default to single-frame inference.
+        # Get batch size from parameter or environment.
+        # Default to 8 for true batched inference (significant GPU utilization improvement)
         if batch_size is None:
             env_batch = os.getenv("GROUNDING_DINO_BATCH_SIZE")
             if env_batch is None:
-                batch_size = 1
+                batch_size = 8  # Default to batched inference for better GPU utilization
             else:
                 try:
                     batch_size = int(env_batch)
                 except ValueError:
                     logger.warning(
-                        "Invalid GROUNDING_DINO_BATCH_SIZE value '%s', falling back to 1",
+                        "Invalid GROUNDING_DINO_BATCH_SIZE value '%s', falling back to 8",
                         env_batch,
                     )
-                    batch_size = 1
+                    batch_size = 8
         if batch_size <= 0:
-            logger.warning("Received non-positive batch_size=%d, defaulting to 1", batch_size)
-            batch_size = 1
+            logger.warning("Received non-positive batch_size=%d, defaulting to 8", batch_size)
+            batch_size = 8
 
         use_batch_inference = batch_size > 1
-        logger.info("Effective batch size: %d", batch_size)
-        if not use_batch_inference:
-            logger.info("Batch size <= 1; using single-frame inference path")
+        logger.info(
+            "Effective batch size: %d (%s)",
+            batch_size,
+            "true batched inference" if use_batch_inference else "single-frame inference",
+        )
 
         progress_every = os.getenv("GROUNDING_DINO_PROGRESS_EVERY", "25")
         try:

@@ -1,8 +1,0 @@
-version: "3.11"
-
-services:
-  grounding_dino_video:
-    # SAHI support has been removed from this example. This file is kept as a stub so
-    # that any existing docker compose commands referencing it continue to work but
-    # have no functional effect.
-    environment: {}

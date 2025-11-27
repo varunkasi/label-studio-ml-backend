@@ -3,10 +3,16 @@ import logging
 import json
 
 from tqdm import tqdm
-from argparse import ArgumentParser
+from argparse import ArgumentParser, RawDescriptionHelpFormatter
 from model import YOLO
 from label_studio_sdk.client import LabelStudio
 from label_studio_ml.response import ModelResponse
+from tracking_presets import (
+    TRACKING_LAYERS,
+    apply_preset,
+    list_presets,
+    describe_preset,
+)
 
 LABEL_STUDIO_URL = os.getenv("LABEL_STUDIO_URL", "http://localhost:8080")
 LABEL_STUDIO_API_KEY = os.getenv("LABEL_STUDIO_API_KEY", "your_api_key")
@@ -19,7 +25,29 @@ logger = logging.getLogger(__name__)
 
 
 def arg_parser():
-    parser = ArgumentParser(description="YOLO client for Label Studio ML Backend")
+    epilog = (
+        "Composable Tracking Presets:\n"
+        "  Layers can be combined with '+' to address multiple concerns:\n"
+        "\n"
+        "  PLATFORM:  uav, ugv, handheld, fixed\n"
+        "  SCENE:     crowded, sparse, cluttered\n"
+        "  MOTION:    fast_motion, slow_motion, erratic\n"
+        "  DURATION:  long_video, short_clip\n"
+        "  MODALITY:  thermal, lowlight, hdr\n"
+        "  QUALITY:   high_precision, high_recall\n"
+        "\n"
+        "Examples:\n"
+        "  python cli.py --preset uav --project 123 --tasks 456\n"
+        "  python cli.py --preset uav+fast_motion+long_video --project 123 --tasks 456\n"
+        "  python cli.py --preset thermal+crowded+high_precision --project 123 --tasks 456\n"
+        "\n"
+        "Use --list-presets to see all layers, --describe-preset to see computed values.\n"
+    )
+    parser = ArgumentParser(
+        description="Grounding DINO Video client for Label Studio ML Backend",
+        formatter_class=RawDescriptionHelpFormatter,
+        epilog=epilog,
+    )
 
     parser.add_argument(
         "--ls-url", type=str, default=LABEL_STUDIO_URL, help="Label Studio URL"
@@ -57,6 +85,27 @@ def arg_parser():
         type=int,
         default=None,
         help="Batch size for processing frames (default: from env GROUNDING_DINO_BATCH_SIZE or 8)",
+    )
+    parser.add_argument(
+        "--preset",
+        type=str,
+        default=os.getenv("TRACKING_PRESET"),
+        help=(
+            "Tracking preset(s) for detection/tracking parameters. "
+            "Combine multiple layers with '+' (e.g., 'uav+fast_motion+long_video'). "
+            "Defaults to env TRACKING_PRESET."
+        ),
+    )
+    parser.add_argument(
+        "--list-presets",
+        action="store_true",
+        help="List all available tracking layers and exit.",
+    )
+    parser.add_argument(
+        "--describe-preset",
+        type=str,
+        metavar="PRESET",
+        help="Show computed parameter values for a preset and exit.",
     )
     return parser.parse_args()
 
@@ -209,6 +258,38 @@ class LabelStudioMLPredictor:
 
 if __name__ == "__main__":
     args = arg_parser()
+
+    # Handle --list-presets
+    if args.list_presets:
+        print(list_presets())
+        exit(0)
+
+    # Handle --describe-preset
+    if args.describe_preset:
+        print(describe_preset(args.describe_preset))
+        exit(0)
+
+    # Apply tracking preset if specified (must happen before model init)
+    if args.preset:
+        preset = apply_preset(args.preset)
+        logger.info(
+            "Using tracking preset '%s': %s",
+            preset.name,
+            preset.description,
+        )
+        # Show computed values for transparency
+        logger.info(
+            "Computed parameters: box=%.2f, text=%.2f, score=%.2f, "
+            "activation=%.2f, buffer=%d, match=%.2f, consecutive=%d",
+            preset.box_threshold,
+            preset.text_threshold,
+            preset.model_score_threshold,
+            preset.track_activation_threshold,
+            preset.lost_track_buffer,
+            preset.minimum_matching_threshold,
+            preset.minimum_consecutive_frames,
+        )
+
     predictor = LabelStudioMLPredictor(args.ls_url, args.ls_api_key)
     predictor.run(
         args.project,

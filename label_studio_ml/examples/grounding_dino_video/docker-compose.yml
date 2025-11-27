@@ -32,26 +32,51 @@ services:
       GROUNDING_DINO_WEIGHTS: gdino_swint_darpa-ir-v1-1k_20_1.pth
       MODEL_SCORE_THRESHOLD: "0.5"
 
+      # Batch size for true batched GPU inference (default: 8)
+      # Higher values = better GPU utilization but more VRAM usage
+      # Recommended: 8-16 for 24GB VRAM, 4-8 for 12GB VRAM
+      GROUNDING_DINO_BATCH_SIZE: "8"
+
       SPARSIFY_KF_FOR_SAM: "false"
 
-      # track_activation_threshold (float): Detection confidence threshold for track activation.
-      #   Increasing track_activation_threshold improves accuracy and stability but might miss
-      #   true detections. Decreasing it increases completeness but risks introducing noise and
-      #   instability.
-      # lost_track_buffer (int): Number of frames to buffer when a track is lost. Increasing
-      #   lost_track_buffer enhances occlusion handling, significantly reducing the likelihood of
-      #   track fragmentation or disappearance caused by brief detection gaps.
-      # minimum_matching_threshold (float): Threshold for matching tracks with detections.
-      #   Increasing minimum_matching_threshold improves accuracy but risks fragmentation.
-      #   Decreasing it improves completeness but risks false positives and drift.
-      # minimum_consecutive_frames (int): Frames an object must be tracked before it's considered
-      #   valid. Increasing minimum_consecutive_frames prevents accidental tracks from false or
-      #   duplicate detections but may miss shorter tracks.
-      # Tracker configuration defaults mirror ByteTrack
-      TRACKER_ACTIVATION_THRESHOLD: "0.2"
-      TRACKER_LOST_BUFFER: "100"
-      TRACKER_MATCH_THRESHOLD: "0.5"
-      TRACKER_MIN_CONSECUTIVE_FRAMES: "5"
+      # ==========================================================================
+      # TRACKING CONFIGURATION
+      # ==========================================================================
+      # Use composable presets (RECOMMENDED) instead of manual parameter tuning.
+      # Presets are validated and clamped to safe bounds automatically.
+      #
+      # Combine multiple layers with '+' to address different concerns:
+      #   PLATFORM:  uav, ugv, handheld, fixed
+      #   SCENE:     crowded, sparse, cluttered
+      #   MOTION:    fast_motion, slow_motion, erratic
+      #   DURATION:  long_video, short_clip
+      #   MODALITY:  thermal, lowlight, hdr
+      #   QUALITY:   high_precision, high_recall
+      #
+      # Examples:
+      #   TRACKING_PRESET: "uav"
+      #   TRACKING_PRESET: "uav+fast_motion+long_video"
+      #   TRACKING_PRESET: "thermal+crowded+high_precision"
+      #
+      # Can also be specified via CLI: python cli.py --preset uav+long_video
+      # Use --describe-preset to see computed values before running.
+      #
+      # UNCOMMENT ONE OF THE FOLLOWING:
+      # TRACKING_PRESET: "ugv"
+      # TRACKING_PRESET: "uav+long_video"
+      # TRACKING_PRESET: "uav+fast_motion+long_video"
+      #
+      # --------------------------------------------------------------------------
+      # MANUAL OVERRIDE (advanced users only)
+      # --------------------------------------------------------------------------
+      # If you need fine-grained control, uncomment these to override preset values.
+      # These are ONLY used if TRACKING_PRESET is NOT set.
+      # If TRACKING_PRESET is set, these are ignored (preset takes precedence).
+      #
+      # TRACKER_ACTIVATION_THRESHOLD: "0.30"  # 0.05-0.95, higher = fewer tracks
+      # TRACKER_LOST_BUFFER: "100"            # 1-1800 frames, higher = better occlusion handling
+      # TRACKER_MATCH_THRESHOLD: "0.40"       # 0.05-0.95, lower = more permissive matching
+      # TRACKER_MIN_CONSECUTIVE_FRAMES: "8"   # 1-100, higher = filters noise
 
     extra_hosts:
       - "host.docker.internal:host-gateway"  # for macos and unix      

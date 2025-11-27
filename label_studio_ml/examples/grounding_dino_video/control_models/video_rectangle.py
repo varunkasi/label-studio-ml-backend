@@ -42,11 +42,19 @@ TRACKER_PARAM_CASTERS = {
 }
 
 
-def _require_env(name: str) -> str:
+def _get_env(name: str, default: str = None) -> str:
+    """Get environment variable, returning default if not set.
+
+    When using tracking presets, env vars are set by apply_preset().
+    When not using presets, env vars should be set in docker-compose.yml.
+    """
     value = os.getenv(name)
     if value is None or value == "":
+        if default is not None:
+            return default
         raise RuntimeError(
-            f"Required environment variable '{name}' is not set or empty."
+            f"Environment variable '{name}' is not set. "
+            f"Either use --preset or set {name} in docker-compose.yml."
         )
     return value
 
@@ -238,7 +246,7 @@ class VideoRectangleModel(ControlModel):
         kwargs: Dict = {}
 
         for param, env_name in TRACKER_ENV_MAP.items():
-            value = _require_env(env_name)
+            value = _get_env(env_name)
             try:
                 caster = TRACKER_PARAM_CASTERS.get(param, float)
                 if caster is int:
@@ -264,7 +272,7 @@ class VideoRectangleModel(ControlModel):
     def _get_float_attr(self, key: str) -> Optional[float]:
         env_name = MODEL_THRESHOLD_ENV_MAP.get(key)
         if env_name:
-            env_value = _require_env(env_name)
+            env_value = _get_env(env_name)
             try:
                 return float(env_value)
             except ValueError as exc:
