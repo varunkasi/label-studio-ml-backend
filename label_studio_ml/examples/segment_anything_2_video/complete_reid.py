@@ -57,6 +57,7 @@ class TrackFeatures:
     geom: np.ndarray
     shape: np.ndarray
     samples: int
+    sam2_vec: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -96,6 +97,62 @@ PRESETS: Dict[str, ReIDPreset] = {
         decisive_min_top1=0.6,
     ),
 }
+
+
+_SAM2_PREDICTOR = None
+
+
+def _get_sam2_predictor():
+    """Lazily initialize and return a global SAM2ImagePredictor instance.
+
+    Uses the same environment variables as the other SAM2 examples:
+    DEVICE, MODEL_CONFIG, MODEL_CHECKPOINT.
+    """
+
+    global _SAM2_PREDICTOR
+    if _SAM2_PREDICTOR is not None:
+        return _SAM2_PREDICTOR
+
+    try:
+        from sam2.build_sam import build_sam2  # type: ignore[import]
+        from sam2.sam2_image_predictor import SAM2ImagePredictor  # type: ignore[import]
+    except ImportError as exc:  # pragma: no cover - environment-specific
+        raise ReIDCLIError(
+            "SAM2 feature backend requested but 'sam2' package is not available in this environment."
+        ) from exc
+
+    device = os.getenv("DEVICE", "cuda")
+    model_config = os.getenv("MODEL_CONFIG", "configs/sam2.1/sam2.1_hiera_l.yaml")
+    model_checkpoint = os.getenv("MODEL_CHECKPOINT", "sam2.1_hiera_large.pt")
+
+    # Prefer a checkpoint in the working tree (/app/checkpoints) but fall
+    # back to the SAM2 repo's own checkpoints directory (/sam2/checkpoints)
+    # as used in the Dockerfile.
+    root_dir = os.getcwd()
+    cand_app = os.path.join(root_dir, "checkpoints", model_checkpoint)
+    cand_sam2 = os.path.join("/sam2", "checkpoints", model_checkpoint)
+    if os.path.exists(cand_app):
+        sam2_checkpoint = cand_app
+    elif os.path.exists(cand_sam2):
+        sam2_checkpoint = cand_sam2
+    else:
+        raise ReIDCLIError(
+            f"SAM2 checkpoint '{model_checkpoint}' not found. "
+            f"Checked: {cand_app} and {cand_sam2}. Make sure the Docker "
+            f"image has downloaded checkpoints and that they are visible "
+            f"inside the container."
+        )
+
+    logger.info(
+        "Initializing SAM2ImagePredictor (DEVICE=%s, CONFIG=%s, CHECKPOINT=%s)",
+        device,
+        model_config,
+        sam2_checkpoint,
+    )
+
+    sam2_model = build_sam2(model_config, sam2_checkpoint, device=device)
+    _SAM2_PREDICTOR = SAM2ImagePredictor(sam2_model)
+    return _SAM2_PREDICTOR
 
 
 def _parse_args() -> argparse.Namespace:
@@ -157,6 +214,27 @@ def _parse_args() -> argparse.Namespace:
         help=(
             "Re-ID preset profile (affects sampling and thresholds). "
             "Defaults to env REID_PROFILE or 'uav'."
+        ),
+    )
+    parser.add_argument(
+        "--feature-backend",
+        choices=["classic", "sam2"],
+        default=os.getenv("REID_FEATURE_BACKEND", "classic"),
+        help=(
+            "Feature backend to use: 'classic' (color+geometry+HOG) or "
+            "'sam2' (SAM2-based embeddings). Defaults to env "
+            "REID_FEATURE_BACKEND or 'classic'."
+        ),
+    )
+    parser.add_argument(
+        "--sam2-padding-fraction",
+        type=float,
+        default=None,
+        help=(
+            "When using --feature-backend sam2, controls how much to pad "
+            "each bounding box on all sides before forming the SAM2 patch. "
+            "If omitted, a profile-specific default is used (e.g. slightly "
+            "larger for UAV than UGV)."
         ),
     )
     parser.add_argument(
@@ -517,6 +595,169 @@ def _compute_track_features(
     return features
 
 
+def _compute_track_features_sam2(
+    video_path: str,
+    tracks: List[TrackSequence],
+    preset: ReIDPreset,
+    padding_fraction: float,
+) -> Dict[str, TrackFeatures]:
+    """Compute per-track SAM2 embedding features.
+
+    Each sampled bounding box is treated as a pseudo-image patch. For every
+    frame, patches are embedded in a batch using SAM2ImagePredictor, then
+    average-pooled spatially to a single vector per patch. Per-track vectors
+    are averaged over all samples and L2-normalized.
+    """
+
+    try:
+        import torch  # type: ignore[import]
+    except ImportError as exc:  # pragma: no cover - environment-specific
+        raise ReIDCLIError(
+            "SAM2 feature backend requested but 'torch' is not available in this environment."
+        ) from exc
+
+    # Build sampling map: frame_idx (0-based) -> list of (track_id, frame_item)
+    frame_requests: Dict[int, List[Tuple[str, Dict[str, Any]]]] = {}
+    for track in tracks:
+        samples = _select_sample_frames(track, preset.max_samples_per_track)
+        for item in samples:
+            frame = int(item.get("frame", 0))
+            if frame <= 0:
+                continue
+            frame_idx = frame - 1
+            frame_requests.setdefault(frame_idx, []).append((track.region_id, item))
+
+    if not frame_requests:
+        logger.warning("No frames selected for SAM2 feature extraction")
+        return {}
+
+    total_frames = len(frame_requests)
+    logger.info(
+        "Preparing to extract SAM2 features from %d unique frame(s)", total_frames
+    )
+
+    predictor = _get_sam2_predictor()
+
+    # Aggregators for per-track embeddings
+    emb_sum: Dict[str, np.ndarray] = {}
+    emb_count: Dict[str, int] = {}
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise ReIDCLIError(f"Could not open video file: {video_path}")
+
+    try:
+        for idx, frame_idx in enumerate(sorted(frame_requests.keys()), 1):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            success, frame_bgr = cap.read()
+            if not success or frame_bgr is None:
+                logger.warning("Failed to read frame %d from video", frame_idx)
+                continue
+
+            h, w, _ = frame_bgr.shape
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+
+            requests = frame_requests[frame_idx]
+            patches: List[np.ndarray] = []
+            owners: List[str] = []
+
+            for region_id, item in requests:
+                x = float(item.get("x", 0.0)) / 100.0
+                y = float(item.get("y", 0.0)) / 100.0
+                bw = float(item.get("width", 0.0)) / 100.0
+                bh = float(item.get("height", 0.0)) / 100.0
+
+                x0 = x * w
+                y0 = y * h
+                x1 = (x + bw) * w
+                y1 = (y + bh) * h
+
+                cx = 0.5 * (x0 + x1)
+                cy = 0.5 * (y0 + y1)
+                box_w = x1 - x0
+                box_h = y1 - y0
+                if box_w <= 1 or box_h <= 1:
+                    continue
+
+                # Apply symmetric padding where possible, without going
+                # outside the image bounds.
+                pad_w = box_w * padding_fraction * 0.5
+                pad_h = box_h * padding_fraction * 0.5
+                x0_exp = max(0.0, cx - (box_w * 0.5 + pad_w))
+                y0_exp = max(0.0, cy - (box_h * 0.5 + pad_h))
+                x1_exp = min(float(w), cx + (box_w * 0.5 + pad_w))
+                y1_exp = min(float(h), cy + (box_h * 0.5 + pad_h))
+
+                ix0 = int(round(x0_exp))
+                iy0 = int(round(y0_exp))
+                ix1 = int(round(x1_exp))
+                iy1 = int(round(y1_exp))
+                if ix1 <= ix0 or iy1 <= iy0:
+                    continue
+
+                patch = frame_rgb[iy0:iy1, ix0:ix1]
+                if patch.size == 0:
+                    continue
+
+                patches.append(patch)
+                owners.append(region_id)
+
+            if not patches:
+                continue
+
+            # Embed all patches in this frame as a batch
+            predictor.set_image_batch(patches)
+            feats = predictor._features.get("image_embed")  # type: ignore[attr-defined]
+            if feats is None:
+                logger.warning("SAM2 predictor returned no image_embed features")
+                continue
+
+            # feats: (B, C, H, W) tensor; pool spatial dims
+            if hasattr(feats, "detach"):
+                emb_batch = feats.mean(dim=(2, 3)).detach().cpu().numpy()
+            else:  # pragma: no cover - defensive
+                emb_batch = feats.mean(axis=(2, 3))
+
+            for region_id, vec in zip(owners, emb_batch):
+                v = vec.astype("float32")
+                if region_id not in emb_sum:
+                    emb_sum[region_id] = np.zeros_like(v)
+                    emb_count[region_id] = 0
+                emb_sum[region_id] += v
+                emb_count[region_id] += 1
+
+            # Periodic progress feedback for long runs
+            if idx % 50 == 0 or idx == total_frames:
+                pct = 100.0 * float(idx) / float(total_frames)
+                logger.info(
+                    "SAM2 feature extraction progress: %d/%d frames (%.1f%%)",
+                    idx,
+                    total_frames,
+                    pct,
+                )
+    finally:
+        cap.release()
+
+    features: Dict[str, TrackFeatures] = {}
+    for region_id, count in emb_count.items():
+        if count <= 0:
+            continue
+        mean_vec = emb_sum[region_id] / float(count)
+        norm = float(np.linalg.norm(mean_vec))
+        if norm > 0.0:
+            mean_vec /= norm
+        features[region_id] = TrackFeatures(
+            hist=np.zeros(1, dtype="float32"),
+            geom=np.zeros(1, dtype="float32"),
+            shape=np.zeros(1, dtype="float32"),
+            samples=count,
+            sam2_vec=mean_vec.astype("float32"),
+        )
+
+    logger.info("Computed SAM2 features for %d track(s)", len(features))
+    return features
+
+
 def _hist_intersection(h1: np.ndarray, h2: np.ndarray) -> float:
     return float(np.minimum(h1, h2).sum())
 
@@ -552,10 +793,41 @@ def _compute_similarity(
     return max(0.0, min(1.0, sim))
 
 
+def _compute_similarity_sam2(
+    ref_track: TrackSequence,
+    ref_feat: TrackFeatures,
+    cand_track: TrackSequence,
+    cand_feat: TrackFeatures,
+    center_frames: Dict[str, float],
+) -> float:
+    """Compute similarity for SAM2 backend using cosine similarity only.
+
+    Cosine similarity between SAM2 embeddings is mapped from [-1, 1] to
+    [0, 1]. No temporal term is applied; all time-awareness comes from the
+    distribution of available reference/candidate tracks, not an explicit
+    decay factor.
+    """
+
+    if ref_feat.sam2_vec is None or cand_feat.sam2_vec is None:
+        return 0.0
+
+    v1 = ref_feat.sam2_vec.astype("float32")
+    v2 = cand_feat.sam2_vec.astype("float32")
+    if v1.shape != v2.shape or v1.size == 0:
+        return 0.0
+
+    cos = float(np.dot(v1, v2))
+    # Numerical safety
+    cos = max(-1.0, min(1.0, cos))
+    sim_embed = 0.5 * (cos + 1.0)  # map to [0, 1]
+    return max(0.0, min(1.0, sim_embed))
+
+
 def _build_reid_matches(
     tracks: List[TrackSequence],
     features: Dict[str, TrackFeatures],
     preset: ReIDPreset,
+    feature_backend: str,
 ) -> Dict[str, Dict[str, Any]]:
     """For each candidate track, compute top-3 reference matches and confidences.
 
@@ -570,9 +842,20 @@ def _build_reid_matches(
 
     logger.info("Reference tracks: %d, candidate tracks: %d", len(refs), len(cands))
 
+    # Pre-compute simple time centers for all tracks
+    center_frames: Dict[str, float] = {}
+    for t in tracks:
+        start, end = t.frame_range
+        center_frames[t.region_id] = 0.5 * float(start + end)
+
     # Only consider tracks with computed features
     def has_feat(t: TrackSequence) -> bool:
-        return t.region_id in features and features[t.region_id].samples > 0
+        f = features.get(t.region_id)
+        if f is None or f.samples <= 0:
+            return False
+        if feature_backend == "sam2":
+            return f.sam2_vec is not None
+        return True
 
     refs = [t for t in refs if has_feat(t)]
     cands = [t for t in cands if has_feat(t)]
@@ -592,7 +875,16 @@ def _build_reid_matches(
             ref_feat = features.get(ref.region_id)
             if ref_feat is None:
                 continue
-            sim = _compute_similarity(ref_feat, cand_feat, preset)
+            if feature_backend == "sam2":
+                sim = _compute_similarity_sam2(
+                    ref_track=ref,
+                    ref_feat=ref_feat,
+                    cand_track=cand,
+                    cand_feat=cand_feat,
+                    center_frames=center_frames,
+                )
+            else:
+                sim = _compute_similarity(ref_feat, cand_feat, preset)
             scored_all.append((ref, sim))
 
         if not scored_all:
@@ -750,6 +1042,17 @@ def main() -> None:
         raise ReIDCLIError(f"Unknown profile '{args.profile}'. Choose from: {sorted(PRESETS.keys())}")
     preset = PRESETS[args.profile]
 
+    # Derive SAM2 padding fraction: CLI flag wins, otherwise use a
+    # profile-specific default when the SAM2 backend is selected.
+    sam2_padding_fraction = args.sam2_padding_fraction
+    if sam2_padding_fraction is None:
+        if args.profile == "uav":
+            sam2_padding_fraction = 0.25
+        elif args.profile == "ugv":
+            sam2_padding_fraction = 0.2
+        else:
+            sam2_padding_fraction = 0.2
+
     logger.info("=" * 80)
     logger.info("🤝 COMPLETE RE-ID CLI STARTED")
     logger.info("=" * 80)
@@ -759,6 +1062,9 @@ def main() -> None:
     logger.info("   • Task ID: %s", args.task)
     logger.info("   • Annotation ID: %s", args.annotation)
     logger.info("   • Profile: %s", args.profile)
+    logger.info("   • Feature backend: %s", args.feature_backend)
+    if args.feature_backend == "sam2":
+        logger.info("   • SAM2 padding fraction: %.3f", sam2_padding_fraction)
     logger.info("=" * 80)
 
     exit_code = 0
@@ -784,14 +1090,22 @@ def main() -> None:
             logger.warning("No video rectangle sequences found in annotation; nothing to do")
             return
 
-        # Compute features
-        features = _compute_track_features(video_path, tracks, preset)
+        # Compute features according to the selected backend
+        if args.feature_backend == "sam2":
+            features = _compute_track_features_sam2(
+                video_path,
+                tracks,
+                preset,
+                sam2_padding_fraction,
+            )
+        else:
+            features = _compute_track_features(video_path, tracks, preset)
         if not features:
             logger.warning("Failed to compute features for any track; aborting re-ID")
             return
 
         # Build matches for candidate tracks
-        matches = _build_reid_matches(tracks, features, preset)
+        matches = _build_reid_matches(tracks, features, preset, args.feature_backend)
         if not matches:
             logger.warning("No candidate tracks received confident matches; uploading copy-only prediction")
 

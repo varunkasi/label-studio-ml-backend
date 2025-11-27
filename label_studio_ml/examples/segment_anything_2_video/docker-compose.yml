@@ -32,9 +32,9 @@ services:
       # specify device
       - DEVICE=cuda
       # SAM2 model config
-      - MODEL_CONFIG=configs/sam2.1/sam2.1_hiera_t.yaml
+      - MODEL_CONFIG=configs/sam2.1/sam2.1_hiera_l.yaml
       # SAM2 checkpoint
-      - MODEL_CHECKPOINT=sam2.1_hiera_tiny.pt
+      - MODEL_CHECKPOINT=sam2.1_hiera_large.pt
 
       # Specify the Label Studio URL and API key to access
       # uploaded, local storage and cloud storage files.
