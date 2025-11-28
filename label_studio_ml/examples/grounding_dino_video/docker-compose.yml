@@ -32,10 +32,19 @@ services:
       GROUNDING_DINO_WEIGHTS: gdino_swint_darpa-ir-v1-1k_20_1.pth
       MODEL_SCORE_THRESHOLD: "0.5"
 
-      # Batch size for true batched GPU inference (default: 8)
+      # Batch size for GPU inference (default: 8)
       # Higher values = better GPU utilization but more VRAM usage
       # Recommended: 8-16 for 24GB VRAM, 4-8 for 12GB VRAM
       GROUNDING_DINO_BATCH_SIZE: "8"
+      
+      # Frame skipping for faster processing (default: auto)
+      # - "auto": Auto-determine based on video length (recommended)
+      #           >10k frames: skip=3, >5k frames: skip=2, else: skip=1
+      # - "1": No skipping (process every frame)
+      # - "2": Process every 2nd frame (2x speedup)
+      # - "3": Process every 3rd frame (3x speedup)
+      # Skipped frames use interpolated bounding boxes from keyframes.
+      GROUNDING_DINO_FRAME_SKIP: "auto"
 
       SPARSIFY_KF_FOR_SAM: "false"
 

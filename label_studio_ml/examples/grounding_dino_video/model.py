@@ -103,6 +103,7 @@ class YOLO(LabelStudioMLBase):
         output_dir = kwargs.get('output_dir')
         save_frames = kwargs.get('save_frames', False)
         batch_size = kwargs.get('batch_size')
+        frame_skip = kwargs.get('frame_skip')
 
         predictions = []
         for task in tasks:
@@ -123,6 +124,7 @@ class YOLO(LabelStudioMLBase):
                     output_dir=task_output_dir,
                     save_frames=save_frames,
                     batch_size=batch_size,
+                    frame_skip=frame_skip,
                 )
 
                 if isinstance(model, VideoRectangleModel):

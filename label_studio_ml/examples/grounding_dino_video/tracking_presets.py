@@ -109,13 +109,18 @@ TRACKING_LAYERS: Dict[str, TrackingLayer] = {
         name="uav",
         description="Aerial/drone: small subjects, fast relative motion",
         category="platform",
-        box_threshold=0.30,
-        text_threshold=0.25,
-        model_score_threshold=0.55,
-        track_activation_threshold=0.35,
-        lost_track_buffer=200,
-        minimum_matching_threshold=0.25,
-        minimum_consecutive_frames=10,
+        # Lower thresholds to catch small/distant objects
+        box_threshold=0.20,
+        text_threshold=0.20,
+        model_score_threshold=0.40,
+        # Lower activation threshold - small objects have lower confidence
+        track_activation_threshold=0.25,
+        # Longer buffer for temporary occlusions during maneuvers
+        lost_track_buffer=150,
+        # Lower IoU threshold - objects move fast between frames
+        minimum_matching_threshold=0.20,
+        # Fewer consecutive frames - don't wait too long to confirm
+        minimum_consecutive_frames=5,
     ),
 
     "ugv": TrackingLayer(
@@ -219,11 +224,12 @@ TRACKING_LAYERS: Dict[str, TrackingLayer] = {
         name="long_video",
         description="Long videos (>10 min), minimize fragmentation",
         category="duration",
-        box_threshold="+0.10",
-        model_score_threshold="+0.10",
-        track_activation_threshold="+0.20",
-        lost_track_buffer="*2.0",  # Double the buffer
-        minimum_consecutive_frames="+12",
+        # DON'T raise detection thresholds - causes missed detections
+        # Instead, focus on tracker parameters to reduce fragmentation
+        lost_track_buffer="*2.0",  # Double the buffer for re-identification
+        minimum_consecutive_frames="+3",  # Slightly more frames to confirm (not +12)
+        # Lower matching threshold to allow re-association after gaps
+        minimum_matching_threshold="-0.05",
     ),
 
     "short_clip": TrackingLayer(

@@ -87,6 +87,15 @@ def arg_parser():
         help="Batch size for processing frames (default: from env GROUNDING_DINO_BATCH_SIZE or 8)",
     )
     parser.add_argument(
+        "--frame-skip",
+        type=str,
+        default=None,
+        help=(
+            "Process every Nth frame, interpolate others (default: from env or 'auto'). "
+            "'auto' determines based on video length. '1' = no skipping, '2' = 2x speedup, etc."
+        ),
+    )
+    parser.add_argument(
         "--preset",
         type=str,
         default=os.getenv("TRACKING_PRESET"),
@@ -125,7 +134,7 @@ class LabelStudioMLPredictor:
         self.ls = LabelStudio(base_url=ls_url, api_key=ls_api_key)
         logger.info(f"Successfully connected to Label Studio: {ls_url}")
 
-    def run(self, project, tasks, output_dir=None, save_frames=False, batch_size=None):
+    def run(self, project, tasks, output_dir=None, save_frames=False, batch_size=None, frame_skip=None):
         # initialize Label Studio SDK client
         ls = self.ls
         project = ls.projects.get(id=project)
@@ -153,6 +162,7 @@ class LabelStudioMLPredictor:
                 output_dir=output_dir,
                 save_frames=save_frames,
                 batch_size=batch_size,
+                frame_skip=frame_skip,
             )
             predictions = self.postprocess_response(model, response, task)
 
@@ -297,4 +307,5 @@ if __name__ == "__main__":
         output_dir=args.output_dir,
         save_frames=args.save_frames,
         batch_size=args.batch_size,
+        frame_skip=args.frame_skip,
     )

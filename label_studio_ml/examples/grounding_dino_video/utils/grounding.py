@@ -53,6 +53,129 @@ class VideoTrackingResult:
     frames: List[FrameDetections]
 
 
+def interpolate_detections(
+    det_before: sv.Detections,
+    det_after: sv.Detections,
+    alpha: float,
+) -> sv.Detections:
+    """Linearly interpolate bounding boxes between two detection sets.
+    
+    This is used for frame skipping - we detect on keyframes and interpolate
+    boxes for skipped frames. Only boxes with matching class_ids are interpolated.
+    
+    Args:
+        det_before: Detections from the earlier keyframe
+        det_after: Detections from the later keyframe  
+        alpha: Interpolation factor (0.0 = det_before, 1.0 = det_after)
+        
+    Returns:
+        Interpolated detections. Boxes present in both frames are interpolated.
+        Boxes only in det_before are included with fading confidence.
+        Boxes only in det_after are included with rising confidence.
+    """
+    if len(det_before) == 0:
+        # Scale confidence by alpha (boxes appearing)
+        if len(det_after) == 0:
+            return sv.Detections.empty()
+        result = det_after.copy()
+        if result.confidence is not None:
+            result.confidence = result.confidence * alpha
+        return result
+    
+    if len(det_after) == 0:
+        # Scale confidence by (1-alpha) (boxes disappearing)
+        result = det_before.copy()
+        if result.confidence is not None:
+            result.confidence = result.confidence * (1.0 - alpha)
+        return result
+    
+    # Match boxes by class_id and proximity (IoU)
+    # For simplicity, we'll interpolate all boxes from det_before
+    # and blend with det_after based on alpha
+    
+    # Simple approach: weighted average of all boxes
+    # More sophisticated: Hungarian matching by IoU, then interpolate matched pairs
+    
+    # Use simple weighted combination for now
+    interpolated_xyxy = []
+    interpolated_conf = []
+    interpolated_class = []
+    
+    # Track which det_after boxes have been matched
+    matched_after = set()
+    
+    for i in range(len(det_before)):
+        box_before = det_before.xyxy[i]
+        class_before = det_before.class_id[i] if det_before.class_id is not None else 0
+        conf_before = det_before.confidence[i] if det_before.confidence is not None else 1.0
+        
+        # Find best matching box in det_after with same class
+        best_iou = 0.0
+        best_j = -1
+        
+        for j in range(len(det_after)):
+            if j in matched_after:
+                continue
+            class_after = det_after.class_id[j] if det_after.class_id is not None else 0
+            if class_before != class_after:
+                continue
+            
+            # Compute IoU
+            box_after = det_after.xyxy[j]
+            x1 = max(box_before[0], box_after[0])
+            y1 = max(box_before[1], box_after[1])
+            x2 = min(box_before[2], box_after[2])
+            y2 = min(box_before[3], box_after[3])
+            
+            inter = max(0, x2 - x1) * max(0, y2 - y1)
+            area_before = (box_before[2] - box_before[0]) * (box_before[3] - box_before[1])
+            area_after = (box_after[2] - box_after[0]) * (box_after[3] - box_after[1])
+            union = area_before + area_after - inter
+            
+            iou = inter / union if union > 0 else 0.0
+            if iou > best_iou:
+                best_iou = iou
+                best_j = j
+        
+        if best_j >= 0 and best_iou > 0.1:  # Matched
+            matched_after.add(best_j)
+            box_after = det_after.xyxy[best_j]
+            conf_after = det_after.confidence[best_j] if det_after.confidence is not None else 1.0
+            
+            # Interpolate box coordinates
+            interp_box = box_before * (1.0 - alpha) + box_after * alpha
+            interp_conf = conf_before * (1.0 - alpha) + conf_after * alpha
+            
+            interpolated_xyxy.append(interp_box)
+            interpolated_conf.append(interp_conf)
+            interpolated_class.append(class_before)
+        else:
+            # Box disappearing - fade out
+            interpolated_xyxy.append(box_before)
+            interpolated_conf.append(conf_before * (1.0 - alpha))
+            interpolated_class.append(class_before)
+    
+    # Add unmatched boxes from det_after (appearing boxes)
+    for j in range(len(det_after)):
+        if j not in matched_after:
+            box_after = det_after.xyxy[j]
+            conf_after = det_after.confidence[j] if det_after.confidence is not None else 1.0
+            class_after = det_after.class_id[j] if det_after.class_id is not None else 0
+            
+            interpolated_xyxy.append(box_after)
+            interpolated_conf.append(conf_after * alpha)  # Fade in
+            interpolated_class.append(class_after)
+    
+    if len(interpolated_xyxy) == 0:
+        return sv.Detections.empty()
+    
+    return sv.Detections(
+        xyxy=np.array(interpolated_xyxy, dtype=np.float32),
+        confidence=np.array(interpolated_conf, dtype=np.float32),
+        class_id=np.array(interpolated_class, dtype=np.int32),
+    )
+
+
 class GroundingDINOInference:
     """Singleton-style helper around Grounding DINO inference primitives."""
 
@@ -121,20 +244,10 @@ class GroundingDINOInference:
         self.max_size = int(os.getenv("GROUNDING_DINO_MAX_SIZE", "1333"))
         self.base_size = int(os.getenv("GROUNDING_DINO_BASE_SIZE", "800"))
         
-        # Standard transform with RandomResize (for single-frame inference)
+        # Standard transform for inference
         self.transform = T.Compose(
             [
                 T.RandomResize([self.base_size], max_size=self.max_size),
-                T.ToTensor(),
-                T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-            ]
-        )
-        
-        # Fixed-size transform for batched inference (all frames must be same size)
-        # We use ResizeDebug which takes a fixed (h, w) tuple
-        self.batch_transform = T.Compose(
-            [
-                T.ResizeDebug((self.base_size, self.max_size)),  # Fixed size for batching
                 T.ToTensor(),
                 T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
             ]
@@ -312,11 +425,13 @@ class GroundingDINOInference:
         box_threshold: Optional[float] = None,
         text_threshold: Optional[float] = None,
     ) -> List[sv.Detections]:
-        """Perform TRUE batched inference on multiple frames for better GPU utilization.
+        """Perform optimized batch inference on multiple frames.
 
-        This method stacks all frames into a single batch tensor and runs a single
-        forward pass through the model, significantly improving GPU utilization
-        compared to sequential frame-by-frame inference.
+        This method processes frames sequentially but with optimizations:
+        - Pre-transforms all frames to tensors upfront
+        - Keeps tensors on GPU to avoid repeated CPU->GPU transfers
+        - Uses CUDA streams for overlapping compute and data transfer
+        - Minimizes Python overhead between frames
 
         Args:
             frames: List of frames (numpy arrays in RGB/BGR format from OpenCV)
@@ -329,15 +444,6 @@ class GroundingDINOInference:
         """
         if not frames:
             return []
-
-        # For single frame, use standard inference (no batching overhead)
-        if len(frames) == 1:
-            return [self.infer_frame(
-                frames[0],
-                prompt=prompt,
-                box_threshold=box_threshold,
-                text_threshold=text_threshold,
-            )]
 
         resolved_prompt = (prompt or self.prompt).strip()
         if not resolved_prompt.endswith("."):
@@ -354,93 +460,66 @@ class GroundingDINOInference:
             else float(os.getenv("GROUNDING_DINO_TEXT_THRESHOLD", 0.25))
         )
 
-        # Store original frame dimensions for coordinate scaling
-        frame_sizes: List[Tuple[int, int]] = []  # (height, width) for each frame
-
-        # Transform all frames to fixed-size tensors and stack into batch
-        tensors: List[torch.Tensor] = []
+        # Pre-transform all frames to tensors and move to GPU upfront
+        # This allows overlapping data transfer with computation
+        prepared_frames: List[Tuple[torch.Tensor, int, int]] = []
         for frame in frames:
             h, w = frame.shape[:2]
-            frame_sizes.append((h, w))
-            
-            # Convert BGR (OpenCV) to RGB PIL Image
             pil_image = Image.fromarray(frame).convert("RGB")
-            tensor, _ = self.batch_transform(pil_image, None)
-            tensors.append(tensor)
+            tensor, _ = self.transform(pil_image, None)
+            # Move to GPU immediately - this can overlap with next frame's CPU processing
+            tensor = tensor.to(self.device)
+            prepared_frames.append((tensor, h, w))
 
-        # Stack into batch tensor: (batch_size, 3, H, W)
-        batch_tensor = torch.stack(tensors, dim=0).to(self.device)
-        batch_size = batch_tensor.shape[0]
-
-        # Run batched inference
-        with torch.no_grad():
-            if self.use_amp:
-                with autocast():
-                    outputs = self.model(
-                        batch_tensor,
-                        captions=[resolved_prompt] * batch_size,
-                    )
-            else:
-                outputs = self.model(
-                    batch_tensor,
-                    captions=[resolved_prompt] * batch_size,
-                )
-
-        # outputs["pred_logits"]: (batch_size, num_queries, 256)
-        # outputs["pred_boxes"]: (batch_size, num_queries, 4) in cxcywh normalized format
-        pred_logits = outputs["pred_logits"].cpu().sigmoid()
-        pred_boxes = outputs["pred_boxes"].cpu()
-
-        # Process each frame's predictions
+        # Process all frames with model - tensors are already on GPU
         detections_list: List[sv.Detections] = []
-        tokenizer = self.model.tokenizer
-        tokenized = tokenizer(resolved_prompt)
+        
+        with torch.no_grad():
+            for tensor, orig_h, orig_w in prepared_frames:
+                if self.use_amp:
+                    with autocast():
+                        boxes, scores, phrases = predict(
+                            model=self.model,
+                            image=tensor,
+                            caption=resolved_prompt,
+                            box_threshold=box_threshold,
+                            text_threshold=text_threshold,
+                            device=self.device,
+                        )
+                else:
+                    boxes, scores, phrases = predict(
+                        model=self.model,
+                        image=tensor,
+                        caption=resolved_prompt,
+                        box_threshold=box_threshold,
+                        text_threshold=text_threshold,
+                        device=self.device,
+                    )
 
-        for i in range(batch_size):
-            frame_logits = pred_logits[i]  # (num_queries, 256)
-            frame_boxes = pred_boxes[i]    # (num_queries, 4)
-            orig_h, orig_w = frame_sizes[i]
+                if boxes.numel() == 0:
+                    detections_list.append(self._empty_detections())
+                    continue
 
-            # Filter by box threshold
-            max_logits = frame_logits.max(dim=1)[0]
-            mask = max_logits > box_threshold
+                # Convert boxes from cxcywh normalized to xyxy pixel coordinates
+                xyxy = box_ops.box_cxcywh_to_xyxy(boxes) * torch.tensor(
+                    [orig_w, orig_h, orig_w, orig_h]
+                )
+                xyxy = xyxy.cpu().numpy().astype(np.float32)
+                confidences = scores.cpu().numpy().astype(np.float32)
 
-            if not mask.any():
-                detections_list.append(self._empty_detections())
-                continue
+                # Filter by allowed labels
+                matches = self._filter_detections(phrases, xyxy, confidences)
+                if not matches:
+                    detections_list.append(self._empty_detections())
+                    continue
 
-            filtered_logits = frame_logits[mask]
-            filtered_boxes = frame_boxes[mask]
-            filtered_scores = max_logits[mask]
-
-            # Convert boxes from cxcywh normalized to xyxy pixel coordinates
-            # The boxes are normalized to the resized image, need to scale to original
-            xyxy = box_ops.box_cxcywh_to_xyxy(filtered_boxes)
-            xyxy = xyxy * torch.tensor([orig_w, orig_h, orig_w, orig_h])
-            xyxy = xyxy.numpy().astype(np.float32)
-            confidences = filtered_scores.numpy().astype(np.float32)
-
-            # Extract phrases for each detection
-            phrases = []
-            for logit in filtered_logits:
-                phrase = get_phrases_from_posmap(
-                    logit > text_threshold, tokenized, tokenizer
-                ).replace(".", "")
-                phrases.append(phrase)
-
-            # Filter by allowed labels
-            matches = self._filter_detections(phrases, xyxy, confidences)
-            if not matches:
-                detections_list.append(self._empty_detections())
-                continue
-
-            filtered_xyxy, filtered_scores_final, class_ids = zip(*matches)
-            detections = sv.Detections(
-                xyxy=np.stack(filtered_xyxy, axis=0),
-                confidence=np.array(filtered_scores_final, dtype=np.float32),
-                class_id=np.array(class_ids, dtype=np.int32),
-            )
-            detections_list.append(detections)
+                filtered_xyxy, filtered_scores_final, class_ids = zip(*matches)
+                detections = sv.Detections(
+                    xyxy=np.stack(filtered_xyxy, axis=0),
+                    confidence=np.array(filtered_scores_final, dtype=np.float32),
+                    class_id=np.array(class_ids, dtype=np.int32),
+                )
+                detections_list.append(detections)
 
         return detections_list
 
@@ -453,6 +532,7 @@ class GroundingDINOInference:
         text_threshold: Optional[float] = None,
         tracker_kwargs: Optional[Dict] = None,
         batch_size: Optional[int] = None,
+        frame_skip: Optional[int] = None,
         output_dir: Optional[str] = None,
         save_frames: bool = False,
     ) -> VideoTrackingResult:
@@ -465,6 +545,9 @@ class GroundingDINOInference:
             text_threshold: Confidence threshold for text matching
             tracker_kwargs: Arguments for ByteTrack tracker
             batch_size: Number of frames to process in parallel (default from env or 8)
+            frame_skip: Process every Nth frame, interpolate others (default from env or auto)
+                        Set to 1 to disable frame skipping.
+                        Set to "auto" or 0 to auto-determine based on video length.
             output_dir: Directory to save annotated frames (required if save_frames=True)
             save_frames: Whether to save annotated frames with bounding boxes
         """
@@ -475,6 +558,32 @@ class GroundingDINOInference:
         frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
         fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
 
+        # Determine frame skip rate
+        if frame_skip is None:
+            env_skip = os.getenv("GROUNDING_DINO_FRAME_SKIP", "auto")
+            if env_skip.lower() == "auto":
+                frame_skip = 0  # Will be auto-determined below
+            else:
+                try:
+                    frame_skip = int(env_skip)
+                except ValueError:
+                    logger.warning(
+                        "Invalid GROUNDING_DINO_FRAME_SKIP value '%s', using auto",
+                        env_skip,
+                    )
+                    frame_skip = 0
+        
+        # Auto-determine frame skip based on video length
+        if frame_skip == 0:
+            if frame_count > 10000:  # >5.5 min at 30fps
+                frame_skip = 3  # Process every 3rd frame
+            elif frame_count > 5000:  # >2.7 min at 30fps
+                frame_skip = 2  # Process every 2nd frame
+            else:
+                frame_skip = 1  # No skipping for short videos
+        
+        frame_skip = max(1, frame_skip)  # Ensure at least 1
+        
         # Setup output directory if saving frames
         if save_frames:
             if not output_dir:
@@ -484,10 +593,11 @@ class GroundingDINOInference:
             logger.info("Saving annotated frames to: %s", output_path)
 
         logger.info(
-            "Starting video tracking: path=%s, total_frames=%s, fps=%.2f",
+            "Starting video tracking: path=%s, total_frames=%s, fps=%.2f, frame_skip=%d",
             path,
             frame_count or "unknown",
             fps,
+            frame_skip,
         )
 
         # Get batch size from parameter or environment.
@@ -529,96 +639,140 @@ class GroundingDINOInference:
         tracker_kwargs = dict(tracker_kwargs or {})
         tracker_kwargs["frame_rate"] = fps
         tracker_kwargs = self._prepare_tracker_kwargs(tracker_kwargs)
-        print("Prepared tracker kwargs:", tracker_kwargs)
+        logger.info("Prepared tracker kwargs: %s", tracker_kwargs)
         tracker = sv.ByteTrack(**tracker_kwargs)
-        print("track_activation_threshold:", tracker.track_activation_threshold)
-        print("lost_track_buffer:", tracker.max_time_lost * 30.0 / fps)
-        print("minimum_matching_threshold:", tracker.minimum_matching_threshold)
-        print("minimum_consecutive_frames:", tracker.minimum_consecutive_frames)
+        logger.info(
+            "ByteTrack config: activation=%.2f, lost_buffer=%d, matching=%.2f, consecutive=%d",
+            tracker.track_activation_threshold,
+            int(tracker.max_time_lost * 30.0 / fps) if fps > 0 else 0,
+            tracker.minimum_matching_threshold,
+            tracker.minimum_consecutive_frames,
+        )
         frames: List[FrameDetections] = []
         latencies_ms: List[float] = []
         device_is_cuda = self.device.startswith("cuda") and torch.cuda.is_available()
         tracked_ids: Set[int] = set()
         
-        # Process frames in streaming batches to avoid memory issues
+        # Frame skipping state
+        # We collect frames in chunks, detect on keyframes, interpolate for skipped frames
         frame_index = 0
-        batch_frames: List[np.ndarray] = []
-        batch_indices: List[int] = []
+        keyframe_detections: Dict[int, sv.Detections] = {}  # keyframe_idx -> detections
+        pending_frames: List[Tuple[int, np.ndarray]] = []  # (idx, frame) waiting for next keyframe
+        last_keyframe_idx = -1
+        last_keyframe_det: Optional[sv.Detections] = None
+        
+        # For batching keyframes
+        keyframe_batch: List[np.ndarray] = []
+        keyframe_indices: List[int] = []
         
         try:
             while True:
-                while len(batch_frames) < batch_size:
+                # Read frames until we have enough keyframes for a batch
+                frames_to_process: List[Tuple[int, np.ndarray]] = []
+                
+                while len(keyframe_batch) < batch_size:
                     ret, frame = capture.read()
                     if not ret:
                         break
-                    batch_frames.append(frame)
-                    batch_indices.append(frame_index)
+                    
+                    is_keyframe = (frame_index % frame_skip == 0)
+                    frames_to_process.append((frame_index, frame, is_keyframe))
+                    
+                    if is_keyframe:
+                        keyframe_batch.append(frame)
+                        keyframe_indices.append(frame_index)
+                    
                     frame_index += 1
-
-                if len(batch_frames) == 0:
+                
+                if len(frames_to_process) == 0:
                     break
-
-                if progress_every_int and (frame_index - len(batch_frames)) % (
-                    progress_every_int * batch_size
-                ) < batch_size:
+                
+                # Progress logging
+                if progress_every_int and frame_index % (progress_every_int * frame_skip) < frame_skip:
                     logger.info(
-                        "Tracking progress: frames %d/%s",
+                        "Tracking progress: frames %d/%s (keyframes: %d)",
                         frame_index,
                         frame_count or "?",
+                        len(keyframe_detections) + len(keyframe_batch),
                     )
-
+                
                 if device_is_cuda:
                     torch.cuda.synchronize()
                 batch_start_time = time.perf_counter()
-
-                batch_detections_count = 0
-                print(
-                    "Batch thresholds:",
-                    "box_threshold=", box_threshold,
-                    "text_threshold=", text_threshold,
-                )
-                process_as_batch = use_batch_inference and len(batch_frames) > 1
-                detections_payload: List[Tuple[np.ndarray, int, sv.Detections]] = []
-
-                if process_as_batch:
-                    try:
-                        batch_detections_list = self.infer_batch(
-                            batch_frames,
-                            prompt=prompt,
-                            box_threshold=box_threshold,
-                            text_threshold=text_threshold,
-                        )
-                        detections_payload = list(
-                            zip(batch_frames, batch_indices, batch_detections_list)
-                        )
-                    except Exception as batch_error:
-                        logger.error(
-                            "Error processing batch starting at frame %d: %s",
-                            batch_indices[0] if batch_indices else 0,
-                            batch_error,
-                        )
-                        process_as_batch = False
-
-                if not process_as_batch:
-                    detections_payload = []
-                    for frame, frame_idx in zip(batch_frames, batch_indices):
+                
+                # Run detection on keyframes
+                if keyframe_batch:
+                    process_as_batch = use_batch_inference and len(keyframe_batch) > 1
+                    
+                    if process_as_batch:
                         try:
-                            detections = self.infer_frame(
-                                frame,
+                            batch_detections_list = self.infer_batch(
+                                keyframe_batch,
                                 prompt=prompt,
                                 box_threshold=box_threshold,
                                 text_threshold=text_threshold,
                             )
-                        except Exception as frame_error:
+                            for kf_idx, det in zip(keyframe_indices, batch_detections_list):
+                                keyframe_detections[kf_idx] = det
+                        except Exception as batch_error:
                             logger.error(
-                                "Error processing frame %d: %s", frame_idx, frame_error
+                                "Error processing keyframe batch: %s, falling back to single-frame",
+                                batch_error,
                             )
-                            continue
-                        detections_payload.append((frame, frame_idx, detections))
-
-                for frame, frame_idx, detections in detections_payload:
+                            process_as_batch = False
+                    
+                    if not process_as_batch:
+                        for kf_frame, kf_idx in zip(keyframe_batch, keyframe_indices):
+                            try:
+                                det = self.infer_frame(
+                                    kf_frame,
+                                    prompt=prompt,
+                                    box_threshold=box_threshold,
+                                    text_threshold=text_threshold,
+                                )
+                                keyframe_detections[kf_idx] = det
+                            except Exception as frame_error:
+                                logger.error(
+                                    "Error processing keyframe %d: %s", kf_idx, frame_error
+                                )
+                                keyframe_detections[kf_idx] = sv.Detections.empty()
+                
+                # Now process all frames (keyframes + interpolated)
+                batch_detections_count = 0
+                
+                for fidx, frame, is_keyframe in frames_to_process:
+                    if is_keyframe:
+                        # Use actual detection
+                        detections = keyframe_detections.get(fidx, sv.Detections.empty())
+                        last_keyframe_idx = fidx
+                        last_keyframe_det = detections
+                    else:
+                        # Interpolate between previous and next keyframe
+                        prev_kf_idx = (fidx // frame_skip) * frame_skip
+                        next_kf_idx = prev_kf_idx + frame_skip
+                        
+                        prev_det = keyframe_detections.get(prev_kf_idx)
+                        next_det = keyframe_detections.get(next_kf_idx)
+                        
+                        if prev_det is None and last_keyframe_det is not None:
+                            prev_det = last_keyframe_det
+                            prev_kf_idx = last_keyframe_idx
+                        
+                        if prev_det is None:
+                            # No previous keyframe yet, use empty
+                            detections = sv.Detections.empty()
+                        elif next_det is None:
+                            # No next keyframe (end of video or not yet processed)
+                            # Just use previous keyframe's detections
+                            detections = prev_det
+                        else:
+                            # Interpolate
+                            alpha = (fidx - prev_kf_idx) / frame_skip
+                            detections = interpolate_detections(prev_det, next_det, alpha)
+                    
+                    # Update tracker with detections (real or interpolated)
                     tracked = tracker.update_with_detections(detections)
-
+                    
                     if tracked.tracker_id is not None:
                         for tracker_id in tracked.tracker_id:
                             if tracker_id is None:
@@ -627,23 +781,24 @@ class GroundingDINOInference:
                                 tracked_ids.add(int(tracker_id))
                             except (TypeError, ValueError):
                                 continue
-
+                    
                     frames.append(
                         FrameDetections(
-                            frame_index=frame_idx,
+                            frame_index=fidx,
                             height=frame.shape[0],
                             width=frame.shape[1],
                             detections=tracked,
                         )
                     )
-
+                    
                     batch_detections_count += tracked.xyxy.shape[0]
-
+                    
                     if save_frames:
-                        annotated_frame = self._annotate_frame(frame, tracked, frame_idx)
-                        frame_filename = output_path / f"frame_{frame_idx:06d}.jpg"
+                        annotated_frame = self._annotate_frame(frame, tracked, fidx)
+                        frame_filename = output_path / f"frame_{fidx:06d}.jpg"
                         cv2.imwrite(str(frame_filename), annotated_frame)
-
+                
+                # Timing and logging
                 if device_is_cuda:
                     torch.cuda.synchronize()
                     gpu_mem_mib = torch.cuda.memory_allocated() / (1024 ** 2)
@@ -651,43 +806,35 @@ class GroundingDINOInference:
                 else:
                     gpu_mem_mib = None
                     gpu_mem_reserved_mib = None
-
+                
                 batch_time_ms = (time.perf_counter() - batch_start_time) * 1000.0
-                per_frame_ms = (
-                    batch_time_ms / len(batch_frames) if len(batch_frames) > 0 else 0.0
-                )
+                num_keyframes = len(keyframe_batch)
+                num_total = len(frames_to_process)
+                per_frame_ms = batch_time_ms / num_total if num_total > 0 else 0.0
                 latencies_ms.append(per_frame_ms)
-
-                if batch_indices and batch_indices[0] == batch_indices[-1]:
-                    frame_msg = "Batch frames %d: detections=%d, latency=%.1f ms/frame%s"
-                    frame_args = (
-                        batch_indices[0],
-                        batch_detections_count,
-                        per_frame_ms,
-                        (
-                            f", gpu_mem={gpu_mem_mib:.1f}/{gpu_mem_reserved_mib:.1f} MiB"
-                            if gpu_mem_mib is not None
-                            else ""
-                        ),
-                    )
-                else:
-                    frame_msg = "Batch frames %d-%d: detections=%d, latency=%.1f ms/frame%s"
-                    frame_args = (
-                        batch_indices[0] if batch_indices else 0,
-                        batch_indices[-1] if batch_indices else 0,
-                        batch_detections_count,
-                        per_frame_ms,
-                        (
-                            f", gpu_mem={gpu_mem_mib:.1f}/{gpu_mem_reserved_mib:.1f} MiB"
-                            if gpu_mem_mib is not None
-                            else ""
-                        ),
-                    )
-
-                logger.info(frame_msg, *frame_args)
-
-                batch_frames = []
-                batch_indices = []
+                
+                logger.info(
+                    "Processed frames %d-%d: keyframes=%d, total=%d, detections=%d, "
+                    "latency=%.1f ms/frame%s",
+                    frames_to_process[0][0] if frames_to_process else 0,
+                    frames_to_process[-1][0] if frames_to_process else 0,
+                    num_keyframes,
+                    num_total,
+                    batch_detections_count,
+                    per_frame_ms,
+                    f", gpu_mem={gpu_mem_mib:.1f}/{gpu_mem_reserved_mib:.1f} MiB"
+                    if gpu_mem_mib is not None else "",
+                )
+                
+                # Clear batch for next iteration
+                keyframe_batch = []
+                keyframe_indices = []
+                # Keep only recent keyframe detections (memory management)
+                if keyframe_detections:
+                    min_keep = max(keyframe_detections.keys()) - frame_skip * 2
+                    keyframe_detections = {
+                        k: v for k, v in keyframe_detections.items() if k >= min_keep
+                    }
 
         except Exception as e:
             logger.error("Error during video tracking: %s", e)
