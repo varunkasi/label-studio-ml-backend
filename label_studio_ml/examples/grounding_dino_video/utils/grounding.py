@@ -77,17 +77,22 @@ def interpolate_detections(
         # Scale confidence by alpha (boxes appearing)
         if len(det_after) == 0:
             return sv.Detections.empty()
-        result = det_after.copy()
-        if result.confidence is not None:
-            result.confidence = result.confidence * alpha
-        return result
+        # Create new Detections with scaled confidence
+        scaled_conf = det_after.confidence * alpha if det_after.confidence is not None else None
+        return sv.Detections(
+            xyxy=det_after.xyxy.copy(),
+            confidence=scaled_conf,
+            class_id=det_after.class_id.copy() if det_after.class_id is not None else None,
+        )
     
     if len(det_after) == 0:
         # Scale confidence by (1-alpha) (boxes disappearing)
-        result = det_before.copy()
-        if result.confidence is not None:
-            result.confidence = result.confidence * (1.0 - alpha)
-        return result
+        scaled_conf = det_before.confidence * (1.0 - alpha) if det_before.confidence is not None else None
+        return sv.Detections(
+            xyxy=det_before.xyxy.copy(),
+            confidence=scaled_conf,
+            class_id=det_before.class_id.copy() if det_before.class_id is not None else None,
+        )
     
     # Match boxes by class_id and proximity (IoU)
     # For simplicity, we'll interpolate all boxes from det_before

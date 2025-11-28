@@ -111,7 +111,7 @@ class YOLO(LabelStudioMLBase):
             regions = []
             for model in control_models:
                 path = model.get_path(task)
-                print(f"[YOLO] {model.__class__.__name__} using media at {path}")
+                print(f"[GroundingDINO] {model.__class__.__name__} using media at {path}")
                 
                 # Create task-specific output directory if saving frames
                 task_output_dir = None
@@ -119,13 +119,17 @@ class YOLO(LabelStudioMLBase):
                     task_id = task.get('id', 'unknown')
                     task_output_dir = os.path.join(output_dir, f"task_{task_id}")
                 
-                regions += model.predict_regions(
-                    path,
-                    output_dir=task_output_dir,
-                    save_frames=save_frames,
-                    batch_size=batch_size,
-                    frame_skip=frame_skip,
-                )
+                # Only pass frame_skip to video models
+                if isinstance(model, VideoRectangleModel):
+                    regions += model.predict_regions(
+                        path,
+                        output_dir=task_output_dir,
+                        save_frames=save_frames,
+                        batch_size=batch_size,
+                        frame_skip=frame_skip,
+                    )
+                else:
+                    regions += model.predict_regions(path)
 
                 if isinstance(model, VideoRectangleModel):
                     tracking_result = getattr(model, "last_tracking_result", None)

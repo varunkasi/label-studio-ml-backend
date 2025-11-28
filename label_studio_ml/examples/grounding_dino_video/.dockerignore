@@ -20,5 +20,10 @@
 # Include script
 !*.sh
 
+# Exclude __pycache__ and .pyc files (IMPORTANT: must come AFTER the include rules)
+**/__pycache__
+**/*.pyc
+**/*.pyo
+
 # Exclude specific requirements if necessary
 # requirements-test.txt (Uncomment if you decide to exclude this)
