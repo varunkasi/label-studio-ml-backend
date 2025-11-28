@@ -87,6 +87,12 @@ def arg_parser():
         help="Batch size for processing frames (default: from env GROUNDING_DINO_BATCH_SIZE or 8)",
     )
     parser.add_argument(
+        "--max-frames",
+        type=int,
+        default=None,
+        help="Stop after processing this many frames (for quick testing)",
+    )
+    parser.add_argument(
         "--frame-skip",
         type=str,
         default=None,
@@ -134,7 +140,7 @@ class LabelStudioMLPredictor:
         self.ls = LabelStudio(base_url=ls_url, api_key=ls_api_key)
         logger.info(f"Successfully connected to Label Studio: {ls_url}")
 
-    def run(self, project, tasks, output_dir=None, save_frames=False, batch_size=None, frame_skip=None):
+    def run(self, project, tasks, output_dir=None, save_frames=False, batch_size=None, frame_skip=None, max_frames=None):
         # initialize Label Studio SDK client
         ls = self.ls
         project = ls.projects.get(id=project)
@@ -163,6 +169,7 @@ class LabelStudioMLPredictor:
                 save_frames=save_frames,
                 batch_size=batch_size,
                 frame_skip=frame_skip,
+                max_frames=max_frames,
             )
             predictions = self.postprocess_response(model, response, task)
 
@@ -308,4 +315,5 @@ if __name__ == "__main__":
         save_frames=args.save_frames,
         batch_size=args.batch_size,
         frame_skip=args.frame_skip,
+        max_frames=args.max_frames,
     )

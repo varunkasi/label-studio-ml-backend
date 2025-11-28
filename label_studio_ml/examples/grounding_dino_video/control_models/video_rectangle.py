@@ -81,7 +81,7 @@ class VideoRectangleModel(ControlModel):
 
         raise ValueError("VideoRectangle detected, but no connected 'Labels' tag found")
 
-    def predict_regions(self, path, output_dir=None, save_frames=False, batch_size=None, frame_skip=None) -> List[Dict]:
+    def predict_regions(self, path, output_dir=None, save_frames=False, batch_size=None, frame_skip=None, max_frames=None) -> List[Dict]:
         tracker_kwargs = self._build_tracker_kwargs()
         box_threshold = self._get_float_attr("model_box_threshold")
         text_threshold = self._get_float_attr("model_text_threshold")
@@ -109,6 +109,7 @@ class VideoRectangleModel(ControlModel):
             save_frames=save_frames,
             batch_size=batch_size,
             frame_skip=frame_skip,
+            max_frames=max_frames,
         )
         self.last_tracking_result = tracking
         return self.create_video_rectangles(tracking)

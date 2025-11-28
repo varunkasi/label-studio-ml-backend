@@ -538,6 +538,7 @@ class GroundingDINOInference:
         tracker_kwargs: Optional[Dict] = None,
         batch_size: Optional[int] = None,
         frame_skip: Optional[int] = None,
+        max_frames: Optional[int] = None,
         output_dir: Optional[str] = None,
         save_frames: bool = False,
     ) -> VideoTrackingResult:
@@ -553,6 +554,7 @@ class GroundingDINOInference:
             frame_skip: Process every Nth frame, interpolate others (default from env or auto)
                         Set to 1 to disable frame skipping.
                         Set to "auto" or 0 to auto-determine based on video length.
+            max_frames: Stop after processing this many frames (for quick testing)
             output_dir: Directory to save annotated frames (required if save_frames=True)
             save_frames: Whether to save annotated frames with bounding boxes
         """
@@ -597,10 +599,16 @@ class GroundingDINOInference:
             output_path.mkdir(parents=True, exist_ok=True)
             logger.info("Saving annotated frames to: %s", output_path)
 
+        # Apply max_frames limit if specified
+        effective_frame_count = frame_count
+        if max_frames is not None and max_frames > 0:
+            effective_frame_count = min(frame_count, max_frames) if frame_count else max_frames
+            logger.info("Limiting to %d frames (--max-frames)", max_frames)
+
         logger.info(
             "Starting video tracking: path=%s, total_frames=%s, fps=%.2f, frame_skip=%d",
             path,
-            frame_count or "unknown",
+            effective_frame_count or "unknown",
             fps,
             frame_skip,
         )
@@ -676,6 +684,10 @@ class GroundingDINOInference:
                 frames_to_process: List[Tuple[int, np.ndarray]] = []
                 
                 while len(keyframe_batch) < batch_size:
+                    # Check max_frames limit
+                    if max_frames is not None and frame_index >= max_frames:
+                        break
+                    
                     ret, frame = capture.read()
                     if not ret:
                         break
@@ -691,6 +703,10 @@ class GroundingDINOInference:
                 
                 if len(frames_to_process) == 0:
                     break
+                
+                # Check if we've hit max_frames limit
+                if max_frames is not None and frame_index >= max_frames:
+                    logger.info("Reached max_frames limit (%d), stopping early", max_frames)
                 
                 # Progress logging
                 if progress_every_int and frame_index % (progress_every_int * frame_skip) < frame_skip:

@@ -104,6 +104,7 @@ class YOLO(LabelStudioMLBase):
         save_frames = kwargs.get('save_frames', False)
         batch_size = kwargs.get('batch_size')
         frame_skip = kwargs.get('frame_skip')
+        max_frames = kwargs.get('max_frames')
 
         predictions = []
         for task in tasks:
@@ -119,7 +120,7 @@ class YOLO(LabelStudioMLBase):
                     task_id = task.get('id', 'unknown')
                     task_output_dir = os.path.join(output_dir, f"task_{task_id}")
                 
-                # Only pass frame_skip to video models
+                # Only pass video-specific params to video models
                 if isinstance(model, VideoRectangleModel):
                     regions += model.predict_regions(
                         path,
@@ -127,6 +128,7 @@ class YOLO(LabelStudioMLBase):
                         save_frames=save_frames,
                         batch_size=batch_size,
                         frame_skip=frame_skip,
+                        max_frames=max_frames,
                     )
                 else:
                     regions += model.predict_regions(path)
