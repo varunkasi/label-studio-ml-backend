@@ -252,11 +252,7 @@ class GroundingDINOInference:
             if text_threshold is not None
             else float(os.getenv("GROUNDING_DINO_TEXT_THRESHOLD", 0.25))
         )
-        # print box_threshold to the terminal for debugging purposes
-        print(f"box_threshold actual value: {box_threshold}")
 
-        # print text_threshold to the termainl for debugging purposes
-        print(f"text_threshold actual value: {text_threshold}")
         with torch.no_grad():
             if self.use_amp:
                 with autocast():
@@ -363,15 +359,17 @@ class GroundingDINOInference:
         tracker_kwargs = dict(tracker_kwargs or {})
         tracker_kwargs["frame_rate"] = fps
         tracker_kwargs = self._prepare_tracker_kwargs(tracker_kwargs)
-        logger.info("Prepared tracker kwargs: %s", tracker_kwargs)
+        logger.info("Prepared tracker kwargs (passed to ByteTrack): %s", tracker_kwargs)
         tracker = sv.ByteTrack(**tracker_kwargs)
-        logger.info(
-            "ByteTrack config: activation=%.2f, lost_buffer=%d, matching=%.2f, consecutive=%d",
-            tracker.track_activation_threshold,
-            int(tracker.max_time_lost * 30.0 / fps) if fps > 0 else 0,
-            tracker.minimum_matching_threshold,
-            tracker.minimum_consecutive_frames,
-        )
+
+        internal_tracker_config = {
+            "track_activation_threshold": tracker.track_activation_threshold,
+            "minimum_matching_threshold": tracker.minimum_matching_threshold,
+            "minimum_consecutive_frames": tracker.minimum_consecutive_frames,
+            "lost_track_buffer": int(tracker.max_time_lost),
+            "frame_rate": fps,
+        }
+        logger.info("ByteTrack internal config: %s", internal_tracker_config)
         frames: List[FrameDetections] = []
         latencies_ms: List[float] = []
         device_is_cuda = self.device.startswith("cuda") and torch.cuda.is_available()
@@ -492,6 +490,7 @@ class GroundingDINOInference:
             avg_latency,
             max_latency,
         )
+        logger.info("ByteTrack internal config at completion: %s", internal_tracker_config)
         logger.info(
             "Detection stats: avg=%.1f/frame (nonzero=%.1f), min=%d, max=%d, fragmentation_ratio=%.1f",
             avg_det_per_frame,

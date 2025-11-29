@@ -46,10 +46,10 @@ services:
       # TRACKING CONFIGURATION (ByteTrack parameters)
       # ==========================================================================
       # For long UAV videos with few subjects, use aggressive anti-fragmentation:
-      TRACKER_ACTIVATION_THRESHOLD: "0.3"   # Confidence to start new track
-      TRACKER_LOST_BUFFER: "900"            # 30 seconds at 30fps - keep tracks alive longer
-      TRACKER_MATCH_THRESHOLD: "0.1"        # Very permissive IoU matching
-      TRACKER_MIN_CONSECUTIVE_FRAMES: "3"   # Frames needed to confirm track
+      track_activation_threshold: "0.3"     # Confidence to start new track
+      lost_track_buffer: "900"              # 30 seconds at 30fps - keep tracks alive longer
+      minimum_matching_threshold: "0.1"     # Very permissive IoU matching
+      minimum_consecutive_frames: "3"       # Frames needed to confirm track
 
     extra_hosts:
       - "host.docker.internal:host-gateway"  # for macos and unix      

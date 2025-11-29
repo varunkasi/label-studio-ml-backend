@@ -569,10 +569,10 @@ def apply_preset(name: str, override_env: bool = True) -> TrackingPreset:
         "GROUNDING_DINO_BOX_THRESHOLD": str(preset.box_threshold),
         "GROUNDING_DINO_TEXT_THRESHOLD": str(preset.text_threshold),
         "MODEL_SCORE_THRESHOLD": str(preset.model_score_threshold),
-        "TRACKER_ACTIVATION_THRESHOLD": str(preset.track_activation_threshold),
-        "TRACKER_LOST_BUFFER": str(preset.lost_track_buffer),
-        "TRACKER_MATCH_THRESHOLD": str(preset.minimum_matching_threshold),
-        "TRACKER_MIN_CONSECUTIVE_FRAMES": str(preset.minimum_consecutive_frames),
+        "track_activation_threshold": str(preset.track_activation_threshold),
+        "lost_track_buffer": str(preset.lost_track_buffer),
+        "minimum_matching_threshold": str(preset.minimum_matching_threshold),
+        "minimum_consecutive_frames": str(preset.minimum_consecutive_frames),
     }
 
     for env_name, value in env_mapping.items():

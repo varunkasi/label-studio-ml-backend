@@ -23,10 +23,10 @@ SPARSIFY_KF_FOR_SAM = os.getenv("SPARSIFY_KF_FOR_SAM", "false").lower() in [
 ]
 
 TRACKER_ENV_MAP = {
-    "lost_track_buffer": "TRACKER_LOST_BUFFER",
-    "minimum_matching_threshold": "TRACKER_MATCH_THRESHOLD",
-    "track_activation_threshold": "TRACKER_ACTIVATION_THRESHOLD",
-    "minimum_consecutive_frames": "TRACKER_MIN_CONSECUTIVE_FRAMES",
+    "track_activation_threshold": "track_activation_threshold",
+    "lost_track_buffer": "lost_track_buffer",
+    "minimum_matching_threshold": "minimum_matching_threshold",
+    "minimum_consecutive_frames": "minimum_consecutive_frames",
 }
 
 MODEL_THRESHOLD_ENV_MAP = {
@@ -245,18 +245,25 @@ class VideoRectangleModel(ControlModel):
     def _build_tracker_kwargs(self) -> Dict:
         kwargs: Dict = {}
 
+        logger.info("Loading ByteTrack parameters from environment (exact names)")
         for param, env_name in TRACKER_ENV_MAP.items():
-            value = _get_env(env_name)
+            raw_value = os.getenv(env_name)
+            if raw_value is None or raw_value == "":
+                logger.info(
+                    "Tracker parameter '%s' not set; using supervision default",
+                    env_name,
+                )
+                continue
+
+            caster = TRACKER_PARAM_CASTERS.get(param, float)
             try:
-                caster = TRACKER_PARAM_CASTERS.get(param, float)
-                if caster is int:
-                    kwargs[param] = int(float(value))
-                else:
-                    kwargs[param] = caster(value)
+                parsed = caster(float(raw_value)) if caster is int else caster(raw_value)
             except (TypeError, ValueError) as exc:
                 raise ValueError(
-                    f"Invalid value for environment variable '{env_name}': {value}"
+                    f"Invalid value for tracker parameter '{env_name}': {raw_value}"
                 ) from exc
+            kwargs[param] = parsed
+            logger.info("Tracker parameter %s=%s", param, parsed)
 
         control_threshold = self.control.attr.get("tracker_match_threshold")
         if control_threshold:
