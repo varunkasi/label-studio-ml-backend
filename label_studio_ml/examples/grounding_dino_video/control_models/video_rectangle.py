@@ -81,21 +81,10 @@ class VideoRectangleModel(ControlModel):
 
         raise ValueError("VideoRectangle detected, but no connected 'Labels' tag found")
 
-    def predict_regions(self, path, output_dir=None, save_frames=False, batch_size=None, frame_skip=None, max_frames=None) -> List[Dict]:
+    def predict_regions(self, path, output_dir=None, save_frames=False, max_frames=None) -> List[Dict]:
         tracker_kwargs = self._build_tracker_kwargs()
         box_threshold = self._get_float_attr("model_box_threshold")
         text_threshold = self._get_float_attr("model_text_threshold")
-        
-        # Parse frame_skip if it's a string
-        if isinstance(frame_skip, str):
-            if frame_skip.lower() == "auto":
-                frame_skip = 0  # Will be auto-determined in track_video
-            else:
-                try:
-                    frame_skip = int(frame_skip)
-                except ValueError:
-                    logger.warning("Invalid frame_skip value '%s', using auto", frame_skip)
-                    frame_skip = None
 
         # Reset cached tracking result before processing the current task
         self.last_tracking_result = None
@@ -107,8 +96,6 @@ class VideoRectangleModel(ControlModel):
             tracker_kwargs=tracker_kwargs,
             output_dir=output_dir,
             save_frames=save_frames,
-            batch_size=batch_size,
-            frame_skip=frame_skip,
             max_frames=max_frames,
         )
         self.last_tracking_result = tracking

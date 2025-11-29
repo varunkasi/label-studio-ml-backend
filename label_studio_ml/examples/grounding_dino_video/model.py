@@ -99,11 +99,9 @@ class YOLO(LabelStudioMLBase):
         )
         control_models = self.detect_control_models()
         
-        # Extract visualization and performance options from kwargs
+        # Extract visualization options from kwargs
         output_dir = kwargs.get('output_dir')
         save_frames = kwargs.get('save_frames', False)
-        batch_size = kwargs.get('batch_size')
-        frame_skip = kwargs.get('frame_skip')
         max_frames = kwargs.get('max_frames')
 
         predictions = []
@@ -126,8 +124,6 @@ class YOLO(LabelStudioMLBase):
                         path,
                         output_dir=task_output_dir,
                         save_frames=save_frames,
-                        batch_size=batch_size,
-                        frame_skip=frame_skip,
                         max_frames=max_frames,
                     )
                 else:

@@ -24,16 +24,18 @@ services:
       LABEL_STUDIO_API_KEY: ${LABEL_STUDIO_API_KEY}
 
       # Grounding DINO configuration
+      # Use very low detection thresholds - let tracker filter instead
       GROUNDING_DINO_PROMPT: person
-      GROUNDING_DINO_BOX_THRESHOLD: "0.20"
-      GROUNDING_DINO_TEXT_THRESHOLD: "0.25"
+      GROUNDING_DINO_BOX_THRESHOLD: "0.05"
+      GROUNDING_DINO_TEXT_THRESHOLD: "0.10"
       GROUNDING_DINO_DEVICE: cuda
       GROUNDING_DINO_CONFIG: GroundingDINO_SwinT_OGC.py
       GROUNDING_DINO_WEIGHTS: gdino_swint_darpa-ir-v1-1k_20_1.pth
-      MODEL_SCORE_THRESHOLD: "0.5"
+      MODEL_SCORE_THRESHOLD: "0.3"
 
       # Batch size for GPU inference (default: 8)
-      GROUNDING_DINO_BATCH_SIZE: "8"
+      # Try batch_size=1 to test if batching is causing detection issues
+      GROUNDING_DINO_BATCH_SIZE: "1"
       
       # Frame skipping: "1" = no skipping, "2" = 2x speedup, "auto" = auto-determine
       GROUNDING_DINO_FRAME_SKIP: "1"
@@ -57,6 +59,12 @@ services:
       - "./data/server:/data"
       - "./cache_dir:/app/cache_dir"
       - "./output_frames:/app/output_frames"
+      # Mount source code for live updates (no rebuild needed)
+      - "./utils:/app/utils"
+      - "./control_models:/app/control_models"
+      - "./model.py:/app/model.py"
+      - "./cli.py:/app/cli.py"
+      - "./tracking_presets.py:/app/tracking_presets.py"
     deploy:
       resources:
         reservations:
