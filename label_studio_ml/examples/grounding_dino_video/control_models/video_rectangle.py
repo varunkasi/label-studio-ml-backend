@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 from collections import defaultdict
@@ -86,6 +87,8 @@ class VideoRectangleModel(ControlModel):
         box_threshold = self._get_float_attr("model_box_threshold")
         text_threshold = self._get_float_attr("model_text_threshold")
 
+        tracker_scenarios = self._load_tracker_scenarios()
+
         # Reset cached tracking result before processing the current task
         self.last_tracking_result = None
 
@@ -97,6 +100,7 @@ class VideoRectangleModel(ControlModel):
             output_dir=output_dir,
             save_frames=save_frames,
             max_frames=max_frames,
+            tracker_scenarios=tracker_scenarios,
         )
         self.last_tracking_result = tracking
         return self.create_video_rectangles(tracking)
@@ -275,6 +279,25 @@ class VideoRectangleModel(ControlModel):
                 )
 
         return kwargs
+
+    @staticmethod
+    def _load_tracker_scenarios() -> Optional[List[Dict]]:
+        raw = os.getenv("TRACKER_SCENARIOS_JSON")
+        if not raw:
+            return None
+
+        try:
+            scenarios = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            logger.warning("Invalid TRACKER_SCENARIOS_JSON: %s", exc)
+            return None
+
+        if not isinstance(scenarios, list):
+            logger.warning("TRACKER_SCENARIOS_JSON must be a list of objects")
+            return None
+
+        logger.info("Loaded %d tracker comparison scenarios", len(scenarios))
+        return scenarios
 
     def _get_float_attr(self, key: str) -> Optional[float]:
         env_name = MODEL_THRESHOLD_ENV_MAP.get(key)

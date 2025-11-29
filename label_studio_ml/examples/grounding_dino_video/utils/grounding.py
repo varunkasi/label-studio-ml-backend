@@ -7,6 +7,7 @@ YOLO-compatible behaviours while relying on zero-shot text prompted detections.
 from __future__ import annotations
 
 import inspect
+import json
 import logging
 import os
 import time
@@ -305,6 +306,7 @@ class GroundingDINOInference:
         max_frames: Optional[int] = None,
         output_dir: Optional[str] = None,
         save_frames: bool = False,
+        tracker_scenarios: Optional[List[Dict[str, Any]]] = None,
     ) -> VideoTrackingResult:
         """Track objects in a video running inference on every frame.
         
@@ -359,17 +361,23 @@ class GroundingDINOInference:
         tracker_kwargs = dict(tracker_kwargs or {})
         tracker_kwargs["frame_rate"] = fps
         tracker_kwargs = self._prepare_tracker_kwargs(tracker_kwargs)
-        logger.info("Prepared tracker kwargs (passed to ByteTrack): %s", tracker_kwargs)
         tracker = sv.ByteTrack(**tracker_kwargs)
 
-        internal_tracker_config = {
-            "track_activation_threshold": tracker.track_activation_threshold,
-            "minimum_matching_threshold": tracker.minimum_matching_threshold,
-            "minimum_consecutive_frames": tracker.minimum_consecutive_frames,
-            "lost_track_buffer": int(tracker.max_time_lost),
-            "frame_rate": fps,
-        }
-        logger.info("ByteTrack internal config: %s", internal_tracker_config)
+        if tracker_scenarios:
+            return self._compare_trackers(
+                path=path,
+                base_kwargs=tracker_kwargs,
+                scenarios=tracker_scenarios,
+                prompt=prompt,
+                box_threshold=box_threshold,
+                text_threshold=text_threshold,
+                tracker_kwargs=tracker_kwargs,
+                max_frames=max_frames,
+                output_dir=output_dir,
+                save_frames=save_frames,
+            )
+
+        internal_tracker_config = self._extract_tracker_config(tracker, fps)
         frames: List[FrameDetections] = []
         latencies_ms: List[float] = []
         device_is_cuda = self.device.startswith("cuda") and torch.cuda.is_available()
@@ -490,7 +498,7 @@ class GroundingDINOInference:
             avg_latency,
             max_latency,
         )
-        logger.info("ByteTrack internal config at completion: %s", internal_tracker_config)
+        logger.debug("ByteTrack internal config at completion: %s", internal_tracker_config)
         logger.info(
             "Detection stats: avg=%.1f/frame (nonzero=%.1f), min=%d, max=%d, fragmentation_ratio=%.1f",
             avg_det_per_frame,
@@ -505,6 +513,109 @@ class GroundingDINOInference:
             duration=duration,
             fps=fps,
             frames=frames,
+        )
+
+    @staticmethod
+    def _extract_tracker_config(tracker: sv.ByteTrack, fps: float) -> Dict[str, Any]:
+        return {
+            "track_activation_threshold": tracker.track_activation_threshold,
+            "minimum_matching_threshold": tracker.minimum_matching_threshold,
+            "minimum_consecutive_frames": tracker.minimum_consecutive_frames,
+            "lost_track_buffer": int(tracker.max_time_lost),
+            "frame_rate": fps,
+        }
+
+    def _compare_trackers(
+        self,
+        *,
+        path: str,
+        base_kwargs: Dict[str, Any],
+        scenarios: List[Dict[str, Any]],
+        prompt: Optional[str],
+        box_threshold: Optional[float],
+        text_threshold: Optional[float],
+        tracker_kwargs: Dict[str, Any],
+        max_frames: Optional[int],
+        output_dir: Optional[str],
+        save_frames: bool,
+    ) -> VideoTrackingResult:
+        """Run multiple tracker configs and log comparative stats."""
+        results = []
+        last_result: Optional[VideoTrackingResult] = None
+
+        for idx, overrides in enumerate(scenarios, start=1):
+            scenario_kwargs = {**base_kwargs, **overrides}
+            label = overrides.get("label", f"scenario_{idx}")
+            logger.info("Running tracker scenario '%s' overrides=%s", label, overrides)
+
+            scenario_result = self._run_single_tracker(
+                path=path,
+                tracker_kwargs=scenario_kwargs,
+                prompt=prompt,
+                box_threshold=box_threshold,
+                text_threshold=text_threshold,
+                max_frames=max_frames,
+                output_dir=output_dir,
+                save_frames=save_frames,
+            )
+            stats = {
+                "label": label,
+                "frames": len(scenario_result.frames),
+                "total_detections": sum(frame.detections.xyxy.shape[0] for frame in scenario_result.frames),
+                "tracks": sum(
+                    1 for frame in scenario_result.frames if frame.detections.tracker_id is not None
+                ),
+            }
+            logger.info("Scenario '%s' summary: %s", label, stats)
+            results.append({"scenario": label, "stats": stats, "config": scenario_kwargs})
+            last_result = scenario_result
+
+        logger.info("Tracker scenario comparison: %s", json.dumps(results, indent=2))
+        return last_result if last_result else self._run_single_tracker(
+            path=path,
+            tracker_kwargs=base_kwargs,
+            prompt=prompt,
+            box_threshold=box_threshold,
+            text_threshold=text_threshold,
+            max_frames=max_frames,
+            output_dir=output_dir,
+            save_frames=save_frames,
+        )
+
+    def _run_single_tracker(
+        self,
+        *,
+        path: str,
+        tracker_kwargs: Dict[str, Any],
+        prompt: Optional[str],
+        box_threshold: Optional[float],
+        text_threshold: Optional[float],
+        max_frames: Optional[int],
+        output_dir: Optional[str],
+        save_frames: bool,
+    ) -> VideoTrackingResult:
+        """Run tracking with a specific tracker configuration."""
+        capture = cv2.VideoCapture(path)
+        if not capture.isOpened():
+            raise ValueError(f"Unable to open video file: {path}")
+
+        frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+        fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+
+        tracker_kwargs = dict(tracker_kwargs or {})
+        tracker_kwargs["frame_rate"] = fps
+        tracker_kwargs = self._prepare_tracker_kwargs(tracker_kwargs)
+        tracker = sv.ByteTrack(**tracker_kwargs)
+
+        return self.track_video(
+            path,
+            prompt=prompt,
+            box_threshold=box_threshold,
+            text_threshold=text_threshold,
+            tracker_kwargs=tracker_kwargs,
+            max_frames=max_frames,
+            output_dir=output_dir,
+            save_frames=save_frames,
         )
 
     def _prepare_tracker_kwargs(self, tracker_kwargs: Dict[str, Any]) -> Dict[str, Any]:
