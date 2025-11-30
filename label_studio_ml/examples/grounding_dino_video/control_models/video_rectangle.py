@@ -2,7 +2,7 @@ import json
 import logging
 import os
 from collections import defaultdict
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from control_models.base import ControlModel
 from utils.grounding import VideoTrackingResult

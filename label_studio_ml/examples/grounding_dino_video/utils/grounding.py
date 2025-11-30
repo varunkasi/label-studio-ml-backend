@@ -380,6 +380,7 @@ class GroundingDINOInference:
         internal_tracker_config = self._extract_tracker_config(tracker, fps)
         frames: List[FrameDetections] = []
         latencies_ms: List[float] = []
+        raw_detection_counts: List[int] = []
         device_is_cuda = self.device.startswith("cuda") and torch.cuda.is_available()
         tracked_ids: Set[int] = set()
         
@@ -413,6 +414,7 @@ class GroundingDINOInference:
                     box_threshold=box_threshold,
                     text_threshold=text_threshold,
                 )
+                raw_detection_counts.append(detections.xyxy.shape[0])
 
                 tracked = tracker.update_with_detections(detections)
 
@@ -508,6 +510,24 @@ class GroundingDINOInference:
             fragmentation_ratio,
         )
 
+        if raw_detection_counts:
+            raw_total = sum(raw_detection_counts)
+            raw_avg = raw_total / len(raw_detection_counts)
+            raw_nonzero = (
+                sum(count for count in raw_detection_counts if count > 0) / len(raw_detection_counts)
+                if any(raw_detection_counts) else 0.0
+            )
+            raw_min = min(raw_detection_counts)
+            raw_max = max(raw_detection_counts)
+            logger.info(
+                "Raw detection stats (pre-tracker): avg=%.1f/frame (nonzero_avg=%.1f), min=%d, max=%d, total=%d",
+                raw_avg,
+                raw_nonzero,
+                raw_min,
+                raw_max,
+                raw_total,
+            )
+
         return VideoTrackingResult(
             frames_count=frame_count,
             duration=duration,
@@ -548,7 +568,7 @@ class GroundingDINOInference:
             label = overrides.get("label", f"scenario_{idx}")
             logger.info("Running tracker scenario '%s' overrides=%s", label, overrides)
 
-            scenario_result = self._run_single_tracker(
+            scenario_result, unique_tracks = self._run_single_tracker(
                 path=path,
                 tracker_kwargs=scenario_kwargs,
                 prompt=prompt,
@@ -562,16 +582,17 @@ class GroundingDINOInference:
                 "label": label,
                 "frames": len(scenario_result.frames),
                 "total_detections": sum(frame.detections.xyxy.shape[0] for frame in scenario_result.frames),
-                "tracks": sum(
-                    1 for frame in scenario_result.frames if frame.detections.tracker_id is not None
-                ),
+                "unique_tracks": unique_tracks,
             }
             logger.info("Scenario '%s' summary: %s", label, stats)
             results.append({"scenario": label, "stats": stats, "config": scenario_kwargs})
             last_result = scenario_result
 
         logger.info("Tracker scenario comparison: %s", json.dumps(results, indent=2))
-        return last_result if last_result else self._run_single_tracker(
+        if last_result:
+            return last_result
+
+        fallback_result, _ = self._run_single_tracker(
             path=path,
             tracker_kwargs=base_kwargs,
             prompt=prompt,
@@ -581,6 +602,7 @@ class GroundingDINOInference:
             output_dir=output_dir,
             save_frames=save_frames,
         )
+        return fallback_result
 
     def _run_single_tracker(
         self,
@@ -593,7 +615,7 @@ class GroundingDINOInference:
         max_frames: Optional[int],
         output_dir: Optional[str],
         save_frames: bool,
-    ) -> VideoTrackingResult:
+    ) -> Tuple[VideoTrackingResult, int]:
         """Run tracking with a specific tracker configuration."""
         capture = cv2.VideoCapture(path)
         if not capture.isOpened():
@@ -607,7 +629,8 @@ class GroundingDINOInference:
         tracker_kwargs = self._prepare_tracker_kwargs(tracker_kwargs)
         tracker = sv.ByteTrack(**tracker_kwargs)
 
-        return self.track_video(
+        capture.release()
+        result = self.track_video(
             path,
             prompt=prompt,
             box_threshold=box_threshold,
@@ -617,6 +640,14 @@ class GroundingDINOInference:
             output_dir=output_dir,
             save_frames=save_frames,
         )
+        unique_tracks = {
+            track_id
+            for frame in result.frames
+            if frame.detections.tracker_id is not None
+            for track_id in frame.detections.tracker_id
+            if track_id is not None
+        }
+        return result, len(unique_tracks)
 
     def _prepare_tracker_kwargs(self, tracker_kwargs: Dict[str, Any]) -> Dict[str, Any]:
         """Normalize tracker kwargs so they match the current supervision.ByteTrack signature."""
