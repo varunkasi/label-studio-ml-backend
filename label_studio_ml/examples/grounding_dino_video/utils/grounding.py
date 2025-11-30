@@ -21,6 +21,11 @@ import supervision as sv
 import torch
 from PIL import Image
 
+try:
+    import optuna
+except ImportError:  # pragma: no cover
+    optuna = None
+
 import groundingdino.datasets.transforms as T
 from groundingdino.util import box_ops
 from groundingdino.util.inference import load_model, predict, get_phrases_from_posmap
@@ -32,6 +37,85 @@ except ImportError:
     AMP_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value in (None, ""):
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        logger.warning("Invalid float for %s=%s, using default %.2f", name, value, default)
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value in (None, ""):
+        return default
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        logger.warning("Invalid int for %s=%s, using default %d", name, value, default)
+        return default
+
+
+@dataclass
+class AutotuneConfig:
+    expected_detections_per_frame: float
+    expected_unique_tracks: int
+    frame_limit: int
+    max_trials: int
+    detection_weight: float = 0.6
+    track_weight: float = 0.4
+
+    def normalized_weights(self) -> Tuple[float, float]:
+        total = self.detection_weight + self.track_weight
+        if total <= 0:
+            return 0.5, 0.5
+        return self.detection_weight / total, self.track_weight / total
+
+
+def _load_autotune_config() -> Optional[AutotuneConfig]:
+    if not _env_flag("TRACKER_AUTOTUNE_ENABLED", False):
+        return None
+
+    config = AutotuneConfig(
+        expected_detections_per_frame=_env_float("EXPECTED_DETECTIONS_PER_FRAME_1000", 5.0),
+        expected_unique_tracks=_env_int("EXPECTED_UNIQUE_TRACKS_1000", 8),
+        frame_limit=max(1, _env_int("TRACKER_AUTOTUNE_FRAME_LIMIT", 1000)),
+        max_trials=max(1, _env_int("TRACKER_AUTOTUNE_TRIALS", 8)),
+        detection_weight=_env_float("TRACKER_AUTOTUNE_DETECTION_WEIGHT", 0.6),
+        track_weight=_env_float("TRACKER_AUTOTUNE_TRACK_WEIGHT", 0.4),
+    )
+    return config
+
+
+def _score_autotune_trial(
+    avg_detections: float,
+    unique_tracks: int,
+    config: AutotuneConfig,
+) -> float:
+    det_target = max(config.expected_detections_per_frame, 1e-3)
+    recall_ratio = avg_detections / det_target
+    recall_score = min(recall_ratio, 1.5)
+
+    if config.expected_unique_tracks > 0:
+        track_error = abs(unique_tracks - config.expected_unique_tracks) / config.expected_unique_tracks
+        track_score = max(1.0 - track_error, 0.0)
+    else:
+        track_score = 1.0
+
+    det_weight, track_weight = config.normalized_weights()
+    return (recall_score * det_weight) + (track_score * track_weight)
 
 
 @dataclass
@@ -307,6 +391,7 @@ class GroundingDINOInference:
         output_dir: Optional[str] = None,
         save_frames: bool = False,
         tracker_scenarios: Optional[List[Dict[str, Any]]] = None,
+        _skip_autotune: bool = False,
     ) -> VideoTrackingResult:
         """Track objects in a video running inference on every frame.
         
@@ -361,7 +446,27 @@ class GroundingDINOInference:
         tracker_kwargs = dict(tracker_kwargs or {})
         tracker_kwargs["frame_rate"] = fps
         tracker_kwargs = self._prepare_tracker_kwargs(tracker_kwargs)
+
+        autotune_summary: Optional[Dict[str, Any]] = None
+        if not _skip_autotune:
+            tracker_kwargs, autotune_summary = self._maybe_autotune_tracker(
+                path=path,
+                base_kwargs=tracker_kwargs,
+                prompt=prompt,
+                box_threshold=box_threshold,
+                text_threshold=text_threshold,
+                max_frames=max_frames,
+                tracker_scenarios=tracker_scenarios,
+            )
+
         tracker = sv.ByteTrack(**tracker_kwargs)
+        if autotune_summary:
+            logger.info(
+                "Optuna autotune selected tracker parameters: %s (score=%.3f across %d trials)",
+                autotune_summary.get("best_params"),
+                autotune_summary.get("best_score"),
+                autotune_summary.get("trials"),
+            )
 
         if tracker_scenarios:
             return self._compare_trackers(
@@ -577,6 +682,7 @@ class GroundingDINOInference:
                 max_frames=max_frames,
                 output_dir=output_dir,
                 save_frames=save_frames,
+                skip_autotune=True,
             )
             stats = {
                 "label": label,
@@ -601,6 +707,7 @@ class GroundingDINOInference:
             max_frames=max_frames,
             output_dir=output_dir,
             save_frames=save_frames,
+            skip_autotune=True,
         )
         return fallback_result
 
@@ -615,6 +722,7 @@ class GroundingDINOInference:
         max_frames: Optional[int],
         output_dir: Optional[str],
         save_frames: bool,
+        skip_autotune: bool = False,
     ) -> Tuple[VideoTrackingResult, int]:
         """Run tracking with a specific tracker configuration."""
         capture = cv2.VideoCapture(path)
@@ -639,6 +747,7 @@ class GroundingDINOInference:
             max_frames=max_frames,
             output_dir=output_dir,
             save_frames=save_frames,
+            _skip_autotune=skip_autotune,
         )
         unique_tracks = {
             track_id
@@ -648,6 +757,111 @@ class GroundingDINOInference:
             if track_id is not None
         }
         return result, len(unique_tracks)
+
+    def _maybe_autotune_tracker(
+        self,
+        *,
+        path: str,
+        base_kwargs: Dict[str, Any],
+        prompt: Optional[str],
+        box_threshold: Optional[float],
+        text_threshold: Optional[float],
+        max_frames: Optional[int],
+        tracker_scenarios: Optional[List[Dict[str, Any]]],
+    ) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+        config = _load_autotune_config()
+        if not config:
+            return base_kwargs, None
+
+        if tracker_scenarios:
+            logger.info(
+                "TRACKER_AUTOTUNE_ENABLED is set but tracker scenarios were provided; skipping autotune so scenarios can run.")
+            return base_kwargs, None
+
+        if optuna is None:
+            logger.warning(
+                "TRACKER_AUTOTUNE_ENABLED is set but Optuna is not installed inside the environment."
+            )
+            return base_kwargs, None
+
+        trial_frame_limit = config.frame_limit
+        if max_frames is not None:
+            trial_frame_limit = min(trial_frame_limit, max_frames)
+
+        logger.info(
+            "Starting Optuna tracker autotune: trials=%d, frame_limit=%d, expected_det=%.2f, expected_tracks=%d",
+            config.max_trials,
+            trial_frame_limit,
+            config.expected_detections_per_frame,
+            config.expected_unique_tracks,
+        )
+
+        study = optuna.create_study(direction="maximize", study_name="byte_track_autotune")
+
+        def objective(trial: optuna.Trial) -> float:
+            params = {
+                "track_activation_threshold": trial.suggest_float("track_activation_threshold", 0.20, 0.55),
+                "minimum_matching_threshold": trial.suggest_float("minimum_matching_threshold", 0.35, 0.75),
+                "minimum_consecutive_frames": trial.suggest_int("minimum_consecutive_frames", 3, 12),
+                "lost_track_buffer": trial.suggest_int("lost_track_buffer", 200, 2400, step=50),
+            }
+            candidate = {**base_kwargs, **params}
+            trial_index = trial.number + 1
+            logger.info(
+                "Optuna trial %d/%d started with params=%s",
+                trial_index,
+                config.max_trials,
+                params,
+            )
+
+            result, unique_tracks = self._run_single_tracker(
+                path=path,
+                tracker_kwargs=candidate,
+                prompt=prompt,
+                box_threshold=box_threshold,
+                text_threshold=text_threshold,
+                max_frames=trial_frame_limit,
+                output_dir=None,
+                save_frames=False,
+                skip_autotune=True,
+            )
+
+            det_counts = [frame.detections.xyxy.shape[0] for frame in result.frames]
+            avg_det = (sum(det_counts) / len(det_counts)) if det_counts else 0.0
+            score = _score_autotune_trial(avg_det, unique_tracks, config)
+            logger.info(
+                "Optuna trial %d finished: avg_det=%.2f, unique_tracks=%d, score=%.3f",
+                trial_index,
+                avg_det,
+                unique_tracks,
+                score,
+            )
+            trial.set_user_attr("avg_det", avg_det)
+            trial.set_user_attr("unique_tracks", unique_tracks)
+            return score
+
+        try:
+            study.optimize(objective, n_trials=config.max_trials)
+        except Exception as exc:
+            logger.exception("Optuna autotune failed; falling back to original tracker parameters: %s", exc)
+            return base_kwargs, None
+
+        if not study.best_trials:
+            logger.warning("Optuna autotune produced no successful trials; using original tracker parameters.")
+            return base_kwargs, None
+
+        best_trial = study.best_trial
+        best_params = best_trial.params
+        summary = {
+            "best_params": best_params,
+            "best_score": best_trial.value,
+            "trials": len(study.trials),
+        }
+        logger.info(
+            "Optuna autotune complete: best_score=%.3f, params=%s", best_trial.value, best_params
+        )
+        tuned_kwargs = {**base_kwargs, **best_params}
+        return tuned_kwargs, summary
 
     def _prepare_tracker_kwargs(self, tracker_kwargs: Dict[str, Any]) -> Dict[str, Any]:
         """Normalize tracker kwargs so they match the current supervision.ByteTrack signature."""

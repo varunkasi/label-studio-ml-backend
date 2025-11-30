@@ -30,6 +30,10 @@ COPY requirements.txt .
 RUN --mount=type=cache,target=${PIP_CACHE_DIR},sharing=locked \
     pip3 install --no-cache-dir -r requirements.txt
 
+# Install Optuna tooling for local hyperparameter optimization workflows.
+RUN --mount=type=cache,target=${PIP_CACHE_DIR},sharing=locked \
+    pip3 install --no-cache-dir optuna optuna-dashboard
+
 # install GroundingDINO
 RUN cd / && git clone https://github.com/IDEA-Research/GroundingDINO.git
 WORKDIR /GroundingDINO
