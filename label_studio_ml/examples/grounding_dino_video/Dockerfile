@@ -38,6 +38,10 @@ COPY requirements.txt .
 RUN --mount=type=cache,target=${PIP_CACHE_DIR},sharing=locked \
     pip3 install -r requirements.txt
 
+# Optuna tooling is required for automatic tracker tuning.
+RUN --mount=type=cache,target=${PIP_CACHE_DIR},sharing=locked \
+    pip3 install optuna optuna-dashboard
+
 # install test requirements if needed
 COPY requirements-test.txt .
 # build only when TEST_ENV="true"

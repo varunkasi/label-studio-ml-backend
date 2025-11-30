@@ -86,6 +86,7 @@ class AutotuneConfig:
 
 def _load_autotune_config() -> Optional[AutotuneConfig]:
     if not _env_flag("TRACKER_AUTOTUNE_ENABLED", False):
+        logger.debug("Tracker autotune disabled (TRACKER_AUTOTUNE_ENABLED not set or false)")
         return None
 
     config = AutotuneConfig(
@@ -95,6 +96,13 @@ def _load_autotune_config() -> Optional[AutotuneConfig]:
         max_trials=max(1, _env_int("TRACKER_AUTOTUNE_TRIALS", 8)),
         detection_weight=_env_float("TRACKER_AUTOTUNE_DETECTION_WEIGHT", 0.6),
         track_weight=_env_float("TRACKER_AUTOTUNE_TRACK_WEIGHT", 0.4),
+    )
+    logger.info(
+        "Tracker autotune enabled: trials=%d, frame_limit=%d, expected_det=%.2f, expected_tracks=%d",
+        config.max_trials,
+        config.frame_limit,
+        config.expected_detections_per_frame,
+        config.expected_unique_tracks,
     )
     return config
 
