@@ -107,10 +107,19 @@ def convert_labelstudio_to_yolo(
 
     # --- Helper: linear interpolation ---
     def interpolate(frame1, frame2):
-        """Interpolate only if both frames are enabled."""
+        """
+        Interpolate between frames.
+        - If frame1 is enabled and frame2 is enabled: interpolate between them
+        - If frame1 is enabled and frame2 is disabled: interpolate up to (but not including) frame2
+        - If frame1 is disabled: no interpolation
+        """
         f1, f2 = frame1["frame"], frame2["frame"]
-        if not frame1["enabled"] or not frame2["enabled"]:
+        
+        # No interpolation if the first frame is disabled
+        if not frame1["enabled"]:
             return []
+        
+        # Interpolate between frames (whether frame2 is enabled or disabled)
         n_frames = f2 - f1 - 1
         interpolated = []
         for i in range(1, n_frames + 1):
@@ -216,11 +225,7 @@ def convert_labelstudio_to_yolo(
         last_enabled_frame = None
 
         for frame in seq:
-            if not frame["enabled"]:
-                last_enabled_frame = None
-                continue
-
-            # Interpolate between frames
+            # Interpolate from last enabled frame to current frame (whether current is enabled or disabled)
             if last_enabled_frame is not None:
                 for f in interpolate(last_enabled_frame, frame):
                     class_id = class_names.index(ann["value"]["labels"][0])
@@ -230,8 +235,14 @@ def convert_labelstudio_to_yolo(
                     h = f["height"] / 100
                     yolo_line = f"{class_id} {x_center:.6f} {y_center:.6f} {w:.6f} {h:.6f}"
                     frames_dict_all.setdefault(f["frame"], []).append(yolo_line)
+            
+            # Handle current frame
+            if not frame["enabled"]:
+                # Stop tracking when we hit a disabled frame
+                last_enabled_frame = None
+                continue
 
-            # Current frame
+            # Current enabled frame - add its annotation
             class_id = class_names.index(ann["value"]["labels"][0])
             x_center = (frame["x"] + frame["width"] / 2) / 100
             y_center = (frame["y"] + frame["height"] / 2) / 100
