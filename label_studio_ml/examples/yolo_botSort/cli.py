@@ -67,9 +67,10 @@ def arg_parser():
     parser.add_argument(
         "--model_version",
         type=str,
-        choices=["UAV_RGB", "UAV_IR", "UAV_IR_GIMBAL", "UAV_RGBr", "UGV_RGB", "UGV_IR", "UGV_THERMAL"],
         default="UAV_RGB",
-        help="Model version identifier to attach to predictions (for different scenarios)",
+        help="Model version identifier (e.g., UAV_RGB, UAV_IR) or direct path to .pt file. "
+             "If a .pt file is provided, it will be used directly for predictions. "
+             "Otherwise, the most recent .pt file in /app/workspace/autolabel/saved_weights/{model_version}/ will be used.",
     )
 
     parser.add_argument(
@@ -161,10 +162,21 @@ class LabelStudioMLPredictor:
 
                 # send predictions to Label Studio
                 for prediction in predictions:
+                    # Extract model version name from path or use as-is if already short
+                    model_ver = prediction.get("model_version", "none")
+                    if "/" in model_ver or "\\" in model_ver:
+                        # Extract folder name that starts with UAV_ or UGV_
+                        parts = model_ver.replace("\\", "/").split("/")
+                        for part in parts:
+                            if part.startswith(("UAV_", "UGV_")):
+                                # Extract just the prefix (e.g., UAV_RGB from UAV_RGB_232794031)
+                                model_ver = "_".join(part.split("_")[:2])
+                                break
+                    
                     ls.predictions.create(
                         task=task["id"],
                         score=prediction.get("score", 0),
-                        model_version=prediction.get("model_version", "none"),
+                        model_version=model_ver,
                         result=prediction["result"],
                     )
 

@@ -5,4 +5,9 @@ run.sh
 cache.db
 .specstory
 *.pt
+cache_dir
+aws
+airlab_cloud_weights
+.vscode
+
 

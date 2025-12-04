@@ -15,7 +15,13 @@ RUN --mount=type=cache,target="/var/cache/apt",sharing=locked \
     && apt-get install -y g++ freeglut3-dev build-essential libx11-dev \
     libxmu-dev libxi-dev libglu1-mesa libglu1-mesa-dev libfreeimage-dev \
     && apt-get -y install ffmpeg libsm6 libxext6 libffi-dev python3-dev python3-pip gcc \
-    && apt-get install -y tmux 
+    && apt-get install -y tmux \
+    && apt-get install -y unzip \
+    && curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" \
+    && unzip awscliv2.zip \
+    && ./aws/install \
+    && rm -rf awscliv2.zip aws/ \
+    && apt-get install -y rsync
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \

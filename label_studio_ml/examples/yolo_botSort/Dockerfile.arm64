@@ -71,6 +71,16 @@ RUN --mount=type=cache,target=/.cache/pip,sharing=locked \
     pip uninstall torch torchvision torchaudio -y --break-system-packages && \
     pip install torch==2.9.0+cu130 torchvision==0.24.0 --index-url https://download.pytorch.org/whl/cu130 --break-system-packages --ignore-installed
 
+# Install AWS CLI
+RUN apt-get update && apt-get install -y unzip \
+    && curl "https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip" -o "awscliv2.zip" \
+    && unzip awscliv2.zip \
+    && ./aws/install \
+    && rm -rf awscliv2.zip aws/
+
+# Install rsync
+RUN apt-get update && apt-get install -y rsync
+
 ENV PYTHONPATH=/app
 
 CMD ["/app/start.sh"]

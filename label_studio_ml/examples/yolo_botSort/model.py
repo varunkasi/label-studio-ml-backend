@@ -208,15 +208,24 @@ class YOLO(LabelStudioMLBase):
         keyframe_interval = int(kwargs.get("keyframe_interval", 5))
 
         # Get weights path based on model version
-        # TODO: Support saving weights from training sessions (and store data on mAP etc.)
-        model_dir = f"/app/workspace/autolabel/saved_weights/{model_version}"
-        model_files = glob.glob(os.path.join(model_dir, "*.pt"))
+        # If model_version is a .pt file, use it directly
+        if model_version.endswith(".pt"):
+            # Convert to absolute path if it's relative
+            model_path = os.path.abspath(model_version)
+            if not os.path.exists(model_path):
+                raise FileNotFoundError(f"Model file not found: {model_path}")
+            logger.info(f"Using model file directly: {model_path}")
+        else:
+            # Otherwise, search for .pt file in the model version folder
+            model_dir = f"/app/workspace/autolabel/saved_weights/{model_version}"
+            model_files = glob.glob(os.path.join(model_dir, "*.pt"))
 
-        if not model_files:
-            raise FileNotFoundError(f"No .pt file found in {model_dir}")
+            if not model_files:
+                raise FileNotFoundError(f"No .pt file found in {model_dir}")
 
-        # Get the most recently modified file
-        model_path = max(model_files, key=os.path.getmtime)
+            # Get the most recently modified file
+            model_path = max(model_files, key=os.path.getmtime)
+            logger.info(f"Using model from folder: {model_path}")
 
         # Creates VideoRectangleModelYoloBotSort instances for each control tag
         control_models = self.detect_control_models(custom_model_path=model_path)
@@ -313,13 +322,16 @@ class YOLO(LabelStudioMLBase):
             base_output_dir = "workspace/autotrain/train_weights" + f"/{model_version}"
             os.makedirs(base_output_dir, exist_ok=True)
             
+            # Get task ID for the filename
+            task_id = task.get('id', 'unknown')
+            
             base_path = os.path.join(base_output_dir, model_version)
             run_number = self.get_next_run_number(base_path)
-            project_name = f'{model_version}_{datetime.now().strftime("%Y%m%d")}_{run_number}'
+            project_name = f'{model_version}_{datetime.now().strftime("%Y%m%d")}_{task_id}_{run_number}'
             final_output_dir = os.path.join(base_output_dir, project_name)
             os.makedirs(final_output_dir, exist_ok=True)
 
-            logger.info(f"Training {model_version} - Run {run_number}")
+            logger.info(f"Training {model_version} - Task {task_id} - Run {run_number}")
             logger.info(f"Output directory: {final_output_dir}")
 
             kwargs['aug_config'] = aug_config

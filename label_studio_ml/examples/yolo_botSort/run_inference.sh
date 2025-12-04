@@ -11,5 +11,5 @@ python /app/cli.py \
  --yolo_botsort \
  --mode "inference" \
  --keyframe_interval 2 \
- --model_version "UAV_RGB" \
+ --model_version "workspace/autolabel/saved_weights/UAV_RGB_232794031/best.pt" \
  --reencode 
