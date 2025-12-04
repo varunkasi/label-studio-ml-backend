@@ -7,10 +7,10 @@ fi
 python /app/cli.py \
  --ls-url "$LABEL_STUDIO_HOST" \
  --ls-api-key "$LABEL_STUDIO_API_KEY" \
- --project 198563 \
- --tasks 226454004 \
+ --project 205664 \
+ --tasks 232794031 \
  --yolo_botsort \
  --mode "train" \
- --model_version "UAV_IR" \
+ --model_version "UAV_RGB" \
  --classes "Person" \
- --annotation_id 78699742
+ --annotation_id 80755710

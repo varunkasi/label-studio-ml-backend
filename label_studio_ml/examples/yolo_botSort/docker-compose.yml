@@ -57,12 +57,10 @@ services:
       - .:/app
       - ./data/server:/data
 
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: all
-    #           capabilities: [ gpu ]
+    deploy:
+      resources:
+        limits:
+          cpus: '4.0' # Limit the container to use at most 2 CPU cores
+          memory: '32g' # Ensure the memory limit matches the mem_limit above
 
     runtime: nvidia
