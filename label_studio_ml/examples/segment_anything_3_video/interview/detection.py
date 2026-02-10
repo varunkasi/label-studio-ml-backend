@@ -61,12 +61,12 @@ logger = logging.getLogger(__name__)
 # Keyframe sampling
 DEFAULT_KEYFRAME_FRAC = float(os.getenv("INTERVIEW_KEYFRAME_FRAC", "0.04"))
 DEFAULT_MIN_SPACING = int(os.getenv("INTERVIEW_MIN_SPACING", "30"))
-DEFAULT_EMBEDDING_BATCH = int(os.getenv("INTERVIEW_EMBEDDING_BATCH", "32"))
+DEFAULT_EMBEDDING_BATCH = int(os.getenv("INTERVIEW_EMBEDDING_BATCH", "64"))
 EMBEDDING_CACHE_DIR = os.getenv("INTERVIEW_EMBEDDING_CACHE", "/tmp/interview_embed_cache")
 INITIAL_KEYFRAME_COUNT = int(os.getenv("INTERVIEW_INITIAL_KEYFRAMES", "40"))
 
 # Batch detection
-DEFAULT_DETECT_BATCH = int(os.getenv("INTERVIEW_DETECT_BATCH", "8"))
+DEFAULT_DETECT_BATCH = int(os.getenv("INTERVIEW_DETECT_BATCH", "16"))
 
 # Detection
 DEFAULT_DETECTION_THRESHOLD = float(os.getenv("INTERVIEW_DETECT_THRESHOLD", "0.3"))
@@ -79,6 +79,9 @@ DEFAULT_DEDUP_IOU_THRESHOLD = float(os.getenv("INTERVIEW_DEDUP_IOU", "0.5"))
 
 # Minimum box area in pixels to keep a detection
 MIN_BOX_AREA_PX = int(os.getenv("INTERVIEW_MIN_BOX_AREA", "100"))
+
+# Embedding FPS cap — subsample to this FPS during background embedding
+EMBEDDING_TARGET_FPS = float(os.getenv("INTERVIEW_EMBEDDING_FPS", "10"))
 
 
 # ===========================================================================
@@ -232,6 +235,83 @@ def uniform_indices(total: int, k: int) -> List[int]:
     if k == 1:
         return [total // 2]
     return [int(round(i * (total - 1) / (k - 1))) for i in range(k)]
+
+
+FRAMES_PER_ROUND = int(os.getenv("INTERVIEW_FRAMES_PER_ROUND", "40"))
+
+
+def select_round_frames(
+    session: "InterviewSession",
+    round_num: int,
+    frames_per_round: int = FRAMES_PER_ROUND,
+) -> List[int]:
+    """Select frames for a round.
+
+    Round 1: uniform temporal stratification with change-keyframe preference.
+    Round 2+: sample primarily from change-detected keyframes (if available),
+    falling back to uniform stratification with prior-round exclusion.
+    """
+    total = session.frames_count
+    if total <= 0:
+        return []
+
+    # Exclude frames from prior rounds
+    used: set = set()
+    for rn, rf in session.round_frames.items():
+        if rn < round_num:
+            used.update(rf)
+
+    if round_num >= 2:
+        # Round 2+: draw from change-detected keyframes
+        change = session.change_keyframes
+        if change:
+            available_change = [f for f in change if f not in used]
+            if not available_change:
+                # All change frames used — fall back to full range
+                available_change = [f for f in range(total) if f not in used]
+                if not available_change:
+                    available_change = list(range(total))
+
+            k = min(frames_per_round, len(available_change))
+            if k <= 0:
+                return []
+            # Uniformly spaced among the available change frames
+            indices = [available_change[i * len(available_change) // k] for i in range(k)]
+            return sorted(set(indices))
+
+    # Round 1 (or round 2+ without change data): uniform temporal bins
+    available = [i for i in range(total) if i not in used]
+    if not available:
+        available = list(range(total))
+
+    k = min(frames_per_round, len(available))
+    if k <= 0:
+        return []
+
+    bin_width = total / k
+    change_set = set(session.change_keyframes) if session.change_keyframes else set()
+
+    selected: List[int] = []
+    for i in range(k):
+        bin_start = int(i * bin_width)
+        bin_end = int((i + 1) * bin_width)
+        candidates = [f for f in available if bin_start <= f < bin_end]
+
+        if not candidates:
+            mid = (bin_start + bin_end) // 2
+            nearest = min(available, key=lambda f: abs(f - mid))
+            if nearest not in selected:
+                selected.append(nearest)
+            continue
+
+        change_in_bin = [f for f in candidates if f in change_set]
+        mid = (bin_start + bin_end) // 2
+        if change_in_bin:
+            selected.append(min(change_in_bin, key=lambda f: abs(f - mid)))
+        else:
+            selected.append(min(candidates, key=lambda f: abs(f - mid)))
+
+    return sorted(set(selected))
 
 
 _MAX_DECODE_AFTER_SEEK = int(os.getenv("INTERVIEW_MAX_DECODE_AFTER_SEEK", "500"))
@@ -924,54 +1004,56 @@ def run_detection_pipeline(
 
 
 # ===========================================================================
-# Stage 1: fast detection on uniform frames (no embeddings)
+# Round-based active learning detection
 # ===========================================================================
 
-def run_detection_stage1(
+def run_round_detection(
     session: InterviewSession,
     prompt: str,
     progress: Any,
+    round_num: int = 1,
 ) -> Dict[str, Any]:
-    """Fast initial detection: uniform frame sampling + batched inference.
+    """Run detection for one active learning round.
 
-    Selects ``INITIAL_KEYFRAME_COUNT`` uniformly-spaced frames, pre-decodes
-    them in a single PyAV pass, runs batched Sam3 detection, and stores
-    crops on the session.  No embedding computation — the user can start
-    labeling within ~30-60 seconds.
+    1. Select frames via temporal stratification (excludes prior rounds)
+    2. Batch-decode and batch-detect
+    3. Store crops on session (NO auto-scoring — MLP trains at round boundary)
+    4. Record round state
 
     Args:
-        session:  InterviewSession with video_path already set.
-        prompt:   Text prompt for detection.
-        progress: JobProgress object.
+        session: The interview session.
+        prompt: Text prompt for SAM3 detection.
+        progress: Progress reporting object with step/current/total.
+        round_num: Which round (1-indexed).
 
     Returns:
-        Summary dict with detection statistics.
+        Summary dict with round, keyframes, total_crops, prompt, elapsed.
     """
-    t0 = time.time()
+    import time as _time
+    t0 = _time.time()
 
     if prompt not in session.prompts:
         session.prompts.append(prompt)
 
-    frames_count = session.frames_count
-    k = min(INITIAL_KEYFRAME_COUNT, frames_count) if frames_count > 0 else INITIAL_KEYFRAME_COUNT
-    keyframe_indices = uniform_indices(frames_count, k)
-
-    # Step 1: decode target frames in one sequential pass
-    progress.step = f"Decoding {len(keyframe_indices)} frames..."
+    # Step 1: Select frames
+    progress.step = f"Round {round_num}: Selecting frames..."
     progress.total = 3
     progress.current = 0
 
-    frame_images = _decode_frames_sequential(session.video_path, keyframe_indices)
+    frame_indices = select_round_frames(session, round_num)
+    if not frame_indices:
+        raise RuntimeError(f"No frames available for round {round_num}")
+    progress.current = 1
+
+    # Step 2: Decode frames (single sequential PyAV pass)
+    progress.step = f"Round {round_num}: Decoding {len(frame_indices)} frames..."
+    frame_images = _decode_frames_sequential(session.video_path, frame_indices)
     if not frame_images:
-        raise RuntimeError(
-            f"Failed to decode any of the {len(keyframe_indices)} target keyframes from {session.video_path}"
-        )
-    progress.current = 1
+        raise RuntimeError(f"Failed to decode frames for round {round_num}")
+    progress.current = 2
 
-    # Step 2: batched detection
-    progress.step = f"Running batched detection on {len(frame_images)} frames..."
-    progress.current = 1
-
+    # Step 3: Batch detect
+    progress.step = f"Round {round_num}: Detecting on {len(frame_images)} frames..."
     detector = Sam3TextBasedDetector()
     crops = _detect_batch(
         detector, frame_images, prompt,
@@ -979,33 +1061,48 @@ def run_detection_stage1(
         batch_size=DEFAULT_DETECT_BATCH,
     )
     detector.clear_cache()
-    progress.current = 2
+    progress.current = 3
 
-    # Step 3: store crops, advance phase
-    progress.step = "Saving results..."
+    # Step 4: Store crops (no auto-scoring)
     total_crops = 0
     with session._lock:
-        session.sampled_frames = sorted(frame_images.keys())
+        session.round_frames[round_num] = sorted(frame_images.keys())
+        session.sampled_frames = sorted(
+            set(session.sampled_frames) | set(frame_images.keys())
+        )
+        session.current_round = round_num
+
         for crop in crops:
             session.add_crop(crop)
             total_crops += 1
-        session.advance_to(Phase.DETECTION)
-        save_session(session)
 
-    elapsed = time.time() - t0
-    progress.step = "Detection complete."
-    progress.current = progress.total
+        if round_num == 1:
+            session.advance_to(Phase.DETECTION)
+
+    elapsed = _time.time() - t0
+    progress.step = f"Round {round_num} complete."
+
+    round_info = {
+        "round": round_num,
+        "frames": len(frame_indices),
+        "new_crops": total_crops,
+        "elapsed_seconds": round(elapsed, 1),
+    }
+
+    with session._lock:
+        session.round_history.append(round_info)
+
+    save_session(session)
 
     summary = {
-        "keyframes": len(keyframe_indices),
+        "round": round_num,
+        "keyframes": len(frame_indices),
         "total_crops": total_crops,
         "prompt": prompt,
         "elapsed_seconds": round(elapsed, 1),
     }
-    logger.info(
-        "Stage 1 detection: %d crops on %d uniform keyframes in %.1fs",
-        total_crops, len(keyframe_indices), elapsed,
-    )
+    logger.info("Round %d: %d crops on %d frames in %.1fs",
+                round_num, total_crops, len(frame_indices), elapsed)
     return summary
 
 
@@ -1023,9 +1120,15 @@ def run_embedding_background(
     stores the change-detected keyframe indices on the session for use
     by subsequent active-learning rounds and recall strategies.
 
+    Supports:
+    - **FPS cap**: Subsamples to ``EMBEDDING_TARGET_FPS`` (default 10fps).
+    - **Pause/resume**: Checks ``progress._pause_event`` between batches.
+    - **Incremental change**: Updates ``session.change_keyframes`` after each
+      batch so partial results are available even when paused.
+
     Args:
         session:  InterviewSession with video_path already set.
-        progress: JobProgress object.
+        progress: JobProgress object (with _pause_event for pause/resume).
 
     Returns:
         Summary dict with embedding stats.
@@ -1041,25 +1144,44 @@ def run_embedding_background(
         progress.current = current
         progress.total = total
 
+    def _change_cb(change_keyframes: list):
+        """Store incremental change keyframes on session as they're computed."""
+        with session._lock:
+            session.change_keyframes = change_keyframes
+            session.touch()
+
+    # Get pause_event from progress if available (JobProgress has it)
+    pause_event = getattr(progress, '_pause_event', None)
+
     progress.step = "Computing frame embeddings..."
-    embeds = _do_embed_all_frames(
-        video_path, DEFAULT_EMBEDDING_BATCH, progress_callback=_progress_cb,
+    embeds, sampled_indices = _do_embed_all_frames(
+        video_path, DEFAULT_EMBEDDING_BATCH,
+        progress_callback=_progress_cb,
+        target_fps=EMBEDDING_TARGET_FPS,
+        pause_event=pause_event,
+        change_callback=_change_cb,
     )
 
-    # Change detection
+    # Final change detection on all embeddings
     progress.step = "Running change detection..."
     frames_count = embeds.shape[0]
     diff = compute_change_scores(embeds)
     smooth = smooth_change_scores(diff, kernel_size=5)
-    change_keyframes = select_keyframes(
+    change_keyframes_sub = select_keyframes(
         frames_count, DEFAULT_KEYFRAME_FRAC, smooth,
         min_spacing=DEFAULT_MIN_SPACING,
     )
+    # Map subsampled indices back to original frame indices
+    change_keyframes = [
+        sampled_indices[k] for k in change_keyframes_sub
+        if k < len(sampled_indices)
+    ]
 
     # Store on session
     with session._lock:
         session.embedding_complete = True
         session.change_keyframes = change_keyframes
+        session.embedding_sampled_indices = sampled_indices
         session.touch()
         save_session(session)
 
@@ -1069,12 +1191,13 @@ def run_embedding_background(
 
     summary = {
         "frames_embedded": int(frames_count),
+        "frames_total_in_video": sampled_indices[-1] + 1 if sampled_indices else 0,
         "change_keyframes": len(change_keyframes),
         "elapsed_seconds": round(elapsed, 1),
     }
     logger.info(
-        "Background embedding: %d frames, %d change keyframes in %.1fs",
-        frames_count, len(change_keyframes), elapsed,
+        "Background embedding: %d frames (subsampled from %d), %d change keyframes in %.1fs",
+        frames_count, summary["frames_total_in_video"], len(change_keyframes), elapsed,
     )
     return summary
 
@@ -1184,36 +1307,6 @@ def _run_multi_prompt_strategy(
     return summary
 
 
-def _run_feature_search_strategy(
-    session: InterviewSession,
-    progress: Any,
-) -> Dict[str, Any]:
-    """Dense-grid DINOv3 feature search recall strategy.
-
-    Delegates to :func:`dinov3_classifier.run_feature_search` which:
-    1. Defines a sliding-window grid across sampled frames at multiple scales.
-    2. Extracts DINOv3 features for each grid cell.
-    3. Compares against the feature centroid of accepted crops.
-    4. Returns high-similarity candidates that don't overlap existing crops.
-
-    Args:
-        session:  InterviewSession.
-        progress: JobProgress object.
-
-    Returns:
-        Summary dict with strategy name and new crop count.
-    """
-    from .dinov3_classifier import run_feature_search
-
-    new_crops = run_feature_search(session, progress)
-
-    return {
-        "strategy": "feature_search",
-        "status": "completed",
-        "new_crops": len(new_crops),
-    }
-
-
 def run_recall_strategy(
     session: InterviewSession,
     strategy: str,
@@ -1227,11 +1320,10 @@ def run_recall_strategy(
     Supported strategies:
         - ``"multi_prompt"``: Run detector with additional text prompts on
           already-sampled frames; deduplicate against existing crops.
-        - ``"feature_search"``: Dense-grid DINOv3 feature search.
 
     Args:
         session:       InterviewSession.
-        strategy:      One of "multi_prompt" or "feature_search".
+        strategy:      ``"multi_prompt"``.
         extra_prompts: Additional text prompts (used by multi_prompt).
         progress:      JobProgress object.
 
@@ -1249,12 +1341,10 @@ def run_recall_strategy(
                 "multi_prompt strategy requires at least one prompt in 'prompts'."
             )
         result = _run_multi_prompt_strategy(session, extra_prompts, progress)
-    elif strategy == "feature_search":
-        result = _run_feature_search_strategy(session, progress)
     else:
         raise ValueError(
             f"Unknown recall strategy: {strategy!r}. "
-            f"Supported: 'multi_prompt', 'feature_search'."
+            f"Supported: 'multi_prompt'."
         )
 
     elapsed = time.time() - t0

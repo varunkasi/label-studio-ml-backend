@@ -42,8 +42,7 @@ class CropSource(str, Enum):
     """How a crop was generated."""
     TEXT_DETECT = "text_detect"       # Sam3TextBasedDetector
     MULTI_PROMPT = "multi_prompt"     # Strategy A
-    FEATURE_SEARCH = "feature_search" # Strategy B
-    HUMAN_DRAWN = "human_drawn"       # Strategy C (draw mode)
+    HUMAN_DRAWN = "human_drawn"       # Manual draw mode
     CHANGE_DETECT = "change_detect"   # Detection on change-detected keyframes
 
 
@@ -62,6 +61,7 @@ class CropData:
     uncertainty: float = 0.5            # classifier uncertainty (0=certain, 1=uncertain)
     features: Optional[np.ndarray] = None  # DINOv3 CLS token (1024,)
     metadata: Optional[np.ndarray] = None  # [norm_cx, norm_cy, scale, aspect] (4,)
+    mask_quality: Optional[np.ndarray] = None  # [fill_ratio, det_score, edge_contact, compactness] (4,)
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize for JSON (excludes numpy arrays)."""
@@ -76,6 +76,7 @@ class CropData:
             "cluster_id": self.cluster_id,
             "reid_cluster_id": self.reid_cluster_id,
             "uncertainty": self.uncertainty,
+            "mask_quality": self.mask_quality.tolist() if self.mask_quality is not None else None,
         }
 
     @staticmethod
@@ -92,6 +93,7 @@ class CropData:
             cluster_id=d.get("cluster_id"),
             reid_cluster_id=d.get("reid_cluster_id"),
             uncertainty=d.get("uncertainty", 0.5),
+            mask_quality=np.array(d["mask_quality"], dtype=np.float32) if d.get("mask_quality") is not None else None,
         )
 
 
@@ -146,6 +148,12 @@ class InterviewSession:
     embedding_job_id: Optional[str] = None
     embedding_complete: bool = False
     change_keyframes: List[int] = field(default_factory=list)
+    embedding_sampled_indices: List[int] = field(default_factory=list)
+
+    # Round-based active learning
+    current_round: int = 0
+    round_history: List[Dict[str, Any]] = field(default_factory=list)
+    round_frames: Dict[int, List[int]] = field(default_factory=dict)
 
     # Classification
     model_trained: bool = False
@@ -227,6 +235,8 @@ class InterviewSession:
             "training_accuracy": self.training_accuracy,
             "n_identities": self.n_identities,
             "prompts": self.prompts,
+            "current_round": self.current_round,
+            "rounds_completed": len(self.round_history),
         }
 
 

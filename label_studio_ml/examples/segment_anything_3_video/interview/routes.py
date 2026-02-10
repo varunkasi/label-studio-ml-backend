@@ -9,8 +9,6 @@ from __future__ import annotations
 import io
 import logging
 import os
-import threading
-from collections import OrderedDict
 from typing import Any, Dict, Optional
 
 from flask import Blueprint, jsonify, request, send_from_directory, abort
@@ -24,53 +22,10 @@ from .cache_manager import (
     cache_exists, list_project_caches, save_session, load_session,
     delete_cache, save_model, load_model,
 )
-from .background import submit_job, get_job_progress, get_job_result
+from .background import submit_job, get_job_progress, get_job_result, pause_job, resume_job
+from .frame_cache import read_frame_cached as _read_frame_cached
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# LRU frame cache — avoids re-decoding the same frames on every HTTP request.
-# Keyed by (video_path, frame_idx).  Default 64 entries ≈ 64 × 6 MB ≈ 384 MB.
-# ---------------------------------------------------------------------------
-_FRAME_CACHE_SIZE = int(os.getenv("INTERVIEW_FRAME_CACHE_SIZE", "64"))
-_frame_cache: OrderedDict = OrderedDict()
-_frame_cache_lock = threading.Lock()
-
-
-def _get_cached_frame(video_path: str, frame_idx: int):
-    """Return cached PIL Image or None."""
-    key = (video_path, frame_idx)
-    with _frame_cache_lock:
-        if key in _frame_cache:
-            _frame_cache.move_to_end(key)
-            return _frame_cache[key]
-    return None
-
-
-def _put_cached_frame(video_path: str, frame_idx: int, pil_img):
-    """Store a PIL Image in the LRU cache."""
-    key = (video_path, frame_idx)
-    with _frame_cache_lock:
-        _frame_cache[key] = pil_img
-        _frame_cache.move_to_end(key)
-        while len(_frame_cache) > _FRAME_CACHE_SIZE:
-            _frame_cache.popitem(last=False)
-
-
-def _read_frame_cached(video_path: str, frame_idx: int):
-    """Read a frame with LRU caching."""
-    cached = _get_cached_frame(video_path, frame_idx)
-    if cached is not None:
-        return cached
-
-    import sys
-    sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-    from seeding_common import _read_frame_pyav
-
-    pil_img = _read_frame_pyav(video_path, frame_idx)
-    if pil_img is not None:
-        _put_cached_frame(video_path, frame_idx, pil_img)
-    return pil_img
 
 
 # Blueprint with static files served from interview/static/
@@ -281,9 +236,9 @@ def session_video_info(session_id: str):
 
 @interview_bp.route("/api/detect/start", methods=["POST"])
 def detect_start():
-    """Start two-phase detection: fast Stage 1 + background embedding.
+    """Start Round 1: detection on stratified frames + background embedding.
 
-    Stage 1 (fast): uniform-sample ~40 frames, batch-detect, return crops.
+    Round 1 (fast): select ~40 temporally-stratified frames, batch-detect.
     Background: GPU-batch embed all frames, run change detection.
     Returns both job IDs so the frontend can poll each independently.
     """
@@ -295,12 +250,12 @@ def detect_start():
     if session is None:
         return jsonify({"error": "Session not found"}), 404
 
-    # Stage 1: fast detection on uniform frames
-    def _detect_stage1(progress):
-        from .detection import run_detection_stage1
-        return run_detection_stage1(session, prompt, progress)
+    # Round 1: detection on stratified frames
+    def _detect_round1(progress):
+        from .detection import run_round_detection
+        return run_round_detection(session, prompt, progress, round_num=1)
 
-    detect_job_id = submit_job(_detect_stage1, name="detection_stage1")
+    detect_job_id = submit_job(_detect_round1, name="round_1_detection")
 
     # Background: embed all frames + change detection (concurrent)
     def _embed_bg(progress):
@@ -317,6 +272,7 @@ def detect_start():
     return jsonify({
         "job_id": detect_job_id,
         "embedding_job_id": embed_job_id,
+        "round": 1,
     }), 202
 
 
@@ -346,6 +302,56 @@ def detect_embedding_status():
             }
 
     return jsonify(result)
+
+
+@interview_bp.route("/api/detect/next_round", methods=["POST"])
+def detect_next_round():
+    """Train MLP on all labels, then start next round of detection.
+
+    Two-phase job:
+      1. Train MLP on ALL accumulated labels (with LR decay)
+      2. Select new frames, detect on them
+    """
+    data = request.get_json(force=True)
+    session_id = data["session_id"]
+
+    session = get_session(session_id)
+    if session is None:
+        return jsonify({"error": "Session not found"}), 404
+
+    next_round = session.current_round + 1
+    prompt = session.prompts[0] if session.prompts else "person"
+
+    def _next_round(progress):
+        from .dinov3_classifier import train_classifier
+        from .detection import run_round_detection
+
+        # Pause background embedding to free GPU for MLP training + detection
+        embedding_paused = False
+        if session.embedding_job_id:
+            embedding_paused = pause_job(session.embedding_job_id)
+
+        try:
+            progress.step = f"Training MLP before round {next_round}..."
+            train_result = train_classifier(session, progress, round_num=next_round)
+
+            progress.step = f"Starting round {next_round} detection..."
+            detect_result = run_round_detection(
+                session, prompt, progress, round_num=next_round,
+            )
+        finally:
+            # Resume embedding after training + detection completes
+            if embedding_paused and session.embedding_job_id:
+                resume_job(session.embedding_job_id)
+
+        return {
+            "training": train_result,
+            "detection": detect_result,
+            "round": next_round,
+        }
+
+    job_id = submit_job(_next_round, name=f"round_{next_round}")
+    return jsonify({"job_id": job_id, "round": next_round}), 202
 
 
 @interview_bp.route("/api/detect/crops", methods=["GET"])
@@ -440,7 +446,6 @@ def detect_frame_annotated(frame_idx: int):
     }
     source_color_override = {
         CropSource.HUMAN_DRAWN: "#ff8800",
-        CropSource.FEATURE_SEARCH: "#aa00ff",
     }
 
     for crop in session.get_crops_by_frame(frame_idx):
@@ -582,10 +587,10 @@ def detect_training_status():
 
 @interview_bp.route("/api/detect/recall_strategy", methods=["POST"])
 def detect_recall_strategy():
-    """Start recall gap job: multi_prompt / feature_search."""
+    """Start recall gap job: multi_prompt strategy."""
     data = request.get_json(force=True)
     session_id = data["session_id"]
-    strategy = data.get("strategy")  # "multi_prompt" or "feature_search"
+    strategy = data.get("strategy")  # "multi_prompt"
     extra_prompts = data.get("prompts", [])
 
     session = get_session(session_id)

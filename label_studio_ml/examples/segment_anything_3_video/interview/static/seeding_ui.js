@@ -30,6 +30,19 @@ class SeedingUI {
     async init(sessionId) {
         this.sessionId = sessionId;
 
+        // Check if ReID clusters exist — seeding requires identities
+        try {
+            var reidData = await API.get('/reid/clusters', {
+                session_id: sessionId,
+            });
+            if (!reidData.n_identities || reidData.n_identities === 0) {
+                this._renderNoClusterWarning();
+                return;
+            }
+        } catch (_) {
+            // If we can't check, proceed and let server-side catch it
+        }
+
         // Load existing config
         try {
             var cfg = await API.get('/seeds/config', {
@@ -60,6 +73,54 @@ class SeedingUI {
         }
 
         this._renderConfig();
+    }
+
+    _renderNoClusterWarning() {
+        this.container.innerHTML = '';
+
+        var panel = document.createElement('div');
+        panel.className = 'seeding-panel';
+        panel.style.marginTop = '40px';
+
+        var box = document.createElement('div');
+        box.className = 'session-setup';
+        box.style.maxWidth = '600px';
+
+        var h2 = document.createElement('h2');
+        h2.textContent = 'Seeding Requires ReID';
+        box.appendChild(h2);
+
+        var desc = document.createElement('p');
+        desc.style.color = 'var(--text-secondary)';
+        desc.style.fontSize = '0.85rem';
+        desc.style.marginBottom = '20px';
+        desc.textContent =
+            'No identity clusters found. You need to run ReID clustering first ' +
+            'so that seeds can be assigned to identities.';
+        box.appendChild(desc);
+
+        var actions = document.createElement('div');
+        actions.className = 'session-actions';
+
+        var btnBack = document.createElement('button');
+        btnBack.className = 'btn btn-primary';
+        btnBack.textContent = 'Go to ReID';
+        btnBack.addEventListener('click', function () {
+            if (typeof navigate === 'function') navigate('reid');
+        });
+        actions.appendChild(btnBack);
+
+        var btnDetection = document.createElement('button');
+        btnDetection.className = 'btn btn-ghost';
+        btnDetection.textContent = 'Back to Detection';
+        btnDetection.addEventListener('click', function () {
+            if (typeof navigate === 'function') navigate('detection');
+        });
+        actions.appendChild(btnDetection);
+
+        box.appendChild(actions);
+        panel.appendChild(box);
+        this.container.appendChild(panel);
     }
 
     // ------------------------------------------------------------------

@@ -144,6 +144,10 @@ def save_session(session: InterviewSession) -> None:
         "embedding_job_id": session.embedding_job_id,
         "embedding_complete": session.embedding_complete,
         "change_keyframes": session.change_keyframes,
+        "embedding_sampled_indices": session.embedding_sampled_indices,
+        "current_round": session.current_round,
+        "round_history": session.round_history,
+        "round_frames": {str(k): v for k, v in session.round_frames.items()},
         "created_at": session.created_at,
         "updated_at": session.updated_at,
         "seed_config": {
@@ -215,9 +219,16 @@ def load_session(cache_key: str) -> Optional[InterviewSession]:
         embedding_job_id=config.get("embedding_job_id"),
         embedding_complete=config.get("embedding_complete", False),
         change_keyframes=config.get("change_keyframes", []),
+        embedding_sampled_indices=config.get("embedding_sampled_indices", []),
+        current_round=config.get("current_round", 0),
+        round_history=config.get("round_history", []),
         created_at=config.get("created_at", time.time()),
         updated_at=config.get("updated_at", time.time()),
     )
+
+    # Restore round_frames (keys must be ints)
+    raw_rf = config.get("round_frames", {})
+    session.round_frames = {int(k): v for k, v in raw_rf.items()}
 
     sc = config.get("seed_config", {})
     session.seed_config = SeedConfig(

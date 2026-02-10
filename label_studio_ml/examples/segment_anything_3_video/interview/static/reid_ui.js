@@ -48,6 +48,13 @@ class ReIDUI {
             return;
         }
 
+        // If clustering hasn't been run yet, show start screen
+        if (this.nIdentities === 0 && this.totalPairs === 0 &&
+            Object.keys(this.clusters).length === 0) {
+            this._renderStartClustering();
+            return;
+        }
+
         document.addEventListener('keydown', this._boundKeyHandler);
         this._render();
 
@@ -60,6 +67,123 @@ class ReIDUI {
 
     destroy() {
         document.removeEventListener('keydown', this._boundKeyHandler);
+    }
+
+    // ------------------------------------------------------------------
+    // Start clustering (not yet run)
+    // ------------------------------------------------------------------
+
+    _renderStartClustering() {
+        this.container.innerHTML = '';
+
+        var panel = document.createElement('div');
+        panel.className = 'seeding-panel';
+        panel.style.marginTop = '40px';
+
+        var box = document.createElement('div');
+        box.className = 'session-setup';
+        box.style.maxWidth = '600px';
+
+        var h2 = document.createElement('h2');
+        h2.textContent = 'Re-Identification';
+        box.appendChild(h2);
+
+        var desc = document.createElement('p');
+        desc.style.color = 'var(--text-secondary)';
+        desc.style.fontSize = '0.85rem';
+        desc.style.marginBottom = '20px';
+        desc.textContent =
+            'Cluster accepted crops into identities using DINOv3 features ' +
+            'and color histograms, then verify ambiguous pairs.';
+        box.appendChild(desc);
+
+        var actions = document.createElement('div');
+        actions.className = 'session-actions';
+
+        var btnStart = document.createElement('button');
+        btnStart.className = 'btn btn-primary';
+        btnStart.textContent = 'Start Clustering';
+        btnStart.addEventListener('click', function () {
+            this._runClustering();
+        }.bind(this));
+        actions.appendChild(btnStart);
+
+        var btnSkip = document.createElement('button');
+        btnSkip.className = 'btn btn-ghost';
+        btnSkip.textContent = 'Skip to Seeding';
+        btnSkip.addEventListener('click', function () {
+            if (typeof navigate === 'function') navigate('seeding');
+        });
+        actions.appendChild(btnSkip);
+
+        var btnBack = document.createElement('button');
+        btnBack.className = 'btn btn-ghost';
+        btnBack.textContent = 'Back to Detection';
+        btnBack.addEventListener('click', function () {
+            if (typeof navigate === 'function') navigate('detection');
+        });
+        actions.appendChild(btnBack);
+
+        box.appendChild(actions);
+
+        // Progress area (hidden until clustering starts)
+        var progressArea = document.createElement('div');
+        progressArea.id = 'reid-progress-area';
+        progressArea.style.marginTop = '20px';
+        box.appendChild(progressArea);
+
+        panel.appendChild(box);
+        this.container.appendChild(panel);
+    }
+
+    async _runClustering() {
+        var progressArea = document.getElementById('reid-progress-area');
+        if (progressArea) {
+            progressArea.innerHTML =
+                '<div class="progress-bar-wrapper">' +
+                '<div class="progress-bar-track"><div class="progress-bar-fill indeterminate"></div></div>' +
+                '<div class="progress-text"><span>Starting clustering...</span></div>' +
+                '</div>';
+        }
+
+        try {
+            var resp = await API.post('/reid/start', {
+                session_id: this.sessionId,
+            });
+
+            // Poll until done
+            var self = this;
+            if (typeof pollJob === 'function') {
+                pollJob(
+                    resp.job_id,
+                    function (p) {
+                        if (progressArea) {
+                            var text = progressArea.querySelector('.progress-text span');
+                            if (text) text.textContent = p.step || 'Clustering...';
+                            var fill = progressArea.querySelector('.progress-bar-fill');
+                            if (fill && p.percent > 0) {
+                                fill.classList.remove('indeterminate');
+                                fill.style.width = p.percent + '%';
+                            }
+                        }
+                    },
+                    function (p) {
+                        if (p.status === 'completed') {
+                            showToast('Clustering complete!', 'success');
+                            // Re-init to load the new clusters and pairs
+                            self.init(self.sessionId);
+                        } else {
+                            showToast('Clustering failed: ' + (p.error || 'Unknown'), 'error');
+                            if (progressArea) progressArea.innerHTML = '';
+                        }
+                    },
+                    1000
+                );
+            }
+        } catch (err) {
+            showToast('Failed to start clustering: ' + err.message, 'error');
+            if (progressArea) progressArea.innerHTML = '';
+        }
     }
 
     // ------------------------------------------------------------------

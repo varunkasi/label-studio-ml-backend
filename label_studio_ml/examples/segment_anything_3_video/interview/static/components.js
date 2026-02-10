@@ -517,7 +517,7 @@ class CropGrid {
             card.classList.add(crop.label);
 
             if (crop.source === 'human_drawn') card.classList.add('human');
-            if (crop.source === 'feature_search') card.classList.add('feature');
+
             if (index === this._selectedIndex) card.classList.add('selected');
 
             const img = document.createElement('img');
@@ -795,17 +795,24 @@ class Toolbar {
         // Separator
         this.el.appendChild(this._separator());
 
-        // Train button
-        const trainBtn = document.createElement('button');
-        trainBtn.className = 'btn btn-primary btn-small';
-        trainBtn.textContent = 'Train Classifier';
-        trainBtn.addEventListener('click', () => {
-            if (options.onTrain) options.onTrain();
+        // Round badge
+        const roundBadge = document.createElement('span');
+        roundBadge.className = 'round-badge';
+        roundBadge.textContent = `Round ${options.currentRound || 1}`;
+        this.el.appendChild(roundBadge);
+
+        // Next Round button (trains MLP + detects new frames)
+        const nextRoundBtn = document.createElement('button');
+        nextRoundBtn.className = 'btn btn-primary btn-small';
+        nextRoundBtn.textContent = 'Next Round';
+        nextRoundBtn.title = 'Train MLP on all labels, then detect on new frames';
+        nextRoundBtn.addEventListener('click', () => {
+            if (options.onNextRound) options.onNextRound();
         });
-        this.el.appendChild(trainBtn);
+        this.el.appendChild(nextRoundBtn);
 
         // Recall strategies dropdown
-        const strategies = options.recallStrategies || ['multi_prompt', 'feature_search'];
+        const strategies = options.recallStrategies || ['multi_prompt'];
         const dropdown = document.createElement('div');
         dropdown.className = 'dropdown';
         dropdown.style.position = 'relative';
@@ -911,12 +918,12 @@ class Toolbar {
             this.el.appendChild(statsEl);
         }
 
-        // Advance phase button
-        if (options.onAdvancePhase) {
+        // Advance to ReID button (available once at least 1 round is done)
+        if (options.onAdvancePhase && (options.roundsCompleted || 0) >= 1) {
             const advBtn = document.createElement('button');
-            advBtn.className = 'btn btn-primary btn-small';
+            advBtn.className = 'btn btn-secondary btn-small';
             advBtn.style.marginLeft = '8px';
-            advBtn.textContent = 'Next Phase';
+            advBtn.textContent = 'Finish Labeling → ReID';
             advBtn.addEventListener('click', () => options.onAdvancePhase());
             this.el.appendChild(advBtn);
         }

@@ -165,10 +165,10 @@ The Interview UI is a browser-based active learning workflow for generating seed
 | Phase | What happens | User action |
 |-------|-------------|-------------|
 | **Init** | Create session with project/task IDs | Enter LS project + task ID |
-| **Detection** | Stage 1: SAM3 text detection on ~40 uniform keyframes (~30-60s). Stage 2: GPU-batched frame embeddings run in background (~3-5 min) | Review detected crops as they appear |
-| **Classification** | MLP quality-gate classifier trains on accepted/rejected crops. Active learning picks most uncertain crops for next labeling round | Label crops: Accept (good box) / Reject (bad box or not target) / Skip (ambiguous) |
-| **ReID** | Spherical K-means clustering on DINOv3 features. Calibrated pair sampling (60% ambiguous, 20% confident same, 20% confident different) | Judge pairs: same person / different / unsure |
-| **Seeding** | Three-path dual-proposer pipeline generates dense seeds across all frames, filtered by MLP quality gate. Upload to Label Studio | Configure frame interval + confidence threshold, review + upload |
+| **Detection** | Stage 1: SAM3 text detection on ~40 uniform keyframes (~30-60s). Stage 2: FPS-capped background embeddings with incremental change detection (paused during training). Round 2+ samples from change-detected keyframes | Review detected crops as they appear |
+| **Classification** | MLP quality-gate classifier trains on accepted/rejected crops with warm-start weights + LR decay. Active learning picks most uncertain crops for next labeling round. Click "Finish Labeling → ReID" after round 1+ to proceed | Label crops: Accept (good box) / Reject (bad box or not target) / Skip (ambiguous) |
+| **ReID** | Auto-prompts "Start Clustering" on entry. Spherical K-means on DINOv3 features + color histograms. Calibrated pair sampling (60% ambiguous, 20% confident same, 20% confident different) | Judge pairs: same person / different / unsure |
+| **Seeding** | Three-path dual-proposer pipeline generates dense seeds across all frames, filtered by MLP quality gate. Guards against missing ReID clusters. Upload to Label Studio | Configure frame interval + confidence threshold, review + upload |
 
 After upload, seeds are created with `enabled=false` keyframes in Label Studio. Run the tracking CLI to fill gaps:
 
@@ -181,8 +181,8 @@ docker compose exec segment_anything_3_video python /app/initial_seeding_video_b
 ### Architecture
 
 - **Backend:** Flask Blueprint (`interview/routes.py`) with background job executor for long-running operations
-- **Frontend:** Vanilla JS SPA with hash-based routing, no framework dependencies
-- **Models used:** SAM3 (text-based detection + box-prompted refinement), DINOv3 (`facebook/dinov2-large` for feature extraction + 3-scale grid search), MLP classifier (trained per session on Accept/Reject labels)
+- **Frontend:** Vanilla JS SPA with hash-based routing and clickable phase navigation, no framework dependencies
+- **Models used:** SAM3 (text-based detection + box-prompted refinement), DINOv3 (`facebook/dinov3-vitl16-pretrain-lvd1689m` for feature extraction + 3-scale grid search), MLP classifier (trained per session on Accept/Reject labels)
 - **State:** In-memory sessions with optional disk persistence to `/data/adapters/`
 
 ### Detection Pipeline
@@ -220,12 +220,14 @@ The MLP classifier acts as a **quality gate** during dense seeding. It does NOT 
 
 | Module | Purpose |
 |--------|---------|
-| `interview/routes.py` | REST endpoints, LRU frame cache, SPA serving |
-| `interview/state.py` | Session state management (phases, crops, clusters) |
-| `interview/background.py` | Thread-based job executor with progress polling |
-| `interview/cache_manager.py` | Disk persistence for sessions, features, models |
-| `interview/detection.py` | Two-stage detection pipeline: batch SAM3 inference + background embeddings |
-| `interview/dinov3_classifier.py` | DINOv3 feature extraction, MLP quality-gate classifier, 3-scale grid search |
+| `interview/routes.py` | REST endpoints, SPA serving, embedding pause/resume during training |
+| `interview/state.py` | Session state management (phases, crops, clusters, embedding indices) |
+| `interview/background.py` | Thread-based job executor with progress polling, pause/resume via `threading.Event` |
+| `interview/cache_manager.py` | Disk persistence for sessions, features, models, embedding indices |
+| `interview/detection.py` | Two-stage detection pipeline: batch SAM3 inference + FPS-capped background embeddings with incremental change detection |
+| `interview/dinov3_classifier.py` | DINOv3 feature extraction (batch decode + LRU cache), MLP quality-gate classifier with feature-level augmentation |
+| `interview/frame_cache.py` | Shared LRU frame cache (avoids circular imports between routes and classifier) |
+| `interview/mask_utils.py` | Mask-quality feature computation (fill ratio, edge contact, compactness) and LR decay |
 | `interview/reid_phase.py` | Spherical K-means clustering, calibrated pair sampling, burden-of-proof merge |
 | `interview/seeding_phase.py` | Three-path dual-proposer dense seeding + Label Studio upload |
 
@@ -241,6 +243,11 @@ The MLP classifier acts as a **quality gate** during dense seeding. It does NOT 
 | `INTERVIEW_GRID_SIM_THRESHOLD` | `0.5` | Cosine similarity threshold for grid cell match |
 | `INTERVIEW_GRID_TOP_K` | `5` | Max grid cells to refine per frame |
 | `INTERVIEW_SEED_CHUNK_SIZE` | `100` | Frames per processing chunk in seeding |
+| `INTERVIEW_EMBEDDING_FPS` | `10` | FPS cap for background embedding (subsamples to this rate) |
+| `INTERVIEW_EMBEDDING_BATCH` | `64` | Batch size for SAM3 frame embedding |
+| `INTERVIEW_DETECT_BATCH` | `16` | Batch size for SAM3 text detection |
+| `INTERVIEW_LR_DECAY` | `0.7` | Per-round learning rate decay factor for MLP classifier |
+| `INTERVIEW_FRAME_CACHE_SIZE` | `64` | LRU frame cache entries (~6 MB each) |
 
 ## Configuration
 

@@ -37,6 +37,26 @@ class JobProgress:
     finished_at: Optional[float] = None
     result: Any = None
     error: Optional[str] = None
+    _pause_event: threading.Event = field(default_factory=threading.Event, repr=False)
+
+    def __post_init__(self):
+        self._pause_event.set()  # Not paused by default
+
+    def pause(self):
+        """Pause the job — worker must call wait_if_paused() to block."""
+        self._pause_event.clear()
+
+    def resume(self):
+        """Resume a paused job."""
+        self._pause_event.set()
+
+    def wait_if_paused(self, timeout: Optional[float] = None) -> bool:
+        """Block until resumed.  Returns True if resumed, False if timed out."""
+        return self._pause_event.wait(timeout=timeout)
+
+    @property
+    def paused(self) -> bool:
+        return not self._pause_event.is_set()
 
     def to_dict(self) -> Dict[str, Any]:
         elapsed = (self.finished_at or time.time()) - self.started_at
@@ -50,6 +70,7 @@ class JobProgress:
             "percent": round(pct, 1),
             "elapsed_seconds": round(elapsed, 1),
             "error": self.error,
+            "paused": self.paused,
         }
 
 
@@ -136,3 +157,31 @@ def is_job_running(job_id: str) -> bool:
     with _jobs_lock:
         job = _jobs.get(job_id)
     return job is not None and job.status == JobStatus.RUNNING
+
+
+def get_job(job_id: str) -> Optional[JobProgress]:
+    """Get the raw JobProgress object (for pause_event access)."""
+    with _jobs_lock:
+        return _jobs.get(job_id)
+
+
+def pause_job(job_id: str) -> bool:
+    """Pause a running job.  Returns True if the job was found and paused."""
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if job is None or job.status != JobStatus.RUNNING:
+        return False
+    job.pause()
+    logger.info("Paused job %s", job_id)
+    return True
+
+
+def resume_job(job_id: str) -> bool:
+    """Resume a paused job.  Returns True if the job was found and resumed."""
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if job is None or job.status != JobStatus.RUNNING:
+        return False
+    job.resume()
+    logger.info("Resumed job %s", job_id)
+    return True

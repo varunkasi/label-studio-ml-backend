@@ -1,9 +1,9 @@
 """DINOv3 feature extractor and MLP classifier for the Interview UI.
 
 Provides lazy-loaded DINOv3 ViT-L backbone, CLS-token feature extraction,
-2-layer MLP binary classifier with feature-level augmentation, training
-loop with class weighting / uncertainty sampling, and dense spatial grid
-feature search for Strategy B discovery.
+2-layer MLP binary classifier (1032-dim: DINOv3 + spatial + mask quality)
+with feature-level augmentation, and training loop with class weighting,
+LR decay per round, and uncertainty sampling.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ import torch.nn.functional as F
 from PIL import Image
 
 from .background import JobProgress
+from .mask_utils import compute_lr, compute_mask_quality  # noqa: F401 – re-export
 from .cache_manager import load_model, save_model, save_session
 from .state import CropData, CropLabel, CropSource, InterviewSession, Phase
 
@@ -40,12 +41,12 @@ def _get_dinov3():
     """Lazy-load DINOv3 ViT-L backbone (frozen, bfloat16).
 
     Configurable via ``DINOV3_MODEL`` env var.  Defaults to
-    ``facebook/dinov2-large`` (1024-dim CLS tokens).
+    ``facebook/dinov3-vitl16-pretrain-lvd1689m`` (1024-dim CLS tokens).
     """
     global _dinov3_model, _dinov3_processor
     if _dinov3_model is None:
         from transformers import AutoImageProcessor, AutoModel
-        model_name = os.getenv("DINOV3_MODEL", "facebook/dinov2-large")
+        model_name = os.getenv("DINOV3_MODEL", "facebook/dinov3-vitl16-pretrain-lvd1689m")
         logger.info("Loading DINOv3 backbone from %s ...", model_name)
         _dinov3_model = (
             AutoModel.from_pretrained(model_name)
@@ -63,10 +64,12 @@ def _get_dinov3():
 # Feature extraction
 # ---------------------------------------------------------------------------
 
-def extract_features(crops: List[Image.Image], batch_size: int = 16) -> np.ndarray:
+def extract_features(crops: List[Image.Image], batch_size: int = 64) -> np.ndarray:
     """Extract DINOv3 CLS-token features from crop images.
 
     Returns: (N, 1024) float32 array, L2-normalized.
+    Uses batch_size=64 (up from 16) and bfloat16 autocast for GPU utilization.
+    Falls back to half batch on OOM.
     """
     if not crops:
         return np.empty((0, 1024), dtype=np.float32)
@@ -79,8 +82,25 @@ def extract_features(crops: List[Image.Image], batch_size: int = 16) -> np.ndarr
         inputs = processor(images=batch_imgs, return_tensors="pt")
         inputs = {k: v.to(DEVICE, dtype=DTYPE) for k, v in inputs.items()}
 
-        with torch.no_grad():
-            outputs = model(**inputs)
+        try:
+            with torch.no_grad(), torch.autocast(device_type=DEVICE, dtype=DTYPE):
+                outputs = model(**inputs)
+        except torch.cuda.OutOfMemoryError:
+            if DEVICE == "cuda":
+                torch.cuda.empty_cache()
+            # Retry with half batch size
+            half = max(1, len(batch_imgs) // 2)
+            logger.warning("DINOv3 OOM at batch_size=%d, retrying with %d", len(batch_imgs), half)
+            for sub_start in range(0, len(batch_imgs), half):
+                sub_imgs = batch_imgs[sub_start : sub_start + half]
+                sub_inputs = processor(images=sub_imgs, return_tensors="pt")
+                sub_inputs = {k: v.to(DEVICE, dtype=DTYPE) for k, v in sub_inputs.items()}
+                with torch.no_grad(), torch.autocast(device_type=DEVICE, dtype=DTYPE):
+                    sub_out = model(**sub_inputs)
+                cls_tokens = sub_out.last_hidden_state[:, 0, :].float().cpu().numpy()
+                norms = np.maximum(np.linalg.norm(cls_tokens, axis=1, keepdims=True), 1e-8)
+                all_features.append(cls_tokens / norms)
+            continue
 
         cls_tokens = outputs.last_hidden_state[:, 0, :].float().cpu().numpy()
         norms = np.maximum(np.linalg.norm(cls_tokens, axis=1, keepdims=True), 1e-8)
@@ -118,12 +138,12 @@ def compute_crop_metadata(
 class CropClassifier(nn.Module):
     """2-layer MLP for binary classification of crops.
 
-    Input: 1028-dim (1024 DINOv3 + 4 metadata)
-    Architecture: Linear(1028, 256) -> ReLU -> Dropout(0.3) -> Linear(256, 1)
+    Input: 1032-dim (1024 DINOv3 + 4 spatial metadata + 4 mask quality)
+    Architecture: Linear(1032, 256) -> ReLU -> Dropout(0.3) -> Linear(256, 1)
     Output: logit (use BCEWithLogitsLoss for training, sigmoid for inference)
     """
 
-    def __init__(self, input_dim: int = 1028, hidden_dim: int = 256, dropout: float = 0.3):
+    def __init__(self, input_dim: int = 1032, hidden_dim: int = 256, dropout: float = 0.3):
         super().__init__()
         self.fc1 = nn.Linear(input_dim, hidden_dim)
         self.relu = nn.ReLU()
@@ -131,7 +151,7 @@ class CropClassifier(nn.Module):
         self.fc2 = nn.Linear(hidden_dim, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward: (B, 1028) -> (B, 1) logit."""
+        """Forward: (B, 1032) -> (B, 1) logit."""
         return self.fc2(self.drop(self.relu(self.fc1(x))))
 
 
@@ -188,31 +208,19 @@ def augment_features(
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _read_single_frame(video_path: str, frame_idx: int) -> Optional[Image.Image]:
-    """Read a single frame by index via PyAV, return as PIL RGB Image."""
-    import av
-    container = av.open(video_path)
-    try:
-        stream = container.streams.video[0]
-        fps = float(stream.average_rate) if stream.average_rate else 30.0
-        if frame_idx > 0 and stream.time_base:
-            container.seek(int(frame_idx / fps / stream.time_base), stream=stream)
-        current_idx = 0
-        for frame in container.decode(video=0):
-            if current_idx >= frame_idx:
-                return frame.to_image()
-            current_idx += 1
-        return None
-    finally:
-        container.close()
-
-
 def _ensure_crop_features(
     session: InterviewSession,
     crop_ids: List[str],
     progress: Optional[JobProgress] = None,
 ) -> None:
-    """Extract and cache DINOv3 features for crops that don't have them yet."""
+    """Extract and cache DINOv3 features for crops that don't have them yet.
+
+    Uses the shared LRU frame cache first, then batch-decodes remaining
+    frames via ``_decode_frames_sequential`` (single PyAV container open).
+    This replaces the old ``_read_single_frame`` which opened/closed a
+    container per frame and had a broken seek that returned None for high
+    frame indices.
+    """
     missing = [cid for cid in crop_ids if session.crops[cid].features is None]
     if not missing:
         return
@@ -220,14 +228,35 @@ def _ensure_crop_features(
         progress.step = f"Extracting DINOv3 features for {len(missing)} crops"
 
     from collections import defaultdict
+    from .frame_cache import read_frame_cached
+
     frame_to_cids: Dict[int, List[str]] = defaultdict(list)
     for cid in missing:
         frame_to_cids[session.crops[cid].frame_idx].append(cid)
 
+    # Try LRU cache first, batch-decode the rest
+    frame_images: Dict[int, Image.Image] = {}
+    uncached: List[int] = []
+    for fidx in sorted(frame_to_cids.keys()):
+        cached = read_frame_cached(session.video_path, fidx)
+        if cached is not None:
+            frame_images[fidx] = cached
+        else:
+            uncached.append(fidx)
+
+    if uncached:
+        from .detection import _decode_frames_sequential
+        decoded = _decode_frames_sequential(session.video_path, uncached)
+        frame_images.update(decoded)
+        # Populate the LRU cache with newly decoded frames
+        from .frame_cache import put_cached_frame
+        for fidx, img in decoded.items():
+            put_cached_frame(session.video_path, fidx, img)
+
     processed = 0
     for frame_idx in sorted(frame_to_cids.keys()):
         cids = frame_to_cids[frame_idx]
-        pil_frame = _read_single_frame(session.video_path, frame_idx)
+        pil_frame = frame_images.get(frame_idx)
         if pil_frame is None:
             logger.warning("Could not decode frame %d", frame_idx)
             continue
@@ -258,13 +287,16 @@ def _ensure_crop_features(
 
 
 def _build_feature_matrix(session: InterviewSession, crop_ids: List[str]) -> torch.Tensor:
-    """Build (N, 1028) feature matrix: DINOv3 (1024) + metadata (4)."""
+    """Build (N, 1032) feature matrix: DINOv3 (1024) + metadata (4) + mask_quality (4)."""
     rows = []
     for cid in crop_ids:
-        crop = session.crops[cid]
-        feat = crop.features if crop.features is not None else np.zeros(1024, dtype=np.float32)
-        meta = crop.metadata if crop.metadata is not None else np.zeros(4, dtype=np.float32)
-        rows.append(np.concatenate([feat, meta]))
+        crop = session.crops.get(cid)
+        if crop is None or crop.features is None or crop.metadata is None:
+            continue
+        mq = crop.mask_quality if crop.mask_quality is not None else np.zeros(4, dtype=np.float32)
+        rows.append(np.concatenate([crop.features, crop.metadata, mq]))
+    if not rows:
+        return torch.empty(0, 1032)
     return torch.tensor(np.stack(rows), dtype=torch.float32)
 
 
@@ -291,14 +323,15 @@ def _overlaps_any(box: np.ndarray, existing: List[np.ndarray], threshold: float)
 # ---------------------------------------------------------------------------
 
 def train_classifier(
-    session: InterviewSession, progress: JobProgress
+    session: InterviewSession, progress: JobProgress,
+    round_num: int = 1,
 ) -> Dict[str, Any]:
     """Train the MLP classifier on labeled crops.
 
     1. Collect accepted (positive) and rejected (negative) crops
-    2. Build feature matrix (1028-dim: DINOv3 + metadata)
+    2. Build feature matrix (1032-dim: DINOv3 + metadata + mask_quality)
     3. Apply class weights for imbalance
-    4. Train for 20 epochs with AdamW lr=1e-3
+    4. Train with AdamW, LR decaying per round (0.7^(round-1))
     5. Score all unlabeled crops -> uncertainty sampling
     6. uncertainty = 1.0 - abs(2 * sigmoid(logit) - 1.0)
     7. Save model to cache, update session stats
@@ -318,21 +351,41 @@ def train_classifier(
     # Ensure features extracted for all crops
     _ensure_crop_features(session, list(session.crops.keys()), progress)
 
-    # Build training data
+    # Build training data (1032-dim: DINOv3 + spatial + mask_quality)
     progress.step = "Building training data"
     train_ids = [c.crop_id for c in accepted] + [c.crop_id for c in rejected]
-    y_np = np.array([1.0] * n_pos + [0.0] * n_neg, dtype=np.float32)
+    y_all = np.array([1.0] * n_pos + [0.0] * n_neg, dtype=np.float32)
 
     X_train = _build_feature_matrix(session, train_ids)
+
+    # Filter labels to match features — some crops may lack features
+    # if their frames failed to decode
+    valid_mask = np.array([
+        session.crops[cid].features is not None and session.crops[cid].metadata is not None
+        for cid in train_ids
+    ])
+    y_np = y_all[valid_mask]
+    if len(y_np) == 0:
+        logger.warning("No crops with features after filtering, cannot train")
+        return {"accuracy": 0.0, "n_pos": n_pos, "n_neg": n_neg,
+                "epochs": 0, "pending_scored": 0, "mean_uncertainty": 0.5}
+
+    n_pos_actual = int(y_np.sum())
+    n_neg_actual = len(y_np) - n_pos_actual
+    if n_pos_actual == 0 or n_neg_actual == 0:
+        logger.warning("After filtering: %d pos, %d neg — need both", n_pos_actual, n_neg_actual)
+        return {"accuracy": 0.0, "n_pos": n_pos_actual, "n_neg": n_neg_actual,
+                "epochs": 0, "pending_scored": 0, "mean_uncertainty": 0.5}
+
     y_train = torch.tensor(y_np, dtype=torch.float32)
 
     # Inverse-frequency class weights
-    w_pos = len(y_np) / (2.0 * max(n_pos, 1))
-    w_neg = len(y_np) / (2.0 * max(n_neg, 1))
+    w_pos = len(y_np) / (2.0 * max(n_pos_actual, 1))
+    w_neg = len(y_np) / (2.0 * max(n_neg_actual, 1))
     sample_weights = torch.where(y_train == 1.0, torch.tensor(w_pos), torch.tensor(w_neg))
 
     # Init model (or load cached)
-    model = CropClassifier()
+    model = CropClassifier(input_dim=1032)
     cached_sd = load_model(session.cache_key)
     if cached_sd is not None:
         try:
@@ -346,7 +399,8 @@ def train_classifier(
         model.to(device), X_train.to(device), y_train.to(device), sample_weights.to(device)
     )
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    lr = compute_lr(1e-3, round_num)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     n_epochs = 20
     progress.step = "Training classifier"
     progress.total = n_epochs
@@ -395,112 +449,9 @@ def train_classifier(
 
     result = {"accuracy": best_acc, "n_pos": n_pos, "n_neg": n_neg,
               "epochs": n_epochs, "pending_scored": pending_scored,
-              "mean_uncertainty": mean_unc}
+              "mean_uncertainty": mean_unc, "round_num": round_num,
+              "lr": lr}
     logger.info("Training complete: %s", result)
     return result
 
 
-# ---------------------------------------------------------------------------
-# Feature search (Strategy B helper)
-# ---------------------------------------------------------------------------
-
-def run_feature_search(
-    session: InterviewSession, progress: JobProgress
-) -> List[CropData]:
-    """Dense spatial grid feature search.
-
-    1. Define sliding window grid across sampled frames at scales [0.05, 0.10, 0.15]
-    2. Extract DINOv3 features for each grid cell
-    3. Compare to confirmed positives using cosine similarity
-    4. Return top-K most similar cells that don't overlap existing crops
-    """
-    import uuid
-
-    progress.step = "Preparing feature search"
-    accepted = session.get_crops_by_label(CropLabel.ACCEPTED)
-    if not accepted:
-        logger.warning("Feature search requires at least one accepted crop")
-        return []
-
-    _ensure_crop_features(session, [c.crop_id for c in accepted], progress)
-    pos_feats = [c.features for c in accepted if c.features is not None]
-    if not pos_feats:
-        return []
-
-    mean_feat = np.mean(np.stack(pos_feats), axis=0)
-    norm = np.linalg.norm(mean_feat)
-    if norm > 1e-8:
-        mean_feat /= norm
-
-    # Existing bboxes per frame for overlap filtering
-    existing_per_frame: Dict[int, List[np.ndarray]] = {}
-    for crop in session.crops.values():
-        existing_per_frame.setdefault(crop.frame_idx, []).append(crop.xyxy)
-
-    W, H = session.width, session.height
-    scales = [0.05, 0.10, 0.15]
-    top_k, sim_thresh, iou_thresh = 50, 0.5, 0.3
-    candidates: List[Tuple[float, CropData]] = []
-
-    frames = session.sampled_frames
-    if not frames:
-        total = session.frames_count or 1
-        step = max(1, total // 10)
-        frames = list(range(0, total, step))[:10]
-
-    progress.total = len(frames)
-
-    for fi, frame_idx in enumerate(frames):
-        progress.step = f"Feature search: frame {fi + 1}/{len(frames)}"
-        progress.current = fi
-
-        pil_frame = _read_single_frame(session.video_path, frame_idx)
-        if pil_frame is None:
-            continue
-
-        grid_crops: List[Image.Image] = []
-        grid_boxes: List[np.ndarray] = []
-
-        for scale in scales:
-            cw, ch = max(16, int(W * scale)), max(16, int(H * scale))
-            sx, sy = max(8, cw // 2), max(8, ch // 2)
-            for y0 in range(0, H - ch + 1, sy):
-                for x0 in range(0, W - cw + 1, sx):
-                    box = np.array([x0, y0, x0 + cw, y0 + ch], dtype=np.float32)
-                    if _overlaps_any(box, existing_per_frame.get(frame_idx, []), iou_thresh):
-                        continue
-                    grid_crops.append(pil_frame.crop((x0, y0, x0 + cw, y0 + ch)))
-                    grid_boxes.append(box)
-
-        if not grid_crops:
-            continue
-
-        feats = extract_features(grid_crops, batch_size=32)
-        sims = feats @ mean_feat  # cosine sim (both L2-normed)
-
-        for j in range(len(grid_crops)):
-            if sims[j] < sim_thresh:
-                continue
-            candidates.append((float(sims[j]), CropData(
-                crop_id=str(uuid.uuid4())[:12],
-                frame_idx=frame_idx,
-                xyxy=grid_boxes[j],
-                score=float(sims[j]),
-                label=CropLabel.PENDING,
-                source=CropSource.FEATURE_SEARCH,
-                prompt="feature_search",
-                uncertainty=0.5,
-                features=feats[j],
-                metadata=compute_crop_metadata(grid_boxes[j], W, H),
-            )))
-
-    candidates.sort(key=lambda x: -x[0])
-    results = [cd for _, cd in candidates[:top_k]]
-    for cd in results:
-        session.add_crop(cd)
-
-    progress.step = f"Feature search complete: {len(results)} new candidates"
-    progress.current = progress.total
-    logger.info("Feature search found %d candidates from %d frames", len(results), len(frames))
-    save_session(session)
-    return results

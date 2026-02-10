@@ -607,8 +607,11 @@ def _do_embed_all_frames(
     video_path: str,
     batch_size: int,
     progress_callback: Optional[Any] = None,
-) -> np.ndarray:
-    """Embed every frame of a video using GPU-batched SAM3 vision encoder.
+    target_fps: Optional[float] = None,
+    pause_event: Optional[Any] = None,
+    change_callback: Optional[Any] = None,
+) -> "tuple[np.ndarray, list[int]]":
+    """Embed video frames using GPU-batched SAM3 vision encoder.
 
     Uses a prefetch thread to decode frames via PyAV concurrently with GPU
     inference, keeping the GPU fed and avoiding decode-wait bottlenecks.
@@ -623,33 +626,57 @@ def _do_embed_all_frames(
         batch_size:        Number of frames per GPU forward pass.
         progress_callback: Optional callable(current: int, total: int) for
                            progress reporting (e.g. from Interview UI).
+        target_fps:        If set, subsample to at most this many frames per
+                           second.  E.g. target_fps=10 on a 30fps video
+                           processes every 3rd frame.
+        pause_event:       Optional threading.Event — if provided, the main
+                           loop calls ``pause_event.wait()`` between batches,
+                           blocking while paused.
+        change_callback:   Optional callable(change_keyframes: List[int]) —
+                           called incrementally after each batch with the
+                           change-detected keyframe indices computed so far.
 
     Returns:
-        (N, C) float16 numpy array of per-frame embeddings.
+        Tuple of:
+        - (N, C) float16 numpy array of per-frame embeddings.
+        - List of original 0-based frame indices that were sampled
+          (length N; identity map [0..total-1] when target_fps is None).
     """
     import queue
     import threading
 
     sam3_model, sam3_processor = _get_sam3_image_model()
 
-    # Probe total_frames from a quick container open (closed immediately).
+    # Probe total_frames and fps from a quick container open (closed immediately).
     probe = av.open(video_path)
     probe_stream = probe.streams.video[0]
     total_frames = probe_stream.frames
+    video_fps = float(probe_stream.average_rate) if probe_stream.average_rate else 30.0
     if not total_frames and probe_stream.duration and probe_stream.time_base:
-        fps_est = float(probe_stream.average_rate) if probe_stream.average_rate else 30.0
-        total_frames = int(float(probe_stream.duration * probe_stream.time_base) * fps_est)
+        total_frames = int(float(probe_stream.duration * probe_stream.time_base) * video_fps)
     probe.close()
 
+    # Compute skip interval for FPS subsampling
+    skip = 1
+    if target_fps is not None and target_fps > 0 and video_fps > target_fps:
+        skip = max(1, round(video_fps / target_fps))
+
+    # Estimate sampled count for progress reporting
+    sampled_total = (total_frames + skip - 1) // skip if total_frames else 0
+
     # -- Prefetch thread: owns its own container, decodes into a bounded queue --
+    # Queue items are (original_frame_idx, PIL Image) or _SENTINEL
     frame_queue: queue.Queue = queue.Queue(maxsize=batch_size * 2)
     _SENTINEL = None  # signals end-of-video
 
     def _decode_worker():
         container = av.open(video_path)
         try:
+            frame_idx = 0
             for av_frame in container.decode(video=0):
-                frame_queue.put(av_frame.to_image())
+                if frame_idx % skip == 0:
+                    frame_queue.put((frame_idx, av_frame.to_image()))
+                frame_idx += 1
         except Exception as exc:
             logger.error("Prefetch decode error: %s", exc)
         finally:
@@ -667,43 +694,84 @@ def _do_embed_all_frames(
 
     try:
         embeds: List[np.ndarray] = []
+        sampled_indices: List[int] = []
         frames_batch: List[Image.Image] = []
+        indices_batch: List[int] = []
         frames_done = 0
 
         while True:
             item = frame_queue.get()
             if item is _SENTINEL:
                 break
-            frames_batch.append(item)
+            orig_idx, pil_img = item
+            frames_batch.append(pil_img)
+            indices_batch.append(orig_idx)
 
             if len(frames_batch) >= batch_size:
+                # Pause check — blocks if embedding is paused
+                if pause_event is not None:
+                    pause_event.wait()
+
                 embeds.append(_embed_batch_sam3(sam3_model, sam3_processor, frames_batch))
+                sampled_indices.extend(indices_batch)
                 frames_done += len(frames_batch)
                 frames_batch = []
+                indices_batch = []
                 if progress_callback is not None:
-                    progress_callback(frames_done, total_frames or frames_done)
+                    progress_callback(frames_done, sampled_total or frames_done)
+
+                # Incremental change detection callback (every 10 batches to avoid O(N^2))
+                if change_callback is not None and len(embeds) >= 2 and len(embeds) % 10 == 0:
+                    _invoke_change_callback(embeds, sampled_indices, change_callback)
 
         if frames_batch:
+            if pause_event is not None:
+                pause_event.wait()
             embeds.append(_embed_batch_sam3(sam3_model, sam3_processor, frames_batch))
+            sampled_indices.extend(indices_batch)
             frames_done += len(frames_batch)
             if progress_callback is not None:
-                progress_callback(frames_done, total_frames or frames_done)
+                progress_callback(frames_done, sampled_total or frames_done)
+            if change_callback is not None and len(embeds) >= 2:
+                _invoke_change_callback(embeds, sampled_indices, change_callback)
 
         if not embeds:
             raise InitialSeedingError("No frames read from video for embedding computation")
 
         stacked = np.concatenate(embeds, axis=0).astype("float16")
         logger.info(
-            "Computed SAM3 embeddings for %d frames (shape=%s)",
-            stacked.shape[0], stacked.shape,
+            "Computed SAM3 embeddings for %d frames (skip=%d, shape=%s)",
+            stacked.shape[0], skip, stacked.shape,
         )
-        return stacked
+        return stacked, sampled_indices
     finally:
         decode_thread.join(timeout=30)
         if decode_thread.is_alive():
             logger.warning("Prefetch decode thread did not finish in 30s")
         for h in root_logger.handlers:
             h.removeFilter(_suppress_filter)
+
+
+def _invoke_change_callback(
+    embeds: List[np.ndarray],
+    sampled_indices: List[int],
+    change_callback: Any,
+) -> None:
+    """Compute change scores on accumulated embeddings and invoke callback."""
+    try:
+        stacked = np.concatenate(embeds, axis=0).astype("float16")
+        if stacked.shape[0] < 2:
+            return
+        diff = compute_change_scores(stacked)
+        smooth = smooth_change_scores(diff, kernel_size=5)
+        keyframes_sub = select_keyframes(
+            stacked.shape[0], 0.04, smooth, min_spacing=30,
+        )
+        # Map subsampled indices back to original frame indices
+        change_originals = [sampled_indices[k] for k in keyframes_sub if k < len(sampled_indices)]
+        change_callback(change_originals)
+    except Exception as exc:
+        logger.warning("Incremental change callback error: %s", exc)
 
 
 def _compute_sam3_frame_embeddings(
@@ -734,7 +802,12 @@ def _compute_sam3_frame_embeddings(
         batch_size_arg: int,
         progress_cb: Optional[Any] = None,
     ) -> np.ndarray:
-        return _do_embed_all_frames(video_path_arg, batch_size_arg, progress_cb)
+        result = _do_embed_all_frames(video_path_arg, batch_size_arg, progress_cb)
+        # _do_embed_all_frames now returns (embeds, sampled_indices) tuple.
+        # Legacy callers through this cache function only need the embeddings.
+        if isinstance(result, tuple):
+            return result[0]
+        return result
 
     return _cached_compute(video_id, video_path, batch_size, progress_callback)
 

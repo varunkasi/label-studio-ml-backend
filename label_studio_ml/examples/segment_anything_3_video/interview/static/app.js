@@ -187,13 +187,26 @@ function updatePhaseIndicator(activePhase) {
         const phase = dot.dataset.phase;
         const phaseIdx = PHASE_ORDER.indexOf(phase);
 
-        dot.classList.remove('active', 'complete');
+        dot.classList.remove('active', 'complete', 'clickable');
 
         if (phaseIdx < activeIdx) {
-            dot.classList.add('complete');
+            dot.classList.add('complete', 'clickable');
         } else if (phaseIdx === activeIdx) {
             dot.classList.add('active');
         }
+    });
+}
+
+/** Wire click handlers on phase dots (called once at startup). */
+function _initPhaseNavigation() {
+    document.querySelectorAll('.phase-dot').forEach((dot) => {
+        dot.addEventListener('click', () => {
+            if (!dot.classList.contains('clickable')) return;
+            const phase = dot.dataset.phase;
+            if (phase && phase !== AppState.phase) {
+                navigate(phase);
+            }
+        });
     });
 }
 
@@ -660,7 +673,7 @@ function _renderToolbar() {
         sortBy: AppState.sortBy,
         filterLabel: AppState.filterLabel,
         stats: AppState.stats,
-        recallStrategies: ['multi_prompt', 'feature_search'],
+        recallStrategies: ['multi_prompt'],
 
         onDrawToggle: () => {
             AppState.drawMode = !AppState.drawMode;
@@ -675,7 +688,9 @@ function _renderToolbar() {
             _renderToolbar();
         },
 
-        onTrain: _onTrain,
+        onNextRound: _onNextRound,
+        currentRound: AppState.stats.current_round || 1,
+        roundsCompleted: AppState.stats.rounds_completed || 0,
         onRecall: _onRecall,
 
         onPrevFrame: () => _navigateFrame(-1),
@@ -914,9 +929,40 @@ async function _onTrain() {
     }
 }
 
+/** Handle Next Round: train MLP on all labels, then detect on new frames. */
+async function _onNextRound() {
+    const progress = AppState._components.progressOverlay;
+
+    try {
+        progress.show('Training MLP and preparing next round...', -1);
+
+        const job = await API.post('/detect/next_round', {
+            session_id: AppState.sessionId,
+        });
+
+        pollJob(
+            job.job_id,
+            (p) => {
+                progress.show(p.step || 'Processing...', p.percent || -1);
+            },
+            async (p) => {
+                progress.hide();
+                if (p.status === 'completed') {
+                    showToast(`Round ${job.round} ready`, 'success');
+                    await _refreshCrops();
+                } else {
+                    showToast(`Round failed: ${p.error}`, 'error');
+                }
+            }
+        );
+    } catch (err) {
+        progress.hide();
+    }
+}
+
 /**
  * Handle a recall strategy selection.
- * @param {string} strategy - 'multi_prompt' or 'feature_search'.
+ * @param {string} strategy - 'multi_prompt'.
  */
 async function _onRecall(strategy) {
     const progress = AppState._components.progressOverlay;
@@ -964,8 +1010,6 @@ async function _onRecall(strategy) {
                 }
             });
         });
-    } else {
-        await _runRecallJob(strategy, []);
     }
 }
 
@@ -994,7 +1038,10 @@ async function _runRecallJob(strategy, extraPrompts) {
             async (p) => {
                 progress.hide();
                 if (p.status === 'completed') {
-                    showToast(`Recall (${strategy}) complete`, 'success');
+                    const newCount = p.result?.new_crops || 0;
+                    showToast(`Recall (${strategy}) complete: ${newCount} new crops`, 'success');
+                    // Reset filter to 'all' so newly-added pending crops are visible
+                    AppState.filterLabel = 'all';
                     await _refreshCrops();
                 } else {
                     showToast(`Recall failed: ${p.error}`, 'error');
@@ -1682,6 +1729,9 @@ function _prevCrop() {
 document.addEventListener('DOMContentLoaded', () => {
     // Set up hash-based routing
     window.addEventListener('hashchange', _onHashChange);
+
+    // Wire phase dot click navigation
+    _initPhaseNavigation();
 
     // Parse initial hash
     const hash = window.location.hash.replace(/^#\/?/, '') || 'setup';

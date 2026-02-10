@@ -97,6 +97,19 @@ body {
   align-items: center;
   gap: 6px;
   cursor: default;
+  user-select: none;
+}
+
+.phase-dot.clickable {
+  cursor: pointer;
+}
+
+.phase-dot.clickable:hover .dot {
+  box-shadow: 0 0 6px rgba(46, 204, 113, 0.5);
+}
+
+.phase-dot.clickable:hover .phase-label {
+  color: var(--text-primary);
 }
 
 .phase-dot .dot {
@@ -496,6 +509,17 @@ body {
 
 .toolbar .dropdown-menu li:hover {
   background: var(--bg-accent);
+}
+
+.toolbar .round-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 10px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--highlight);
+  border: 1px solid var(--highlight);
+  border-radius: var(--radius-sm);
 }
 
 /* -- Toast Notifications -------------------------------------------------- */
