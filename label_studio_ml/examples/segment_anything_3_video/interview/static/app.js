@@ -415,7 +415,11 @@ function _renderCacheOptions(result) {
     actionsEl.innerHTML = '';
 
     if (result.has_cache) {
-        infoEl.textContent = 'Existing cache found for this task.';
+        let cacheText = 'Existing cache found for this task.';
+        if (result.has_frame_cache) {
+            cacheText += ` Frame cache: ${result.frame_cache_size} (${result.frame_cache_frames.toLocaleString()} frames).`;
+        }
+        infoEl.textContent = cacheText;
 
         const resumeBtn = document.createElement('button');
         resumeBtn.className = 'btn btn-secondary';
@@ -464,6 +468,32 @@ function _renderCacheOptions(result) {
         startBtn.textContent = 'Start';
         startBtn.addEventListener('click', () => _startSession('fresh'));
         actionsEl.appendChild(startBtn);
+    }
+
+    // Show global disk frame cache usage
+    _fetchDiskUsage(actionsEl);
+}
+
+/**
+ * Fetch and display total disk frame cache usage below the action buttons.
+ * @param {HTMLElement} parentEl - Element to append the info card to.
+ */
+async function _fetchDiskUsage(parentEl) {
+    try {
+        const data = await API.get('/disk_usage');
+        if (data.total_bytes > 0) {
+            const card = document.createElement('div');
+            card.style.cssText =
+                'margin-top:16px;padding:10px 14px;font-size:0.8rem;' +
+                'color:var(--text-secondary);background:var(--bg-surface);' +
+                'border:1px solid var(--border-default);border-radius:var(--radius-sm);';
+            card.textContent =
+                `Frame Cache: ${data.total_human} ` +
+                `(${data.sessions_cached} video${data.sessions_cached !== 1 ? 's' : ''} cached)`;
+            parentEl.parentNode.appendChild(card);
+        }
+    } catch (err) {
+        // Non-critical — silently ignore
     }
 }
 
@@ -917,8 +947,12 @@ async function _onTrain() {
             async (p) => {
                 progress.hide();
                 if (p.status === 'completed') {
-                    showToast('Classifier trained successfully', 'success');
                     await _refreshCrops();
+                    const vh = (AppState.stats && AppState.stats.validation_history) || [];
+                    const valStr = vh.length > 0
+                        ? ` — Val: ${Math.round(vh[vh.length - 1].val_accuracy * 100)}%`
+                        : '';
+                    showToast('Classifier trained' + valStr, 'success');
                 } else {
                     showToast(`Training failed: ${p.error}`, 'error');
                 }
@@ -948,8 +982,12 @@ async function _onNextRound() {
             async (p) => {
                 progress.hide();
                 if (p.status === 'completed') {
-                    showToast(`Round ${job.round} ready`, 'success');
                     await _refreshCrops();
+                    const vh = (AppState.stats && AppState.stats.validation_history) || [];
+                    const valStr = vh.length > 0
+                        ? ` — Val: ${Math.round(vh[vh.length - 1].val_accuracy * 100)}%`
+                        : '';
+                    showToast(`Round ${job.round} ready` + valStr, 'success');
                 } else {
                     showToast(`Round failed: ${p.error}`, 'error');
                 }
@@ -1564,13 +1602,18 @@ function _startEmbeddingPoll() {
         AppState._embeddingPollCancel();
     }
 
-    _showEmbeddingBanner('Embedding frames in background...');
+    _showEmbeddingBanner('Analyzing video in background...');
+
+    let consecutiveErrors = 0;
+    const MAX_CONSECUTIVE_ERRORS = 5;
 
     const cancel = setInterval(async () => {
         try {
             const status = await API.get('/detect/embedding_status', {
                 session_id: AppState.sessionId,
             });
+
+            consecutiveErrors = 0; // Reset on success
 
             if (status.embedding_complete) {
                 clearInterval(cancel);
@@ -1589,11 +1632,17 @@ function _startEmbeddingPoll() {
                 const total = (p.total || 0).toLocaleString();
                 const pct = p.percent > 0 ? ` (${Math.round(p.percent)}%)` : '';
                 _showEmbeddingBanner(
-                    `Background: Embedding frames ${current} / ${total}${pct}`
+                    `Background: Analyzing frames ${current} / ${total}${pct}`
                 );
             }
         } catch (err) {
-            // Silently retry
+            consecutiveErrors++;
+            if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+                clearInterval(cancel);
+                AppState._embeddingPollCancel = null;
+                _hideEmbeddingBanner();
+                console.warn('Embedding poll stopped after repeated failures');
+            }
         }
     }, 2000);
 

@@ -918,6 +918,13 @@ class Toolbar {
             this.el.appendChild(statsEl);
         }
 
+        // Accuracy trend widget (validation history)
+        const valHistory = (options.stats && options.stats.validation_history) || [];
+        if (valHistory.length > 0) {
+            this.el.appendChild(this._separator());
+            this.el.appendChild(this._buildAccuracyTrend(valHistory));
+        }
+
         // Advance to ReID button (available once at least 1 round is done)
         if (options.onAdvancePhase && (options.roundsCompleted || 0) >= 1) {
             const advBtn = document.createElement('button');
@@ -934,6 +941,47 @@ class Toolbar {
         sep.style.cssText =
             'width:1px;height:20px;background:var(--border-default);flex-shrink:0;';
         return sep;
+    }
+
+    /**
+     * Build a compact accuracy trend widget (sparkline bar chart + value).
+     * @param {Array<{round: number, val_accuracy: number}>} history
+     * @returns {HTMLElement}
+     */
+    _buildAccuracyTrend(history) {
+        const wrap = document.createElement('div');
+        wrap.style.cssText = 'display:flex;align-items:center;gap:6px;';
+
+        const label = document.createElement('span');
+        label.className = 'accuracy-trend-label';
+        label.textContent = 'Val:';
+        wrap.appendChild(label);
+
+        const bars = document.createElement('div');
+        bars.className = 'accuracy-trend';
+
+        const maxH = 24;
+        history.forEach((entry) => {
+            const acc = entry.val_accuracy || 0;
+            const pct = Math.round(acc * 100);
+            const bar = document.createElement('div');
+            bar.className = 'accuracy-trend-bar';
+            if (pct < 60) bar.classList.add('low');
+            else if (pct < 80) bar.classList.add('mid');
+            else bar.classList.add('high');
+            bar.style.height = Math.max(3, (acc * maxH)) + 'px';
+            bar.title = `Round ${entry.round}: ${pct}%`;
+            bars.appendChild(bar);
+        });
+        wrap.appendChild(bars);
+
+        const latest = history[history.length - 1];
+        const value = document.createElement('span');
+        value.className = 'accuracy-trend-value';
+        value.textContent = Math.round((latest.val_accuracy || 0) * 100) + '%';
+        wrap.appendChild(value);
+
+        return wrap;
     }
 
     destroy() {

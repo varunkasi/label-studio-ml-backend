@@ -46,9 +46,17 @@ def _fix_passthrough(response):
     every response, which crashes on send_from_directory's streaming
     responses with 'RuntimeError: Attempted implicit sequence conversion
     but the response object is in direct passthrough mode'.
+
+    Also sets no-cache on JS/CSS so browsers always revalidate after deploys.
     """
     if response.direct_passthrough:
         response.direct_passthrough = False
+
+    # Prevent stale JS/CSS after deploys — browser revalidates every request
+    ct = response.content_type or ""
+    if "javascript" in ct or "text/css" in ct:
+        response.headers["Cache-Control"] = "no-cache"
+
     return response
 
 
@@ -98,12 +106,99 @@ def session_init():
     else:
         options.append("fresh")
 
+    # Check for disk frame cache
+    frame_cache_info = {"has_frame_cache": False}
+    try:
+        from .disk_frame_cache import frame_cache_exists, get_frame_cache_size, get_frame_cache_meta
+        if frame_cache_exists(cache_key):
+            size = get_frame_cache_size(cache_key)
+            meta = get_frame_cache_meta(cache_key)
+            n_frames = len(meta.get("sampled_indices", [])) if meta else 0
+            frame_cache_info = {
+                "has_frame_cache": True,
+                "frame_cache_size": _human_size(size),
+                "frame_cache_bytes": size,
+                "frame_cache_frames": n_frames,
+            }
+    except ImportError:
+        pass
+
     return jsonify({
         "cache_key": cache_key,
         "has_cache": has_cache,
         "other_caches": other_caches,
         "options": options,
+        **frame_cache_info,
     })
+
+
+def _recover_embedding_if_needed(session: InterviewSession) -> None:
+    """Re-run lightweight change detection if embedding was interrupted.
+
+    After a container restart, sessions loaded from disk may have
+    embedding_complete=False and an empty change_keyframes list.  In
+    lightweight mode this takes only seconds, so we run it inline.
+
+    If the video file is missing (e.g. LS cache wiped on restart),
+    we skip gracefully — embedding will run when the video is
+    re-fetched on the next ``/detect/start``.
+    """
+    if session.embedding_complete:
+        return
+    if not session.video_path:
+        return
+    if not os.path.isfile(session.video_path):
+        logger.warning(
+            "Skipping embedding recovery: video file missing (%s). "
+            "Will re-run after video is re-fetched.",
+            session.video_path,
+        )
+        # Clear stale job reference so polling doesn't 404
+        session.embedding_job_id = None
+        return
+
+    from .detection import (
+        EMBEDDING_MODE, EMBEDDING_TARGET_FPS,
+        DEFAULT_KEYFRAME_FRAC, DEFAULT_MIN_SPACING,
+    )
+
+    if EMBEDDING_MODE != "lightweight":
+        # SAM3 mode is too slow for inline recovery — leave it for the
+        # background job to handle on next /detect/start.
+        logger.warning("Skipping embedding recovery: SAM3 mode requires background job")
+        return
+
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+    from seeding_common import (
+        compute_lightweight_change_from_video,
+        smooth_change_scores, select_keyframes,
+    )
+
+    logger.info("Recovering incomplete embedding for session %s (lightweight)...",
+                session.session_id)
+
+    scores, sampled_indices = compute_lightweight_change_from_video(
+        session.video_path, target_fps=EMBEDDING_TARGET_FPS,
+        cache_key=session.cache_key,
+    )
+    smooth = smooth_change_scores(scores, kernel_size=5)
+    change_keyframes_sub = select_keyframes(
+        len(scores), DEFAULT_KEYFRAME_FRAC, smooth,
+        min_spacing=DEFAULT_MIN_SPACING,
+    )
+    change_keyframes = [
+        sampled_indices[k] for k in change_keyframes_sub
+        if k < len(sampled_indices)
+    ]
+
+    session.embedding_complete = True
+    session.change_keyframes = change_keyframes
+    session.embedding_sampled_indices = sampled_indices
+    session.embedding_job_id = None  # Clear stale job reference
+    session.touch()
+
+    logger.info("Embedding recovery complete: %d keyframes", len(change_keyframes))
 
 
 @interview_bp.route("/api/session/resume", methods=["POST"])
@@ -122,6 +217,8 @@ def session_resume():
         session = load_session(cache_key)
         if session is None:
             return jsonify({"error": "No cache found to resume"}), 404
+        # Recover incomplete embedding (fast in lightweight mode)
+        _recover_embedding_if_needed(session)
         # Register in memory
         from .state import _sessions, _registry_lock
         with _registry_lock:
@@ -132,6 +229,7 @@ def session_resume():
         session = load_session(cache_key)
         if session is None:
             return jsonify({"error": "No cache found to build on"}), 404
+        _recover_embedding_if_needed(session)
         session.phase = Phase.DETECTION
         from .state import _sessions, _registry_lock
         with _registry_lock:
@@ -404,7 +502,7 @@ def detect_frame(frame_idx: int):
     if session is None:
         abort(404)
 
-    pil_img = _read_frame_cached(session.video_path, frame_idx)
+    pil_img = _read_frame_cached(session.video_path, frame_idx, cache_key=session.cache_key)
     if pil_img is None:
         abort(404)
 
@@ -429,7 +527,7 @@ def detect_frame_annotated(frame_idx: int):
     if session is None:
         abort(404)
 
-    pil_img = _read_frame_cached(session.video_path, frame_idx)
+    pil_img = _read_frame_cached(session.video_path, frame_idx, cache_key=session.cache_key)
     if pil_img is None:
         abort(404)
 
@@ -477,7 +575,7 @@ def detect_crop_image(crop_id: str):
     if crop is None:
         abort(404)
 
-    pil_img = _read_frame_cached(session.video_path, crop.frame_idx)
+    pil_img = _read_frame_cached(session.video_path, crop.frame_idx, cache_key=session.cache_key)
     if pil_img is None:
         abort(404)
 
@@ -582,6 +680,7 @@ def detect_training_status():
         "training_epochs": session.training_epochs,
         "training_accuracy": session.training_accuracy,
         "pending_crops": len(session.get_crops_by_label(CropLabel.PENDING)),
+        "validation_history": session.validation_history,
     })
 
 
@@ -628,6 +727,40 @@ def reid_start():
     return jsonify({"job_id": job_id}), 202
 
 
+@interview_bp.route("/api/reid/recluster", methods=["POST"])
+def reid_recluster():
+    """Re-run clustering with optional user-specified K or adjusted bias.
+
+    Clears existing clusters and pairs, then re-runs the full ReID pipeline.
+    """
+    data = request.get_json(force=True)
+    session_id = data["session_id"]
+    n_clusters = data.get("n_clusters")  # optional int
+    overcluster_bias = data.get("overcluster_bias")  # optional float
+
+    session = get_session(session_id)
+    if session is None:
+        return jsonify({"error": "Session not found"}), 404
+
+    # Clear existing clustering state
+    session.reid_pairs = {}
+    session.reid_clusters = {}
+    session.n_identities = 0
+
+    if overcluster_bias is not None:
+        overcluster_bias = float(overcluster_bias)
+
+    def _recluster(progress):
+        from .reid_phase import run_reid_pipeline
+        return run_reid_pipeline(
+            session, n_clusters, progress,
+            overcluster_bias=overcluster_bias,
+        )
+
+    job_id = submit_job(_recluster, name="reid_recluster")
+    return jsonify({"job_id": job_id}), 202
+
+
 @interview_bp.route("/api/reid/clusters", methods=["GET"])
 def reid_clusters():
     """Cluster list + pairs for resolution."""
@@ -654,7 +787,44 @@ def reid_clusters():
         "n_identities": session.n_identities,
         "unresolved_pairs": unresolved,
         "total_pairs": len(session.reid_pairs),
+        "reid_round": session.reid_round,
     })
+
+
+@interview_bp.route("/api/reid/flag_outlier", methods=["POST"])
+def reid_flag_outlier():
+    """Flag a crop as an outlier — move it to a new singleton cluster.
+
+    Generates new pairs for the flagged crop vs. representatives of
+    each existing cluster, enabling human-driven cluster splitting.
+    """
+    data = request.get_json(force=True)
+    session_id = data["session_id"]
+    crop_id = data.get("crop_id")
+
+    if not crop_id:
+        return jsonify({"error": "crop_id is required"}), 400
+
+    session = get_session(session_id)
+    if session is None:
+        return jsonify({"error": "Session not found"}), 404
+
+    from .reid_phase import flag_outlier
+    try:
+        result = flag_outlier(session, crop_id)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    # Return updated cluster info for the frontend to re-render
+    clusters_info = {}
+    for cid, crop_ids_list in session.reid_clusters.items():
+        clusters_info[str(cid)] = {
+            "crop_ids": crop_ids_list,
+            "count": len(crop_ids_list),
+        }
+
+    result["clusters"] = clusters_info
+    return jsonify(result)
 
 
 @interview_bp.route("/api/reid/resolve", methods=["POST"])
@@ -673,6 +843,27 @@ def reid_resolve():
     save_session(session)
 
     return jsonify(result)
+
+
+@interview_bp.route("/api/reid/next_round", methods=["POST"])
+def reid_next_round():
+    """Generate next round of verification pairs for uncovered cluster-pairs."""
+    data = request.get_json(force=True)
+    session_id = data["session_id"]
+
+    session = get_session(session_id)
+    if session is None:
+        return jsonify({"error": "Session not found"}), 404
+
+    from .reid_phase import generate_next_round_pairs
+    new_pairs, coverage = generate_next_round_pairs(session)
+
+    return jsonify({
+        "pairs": [p.__dict__ for p in new_pairs],
+        "n_new_pairs": len(new_pairs),
+        "reid_round": session.reid_round,
+        **coverage,
+    })
 
 
 @interview_bp.route("/api/reid/pair/<pair_id>/frames", methods=["GET"])
@@ -822,3 +1013,41 @@ def session_save(session_id: str):
         return jsonify({"error": "Session not found"}), 404
     save_session(session)
     return jsonify({"saved": True})
+
+
+# ===========================================================================
+# Disk frame cache endpoints
+# ===========================================================================
+
+def _human_size(nbytes: int) -> str:
+    """Format byte count as human-readable string."""
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(nbytes) < 1024.0:
+            return f"{nbytes:.1f} {unit}"
+        nbytes /= 1024.0
+    return f"{nbytes:.1f} PB"
+
+
+@interview_bp.route("/api/disk_usage", methods=["GET"])
+def disk_usage():
+    """Report disk frame cache usage across all sessions."""
+    try:
+        from .disk_frame_cache import get_all_frame_cache_sizes
+    except ImportError:
+        return jsonify({
+            "total_bytes": 0,
+            "total_human": "0 B",
+            "per_session": {},
+        })
+
+    sizes = get_all_frame_cache_sizes()
+    total = sum(sizes.values())
+    return jsonify({
+        "total_bytes": total,
+        "total_human": _human_size(total),
+        "sessions_cached": len(sizes),
+        "per_session": {
+            k: {"bytes": v, "human": _human_size(v)}
+            for k, v in sizes.items()
+        },
+    })

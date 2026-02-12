@@ -605,21 +605,64 @@ docker compose exec segment_anything_3_video /app/export_interpolated_annotation
 - `casualty_<id>_f<start>-<end>_fps<fpsInt>.json` with frame-level bbox entries
 - `README.txt` in the output folder capturing parameters used
 
-### 6b. Overlay BBoxes on Snippets (`overlay_snippet_bboxes.sh`)
+### 6b. Unified Annotation Pipeline (`process_annotation.py`)
 
-**Use case:** Draw bbox overlays on an existing snippet using its bbox JSON.
+**Status**: Optional SAM3 dependency (skippable with `--skip-masks`).
 
-**Example:**
+**Use case:** One-command pipeline from Label Studio annotation to all artifacts: interpolated export, per-casualty video snippets, bbox JSONs, SAM3 mask PNGs, and overlay videos. Replaces the old `overlay_snippet_bboxes.sh` script and combines the functionality of `export_interpolated_annotation.sh` + `extract_snippet_masks.py` into a single Python entry point.
+
+**Example (full pipeline with SAM3):**
 ```bash
-docker compose exec segment_anything_3_video /app/overlay_snippet_bboxes.sh --snippet /app/exports/casualty_31_f1000-2400_fps10.mp4 --bbox-json /app/exports/casualty_31_f1000-2400_fps10.json
+docker compose exec segment_anything_3_video python /app/process_annotation.py \
+  --ls-url "$LABEL_STUDIO_HOST" --ls-api-key "$LABEL_STUDIO_API_KEY" \
+  --project 123 --task 456 --annotation 789
+```
+
+**Example (no GPU — snippets + bbox only):**
+```bash
+python process_annotation.py \
+  --ls-url "$LABEL_STUDIO_HOST" --ls-api-key "$LABEL_STUDIO_API_KEY" \
+  --project 123 --task 456 --annotation 789 --skip-masks
 ```
 
 | Flag | Required | Default | Description |
 |------|----------|---------|-------------|
-| `--snippet` | Yes | — | Path to snippet video |
-| `--bbox-json` | Yes | — | Path to bbox JSON file |
-| `--output` | No | `<snippet>_bbox_overlaid.mp4` | Output video path |
-| `--chunk-size` | No | `1000` | Frames per chunk (for large snippets) |
+| `--ls-url` | Yes* | env `LABEL_STUDIO_URL` / `LABEL_STUDIO_HOST` | Label Studio URL |
+| `--ls-api-key` | Yes* | env `LABEL_STUDIO_API_KEY` | Label Studio API key |
+| `--project` | Yes | — | Project ID |
+| `--task` | Yes | — | Task ID |
+| `--annotation` | Yes | — | Annotation ID |
+| `--snippets-dir` | No | auto-generated | Output directory |
+| `--person-id` | No | all | Filter to a single casualty ID |
+| `--min-frames` | No | — | Skip ranges shorter than N frames |
+| `--min-seconds` | No | — | Skip ranges shorter than N seconds |
+| `--fps` | No | source FPS | Target FPS (stream-copy when same as source) |
+| `--skip-snippets` | No | `False` | Export + summary only, no video cutting |
+| `--skip-masks` | No | `False` | Skip SAM3 masks (no GPU required) |
+| `--skip-mask-video` | No | `False` | Skip grayscale mask MP4 |
+| `--skip-overlay-video` | No | `False` | Skip green overlay MP4 |
+| `--skip-bbox-video` | No | `False` | Skip red bbox overlay MP4 |
+| `--chunk-size` | No | `1000` | ffmpeg drawbox chunk size |
+| `--host-uid` / `--host-gid` | No | `1000` | Docker file ownership fix |
+| `--poll-interval` | No | `5` | Export poll interval (sec) |
+| `--timeout` | No | `300` | Export poll timeout (sec) |
+| `--log-level` | No | `INFO` | Logging level |
+
+**Output directory tree:**
+```
+snippets_proj{P}_task{T}_ann{A}_{timestamp}/
+├── README.txt
+├── project{P}_task{T}_ann{A}.json              # interpolated annotation
+├── project{P}_task{T}_ann{A}.summary.json      # casualty frame ranges
+├── casualty_{id}_f{start}-{end}_fps{N}.mp4     # snippet video
+├── casualty_{id}_f{start}-{end}_fps{N}_frame_bbox.json  # per-frame bboxes
+├── casualty_{id}_f{start}-{end}_fps{N}_masks/  # SAM3 mask PNGs (if not --skip-masks)
+│   ├── mask_000001.png … mask_NNNNNN.png
+│   └── scores.json
+├── casualty_{id}_…_masks.mp4                   # grayscale mask video
+├── casualty_{id}_…_overlaid_masks.mp4          # green overlay video
+└── casualty_{id}_…_bbox_overlaid.mp4           # red bbox overlay video
+```
 
 ### 7. Deletion Utilities (`delete_annotation_or_prediction.py`)
 
@@ -735,8 +778,9 @@ docker compose exec segment_anything_3_video python /app/complete_reid.py --ls-u
 | `complete_reid.py` | **Migrated** | SAM3 embeddings backend, numpy/scipy for classic features |
 | `video_tools.py` | No model dependency | Post-processing utilities |
 | `export_interpolated_annotation.py` | No model dependency | Export with interpolation |
-| `export_interpolated_annotation.sh` | No model dependency | Bash export + snippets |
-| `overlay_snippet_bboxes.sh` | No model dependency | BBox overlay on snippets |
+| `export_interpolated_annotation.sh` | No model dependency | Bash export + snippets (lightweight, no Python) |
+| `process_annotation.py` | Optional SAM3 | Unified pipeline: export → snippets → SAM3 masks → overlay videos |
+| `extract_snippet_masks.py` | SAM3 required | SAM3 mask extraction + ffmpeg encoding (used by `process_annotation.py`) |
 | `validate_prediction.py` | No model dependency | Prediction validation |
 | `delete_annotation_or_prediction.py` | No model dependency | Deletion utility |
 | `mergevideoregions.py` | No model dependency | Track merging |
@@ -749,20 +793,24 @@ All CLI tools now run in the `segment_anything_3_video` container. OpenCV (cv2) 
 Tests run without GPU or model weights using lightweight mocks. All tests are in the `segment_anything_3_video/` directory.
 
 ```bash
-# Run all tests (82 total)
-python -m pytest test_interview_detection.py test_tracking_fixes.py -v
+# Run all tests (134 total)
+python -m pytest test_interview_detection.py test_tracking_fixes.py test_process_annotation.py -v
 
 # Detection + Interview tests only (57 tests)
 python -m pytest test_interview_detection.py -v
 
 # Tracking tests only (25 tests)
 python -m pytest test_tracking_fixes.py -v
+
+# Annotation pipeline tests only (52 tests)
+python -m pytest test_process_annotation.py -v
 ```
 
 | Test file | Tests | Coverage |
 |-----------|-------|----------|
 | `test_interview_detection.py` | 57 | NMS, batch detection, embedding pipeline, dual-proposer seeding (3 paths), mock isolation |
 | `test_tracking_fixes.py` | 25 | Seed frame handling, score extraction, early termination, oracle validation, batched sessions |
+| `test_process_annotation.py` | 52 | Export API, annotation extraction (4 formats), summary generation, FPS resampling, bbox JSON, snippet cutting, end-to-end pipeline |
 
 ## Known Limitations
 

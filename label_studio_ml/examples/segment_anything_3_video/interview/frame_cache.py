@@ -44,12 +44,29 @@ def put_cached_frame(video_path: str, frame_idx: int, pil_img: Image.Image) -> N
             _frame_cache.popitem(last=False)
 
 
-def read_frame_cached(video_path: str, frame_idx: int) -> Optional[Image.Image]:
-    """Read a frame with LRU caching.  Falls back to _read_frame_pyav."""
+def read_frame_cached(
+    video_path: str,
+    frame_idx: int,
+    cache_key: Optional[str] = None,
+) -> Optional[Image.Image]:
+    """Read a frame with 3-tier caching: LRU → disk cache → PyAV seek."""
+    # Tier 1: in-memory LRU
     cached = get_cached_frame(video_path, frame_idx)
     if cached is not None:
         return cached
 
+    # Tier 2: disk frame cache (JPEG files from background embedding)
+    if cache_key:
+        try:
+            from .disk_frame_cache import read_cached_frame as _read_disk
+            disk_img = _read_disk(cache_key, frame_idx)
+            if disk_img is not None:
+                put_cached_frame(video_path, frame_idx, disk_img)
+                return disk_img
+        except ImportError:
+            pass
+
+    # Tier 3: PyAV seek (most expensive)
     import sys
     _parent = os.path.dirname(os.path.dirname(__file__))
     if _parent not in sys.path:

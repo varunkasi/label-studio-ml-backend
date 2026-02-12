@@ -827,6 +827,366 @@ def compute_change_scores(embeds: np.ndarray) -> np.ndarray:
     return diff
 
 
+# ---------------------------------------------------------------------------
+# Lightweight change detection (CPU-only, no SAM3)
+# ---------------------------------------------------------------------------
+
+def _rgb_to_hsv_numpy(rgb: np.ndarray) -> np.ndarray:
+    """Convert RGB uint8 array to HSV float array.
+
+    Input: (H, W, 3) uint8. Output: (H, W, 3) float32
+    with H in [0, 360), S in [0, 1], V in [0, 1].
+    """
+    rgb_f = rgb.astype(np.float32) / 255.0
+    r, g, b = rgb_f[..., 0], rgb_f[..., 1], rgb_f[..., 2]
+    cmax = np.maximum(np.maximum(r, g), b)
+    cmin = np.minimum(np.minimum(r, g), b)
+    delta = cmax - cmin
+
+    h = np.zeros_like(cmax)
+    mask_r = (cmax == r) & (delta > 0)
+    mask_g = (cmax == g) & (delta > 0)
+    mask_b = (cmax == b) & (delta > 0)
+    h[mask_r] = 60.0 * (((g[mask_r] - b[mask_r]) / delta[mask_r]) % 6)
+    h[mask_g] = 60.0 * (((b[mask_g] - r[mask_g]) / delta[mask_g]) + 2)
+    h[mask_b] = 60.0 * (((r[mask_b] - g[mask_b]) / delta[mask_b]) + 4)
+
+    with np.errstate(invalid="ignore"):
+        s = np.where(cmax > 0, delta / cmax, 0.0)
+
+    return np.stack([h, s, cmax], axis=-1)
+
+
+def _histogram_distance(frame_a: np.ndarray, frame_b: np.ndarray,
+                         bins: int = 8) -> float:
+    """Chi-squared distance between HSV histograms of two frames.
+
+    Both inputs should be RGB uint8 arrays (H, W, 3). Returns a scalar
+    distance in [0, +inf), where 0 means identical histograms.
+    """
+    hsv_a = _rgb_to_hsv_numpy(frame_a)
+    hsv_b = _rgb_to_hsv_numpy(frame_b)
+
+    ranges = [(0, 360), (0, 1), (0, 1)]
+    hist_a, _ = np.histogramdd(
+        hsv_a.reshape(-1, 3),
+        bins=[bins, bins, bins],
+        range=ranges,
+    )
+    hist_b, _ = np.histogramdd(
+        hsv_b.reshape(-1, 3),
+        bins=[bins, bins, bins],
+        range=ranges,
+    )
+
+    hist_a = hist_a / (hist_a.sum() + 1e-8)
+    hist_b = hist_b / (hist_b.sum() + 1e-8)
+
+    denom = hist_a + hist_b + 1e-8
+    return float(0.5 * np.sum((hist_a - hist_b) ** 2 / denom))
+
+
+_CHANGE_THUMB_SIZE = (128, 128)
+
+
+def compute_lightweight_change_scores_from_frames(
+    frames: List[Image.Image],
+) -> np.ndarray:
+    """Compute per-frame change scores using pixel diff + histogram distance.
+
+    Two complementary signals combined via max():
+      - Pixel L1: mean absolute difference on 128x128 thumbnails
+      - Histogram chi-sq: HSV histogram distance (lighting, color shifts)
+
+    Both signals are normalized to [0, 1] using their respective max values,
+    then combined: score[i] = max(norm_pixel[i], norm_hist[i]).
+
+    Returns:
+        (N,) float32 array of change scores. First element is always 0.
+    """
+    n = len(frames)
+    if n == 0:
+        return np.empty(0, dtype=np.float32)
+
+    pixel_scores = np.zeros(n, dtype=np.float32)
+    hist_scores = np.zeros(n, dtype=np.float32)
+
+    prev_thumb = np.array(frames[0].resize(_CHANGE_THUMB_SIZE, Image.BILINEAR))
+
+    for i in range(1, n):
+        thumb = np.array(frames[i].resize(_CHANGE_THUMB_SIZE, Image.BILINEAR))
+
+        pixel_scores[i] = np.mean(np.abs(
+            thumb.astype(np.float32) - prev_thumb.astype(np.float32)
+        )) / 255.0
+
+        hist_scores[i] = _histogram_distance(prev_thumb, thumb)
+
+        prev_thumb = thumb
+
+    px_max = pixel_scores.max()
+    if px_max > 0:
+        pixel_scores /= px_max
+
+    hs_max = hist_scores.max()
+    if hs_max > 0:
+        hist_scores /= hs_max
+
+    return np.maximum(pixel_scores, hist_scores)
+
+
+def _decode_frames_for_change(
+    video_path: str,
+    target_fps: Optional[float] = None,
+    pause_event: Optional[Any] = None,
+    progress_callback: Optional[Any] = None,
+) -> Tuple[List[Image.Image], List[int]]:
+    """Decode video frames (subsampled to target_fps) for change detection.
+
+    Returns (frames_list, sampled_indices) where sampled_indices maps
+    position in frames_list to the original 0-based frame index.
+    """
+    container = av.open(video_path)
+    stream = container.streams.video[0]
+    src_fps = float(stream.average_rate or 30)
+    total_frames = stream.frames or 0
+
+    skip = max(1, int(round(src_fps / target_fps))) if target_fps else 1
+
+    frames: List[Image.Image] = []
+    indices: List[int] = []
+    frame_idx = 0
+
+    for av_frame in container.decode(video=0):
+        if frame_idx % skip == 0:
+            frames.append(av_frame.to_image())
+            indices.append(frame_idx)
+
+            if progress_callback and len(frames) % 500 == 0:
+                est_total = total_frames // skip if total_frames else 0
+                progress_callback(len(frames), est_total)
+
+            if pause_event is not None:
+                pause_event.wait()
+
+        frame_idx += 1
+
+    container.close()
+    return frames, indices
+
+
+def _compute_change_score_moving_avg(
+    thumb: np.ndarray,
+    thumb_window: "collections.deque",
+) -> Tuple[float, float]:
+    """Compute pixel L1 and histogram distance against a moving average baseline.
+
+    Compares the current thumbnail against the mean of the thumbnails in
+    ``thumb_window`` (up to 10 recent frames).  This is more robust than
+    pairwise comparison because it smooths over camera jitter and minor
+    per-frame noise.
+
+    Args:
+        thumb:        Current frame thumbnail (128×128×3 uint8).
+        thumb_window: Deque of recent thumbnails (max 10).
+
+    Returns:
+        (pixel_score, hist_score) — unnormalized change scores.
+    """
+    if not thumb_window:
+        return 0.0, 0.0
+
+    # Compute pixel-wise mean of the window as the temporal baseline
+    baseline = np.mean(
+        np.stack(list(thumb_window)).astype(np.float32), axis=0,
+    )
+
+    pixel_score = float(np.mean(np.abs(
+        thumb.astype(np.float32) - baseline
+    )) / 255.0)
+
+    # For histogram distance, compare to the most recent frame in the window
+    # (histogram of an average image is meaningless)
+    hist_score = float(_histogram_distance(thumb_window[-1], thumb))
+
+    return pixel_score, hist_score
+
+
+def compute_lightweight_change_from_video(
+    video_path: str,
+    target_fps: Optional[float] = 10.0,
+    pause_event: Optional[Any] = None,
+    progress_callback: Optional[Any] = None,
+    cache_key: Optional[str] = None,
+) -> Tuple[np.ndarray, List[int]]:
+    """Compute lightweight change scores directly from a video file.
+
+    Uses a 10-frame moving average for robust change detection: each frame
+    is compared against the mean of the previous 10 thumbnails (pixel L1)
+    and the most recent frame (histogram distance).
+
+    Two code paths depending on disk frame cache state:
+
+    **Path A — no disk cache (first run):**
+    Stream-decode from video, write each frame as JPEG to the disk frame
+    cache (if ``cache_key`` is provided), compute change scores on-the-fly.
+    Memory: ~0.5 MB constant (10 thumbnails × 128×128×3).
+
+    **Path B — disk cache exists:**
+    Read JPEGs from disk, compute change scores.  No video decode needed.
+
+    Args:
+        video_path:        Path to the video file.
+        target_fps:        Subsample rate (default 10 FPS).
+        pause_event:       Optional threading.Event for pause/resume.
+        progress_callback: Optional callable(current, total).
+        cache_key:         Session cache key for disk frame cache.
+                           If None, no disk cache is read or written.
+
+    Returns:
+        (scores, sampled_indices) — same contract as _do_embed_all_frames
+        except scores is (N,) instead of (N, C) embeddings.
+    """
+    import collections
+
+    # --- Path B: read from existing disk frame cache ---
+    if cache_key:
+        try:
+            from interview.disk_frame_cache import (
+                frame_cache_exists, iter_cached_frames, get_frame_cache_meta,
+            )
+        except ImportError:
+            frame_cache_exists = None  # running outside interview package
+
+        if frame_cache_exists and frame_cache_exists(cache_key):
+            logger.info("Disk frame cache found for %s — reading from cache", cache_key)
+            meta = get_frame_cache_meta(cache_key)
+            sampled_indices = meta.get("sampled_indices", []) if meta else []
+            est_total = len(sampled_indices)
+
+            pixel_scores_list: List[float] = []
+            hist_scores_list: List[float] = []
+            indices: List[int] = []
+            thumb_window: collections.deque = collections.deque(maxlen=10)
+
+            for n_done, (fidx, pil_img) in enumerate(iter_cached_frames(cache_key), 1):
+                thumb = np.array(pil_img.resize(_CHANGE_THUMB_SIZE, Image.BILINEAR))
+                del pil_img
+
+                px, hs = _compute_change_score_moving_avg(thumb, thumb_window)
+                pixel_scores_list.append(px)
+                hist_scores_list.append(hs)
+                thumb_window.append(thumb)
+                indices.append(fidx)
+
+                if progress_callback and n_done % 500 == 0:
+                    progress_callback(n_done, est_total)
+                if pause_event is not None:
+                    pause_event.wait()
+
+            return _normalize_change_scores(pixel_scores_list, hist_scores_list), indices
+
+    # --- Path A: stream decode from video, optionally write disk cache ---
+    disk_cache_writer = None
+    if cache_key:
+        try:
+            from interview.disk_frame_cache import (
+                init_frame_cache, write_frame, finalize_frame_cache,
+            )
+            disk_cache_writer = True
+        except ImportError:
+            disk_cache_writer = None
+
+    container = av.open(video_path)
+    stream = container.streams.video[0]
+    src_fps = float(stream.average_rate or 30)
+    total_frames = stream.frames or 0
+
+    skip = max(1, int(round(src_fps / target_fps))) if target_fps else 1
+    est_total = total_frames // skip if total_frames else 0
+
+    # Initialize disk cache
+    if disk_cache_writer:
+        probe_stream = container.streams.video[0]
+        w = probe_stream.codec_context.width
+        h = probe_stream.codec_context.height
+        import time as _time
+        init_frame_cache(cache_key, {
+            "target_fps": target_fps,
+            "src_fps": src_fps,
+            "resolution": [w, h],
+            "created_at": _time.strftime("%Y-%m-%dT%H:%M:%S"),
+        })
+
+    pixel_scores_list = []
+    hist_scores_list = []
+    indices: List[int] = []
+    thumb_window: collections.deque = collections.deque(maxlen=10)
+    frame_idx = 0
+    cache_bytes = 0
+
+    for av_frame in container.decode(video=0):
+        if frame_idx % skip == 0:
+            pil_img = av_frame.to_image()
+
+            # Write to disk cache before discarding
+            if disk_cache_writer:
+                write_frame(cache_key, frame_idx, pil_img)
+                # Estimate size (JPEG ~300 KB per 1080p frame)
+                cache_bytes += 300_000
+
+            thumb = np.array(pil_img.resize(_CHANGE_THUMB_SIZE, Image.BILINEAR))
+            del pil_img  # free full-res image immediately
+
+            px, hs = _compute_change_score_moving_avg(thumb, thumb_window)
+            pixel_scores_list.append(px)
+            hist_scores_list.append(hs)
+            thumb_window.append(thumb)
+            indices.append(frame_idx)
+
+            n_done = len(indices)
+            if progress_callback and n_done % 500 == 0:
+                progress_callback(n_done, est_total)
+
+            if pause_event is not None:
+                pause_event.wait()
+
+        frame_idx += 1
+
+    container.close()
+
+    # Finalize disk cache
+    if disk_cache_writer and indices:
+        finalize_frame_cache(cache_key, indices, cache_bytes)
+        logger.info(
+            "Disk frame cache written: %d frames, ~%.1f GB",
+            len(indices), cache_bytes / 1e9,
+        )
+
+    return _normalize_change_scores(pixel_scores_list, hist_scores_list), indices
+
+
+def _normalize_change_scores(
+    pixel_scores_list: List[float],
+    hist_scores_list: List[float],
+) -> np.ndarray:
+    """Normalize pixel and histogram scores to [0, 1] and combine via max."""
+    pixel_scores = np.array(pixel_scores_list, dtype=np.float32)
+    hist_scores = np.array(hist_scores_list, dtype=np.float32)
+
+    px_max = pixel_scores.max() if len(pixel_scores) else 0.0
+    if px_max > 0:
+        pixel_scores /= px_max
+
+    hs_max = hist_scores.max() if len(hist_scores) else 0.0
+    if hs_max > 0:
+        hist_scores /= hs_max
+
+    if len(pixel_scores):
+        return np.maximum(pixel_scores, hist_scores)
+    return np.empty(0, dtype=np.float32)
+
+
 def _median_filter_1d(values: np.ndarray, kernel_size: int) -> np.ndarray:
     if kernel_size < 1:
         raise InitialSeedingError(f"kernel_size must be positive, got {kernel_size}")

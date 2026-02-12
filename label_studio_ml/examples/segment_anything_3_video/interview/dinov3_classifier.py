@@ -68,7 +68,7 @@ def extract_features(crops: List[Image.Image], batch_size: int = 64) -> np.ndarr
     """Extract DINOv3 CLS-token features from crop images.
 
     Returns: (N, 1024) float32 array, L2-normalized.
-    Uses batch_size=64 (up from 16) and bfloat16 autocast for GPU utilization.
+    Uses batch_size=64 and bfloat16 autocast for GPU utilization.
     Falls back to half batch on OOM.
     """
     if not crops:
@@ -319,6 +319,89 @@ def _overlaps_any(box: np.ndarray, existing: List[np.ndarray], threshold: float)
 
 
 # ---------------------------------------------------------------------------
+# Validation evaluation
+# ---------------------------------------------------------------------------
+
+def _evaluate_validation(
+    session: InterviewSession,
+    model: CropClassifier,
+    device: torch.device,
+    round_num: int,
+    train_accuracy: float,
+) -> Dict[str, Any]:
+    """Evaluate the trained model on held-out validation crops.
+
+    Collects labeled crops on validation frames, builds feature matrix,
+    runs model predictions, computes accuracy, and appends to
+    ``session.validation_history``.
+
+    Returns:
+        Dict with val_accuracy, val_n_pos, val_n_neg (or empty if no
+        validation data available).
+    """
+    val_crop_ids = session.get_validation_crop_ids()
+    if not val_crop_ids:
+        return {}
+
+    # Collect only labeled validation crops
+    val_pos_ids = []
+    val_neg_ids = []
+    for cid in val_crop_ids:
+        crop = session.crops.get(cid)
+        if crop is None:
+            continue
+        if crop.label == CropLabel.ACCEPTED:
+            val_pos_ids.append(cid)
+        elif crop.label == CropLabel.REJECTED:
+            val_neg_ids.append(cid)
+
+    val_ids = val_pos_ids + val_neg_ids
+    if not val_ids:
+        return {}
+
+    y_val_np = np.array(
+        [1.0] * len(val_pos_ids) + [0.0] * len(val_neg_ids), dtype=np.float32
+    )
+
+    X_val = _build_feature_matrix(session, val_ids)
+    if X_val.shape[0] == 0:
+        return {}
+
+    # Filter to crops that actually have features
+    valid_mask = np.array([
+        session.crops[cid].features is not None and session.crops[cid].metadata is not None
+        for cid in val_ids
+    ])
+    y_val_np = y_val_np[valid_mask]
+    if len(y_val_np) == 0:
+        return {}
+
+    y_val = torch.tensor(y_val_np, dtype=torch.float32).to(device)
+
+    model.eval()
+    with torch.no_grad():
+        preds = (torch.sigmoid(model(X_val.to(device)).squeeze(-1)) >= 0.5).float()
+        val_acc = (preds == y_val).float().mean().item()
+
+    n_val_pos = int(y_val_np.sum())
+    n_val_neg = len(y_val_np) - n_val_pos
+
+    entry = {
+        "round": round_num,
+        "val_accuracy": round(val_acc, 4),
+        "val_n_pos": n_val_pos,
+        "val_n_neg": n_val_neg,
+        "train_accuracy": round(train_accuracy, 4),
+    }
+    session.validation_history.append(entry)
+
+    logger.info("Validation round %d: acc=%.2f%% (%d pos, %d neg), train_acc=%.2f%%",
+                round_num, val_acc * 100, n_val_pos, n_val_neg, train_accuracy * 100)
+
+    return {"val_accuracy": val_acc, "val_n_pos": n_val_pos, "val_n_neg": n_val_neg}
+
+
+# ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
 
@@ -339,9 +422,16 @@ def train_classifier(
     Target: <2s per training cycle on RTX 6000 Ada.
     """
     progress.step = "Collecting labelled crops"
-    accepted = session.get_crops_by_label(CropLabel.ACCEPTED)
-    rejected = session.get_crops_by_label(CropLabel.REJECTED)
+    val_frame_set = set(session.validation_frames)
+    accepted = [c for c in session.get_crops_by_label(CropLabel.ACCEPTED)
+                if c.frame_idx not in val_frame_set]
+    rejected = [c for c in session.get_crops_by_label(CropLabel.REJECTED)
+                if c.frame_idx not in val_frame_set]
     n_pos, n_neg = len(accepted), len(rejected)
+
+    if val_frame_set:
+        logger.info("Training: excluded %d validation frames, %d pos / %d neg training crops",
+                     len(val_frame_set), n_pos, n_neg)
 
     if n_pos == 0 or n_neg == 0:
         logger.warning("Need >= 1 pos and >= 1 neg (got %d / %d)", n_pos, n_neg)
@@ -439,6 +529,10 @@ def train_classifier(
         pending_scored = len(pids)
         mean_unc = float(np.mean(uncertainties))
 
+    # Evaluate on held-out validation set
+    progress.step = "Evaluating on validation set"
+    val_result = _evaluate_validation(session, model, device, round_num, best_acc)
+
     # Persist
     save_model(session.cache_key, model.cpu().state_dict())
     session.model_trained = True
@@ -451,6 +545,9 @@ def train_classifier(
               "epochs": n_epochs, "pending_scored": pending_scored,
               "mean_uncertainty": mean_unc, "round_num": round_num,
               "lr": lr}
+    if val_result:
+        result["val_accuracy"] = val_result["val_accuracy"]
+        result["val_n"] = val_result["val_n_pos"] + val_result["val_n_neg"]
     logger.info("Training complete: %s", result)
     return result
 

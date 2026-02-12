@@ -136,6 +136,7 @@ def _assign_identity(
 _REFINE_THRESHOLD = float(os.getenv("INTERVIEW_REFINE_THRESHOLD", "0.3"))
 _ENABLE_REFINEMENT = os.getenv("INTERVIEW_ENABLE_REFINEMENT", "true").lower() == "true"
 _SEED_CHUNK_SIZE = int(os.getenv("INTERVIEW_SEED_CHUNK_SIZE", "100"))
+_SEED_DETECT_BATCH = int(os.getenv("INTERVIEW_SEED_DETECT_BATCH", "8"))
 
 
 def _get_sam3_image_model():
@@ -198,7 +199,7 @@ def _refine_candidates_sam3(
                 return_tensors="pt",
             ).to(DEVICE)
 
-            with torch.inference_mode():
+            with torch.inference_mode(), torch.autocast(device_type=DEVICE, dtype=DTYPE):
                 outputs = model(**inputs)
 
             target_sizes = inputs.get("original_sizes")
@@ -357,11 +358,13 @@ def generate_seeds(
     """
     from .detection import (
         Sam3TextBasedDetector, nms_numpy, pad_boxes,
-        _decode_frames_sequential,
+        _decode_frames_sequential, _detect_batch,
+        precompute_text_tokens,
     )
     from .dinov3_classifier import (
         CropClassifier, compute_crop_metadata, compute_mask_quality,
     )
+    from seeding_common import _get_video_info_pyav
 
     import torch
 
@@ -405,14 +408,36 @@ def generate_seeds(
     threshold = session.seed_config.confidence_threshold
     seeds: List[Dict[str, Any]] = []
 
+    # Get video dimensions for _detect_batch
+    vid_width, vid_height, _, _ = _get_video_info_pyav(session.video_path)
+
+    # Pre-compute text tokens for each prompt (avoids re-tokenization per batch)
+    precomputed_tokens: Dict[str, Any] = {}
+    for p in prompts:
+        tokens = precompute_text_tokens(detector, p)
+        if tokens is not None:
+            precomputed_tokens[p] = tokens
+    if precomputed_tokens:
+        logger.info("Pre-computed text tokens for %d prompts", len(precomputed_tokens))
+
     logger.info(
         "Seed generation: scanning %d frames (interval=%d, threshold=%.2f, "
-        "prompts=%s, refinement=%s)",
+        "prompts=%s, refinement=%s, batch_size=%d)",
         total_frames, interval, threshold,
-        prompts, _ENABLE_REFINEMENT,
+        prompts, _ENABLE_REFINEMENT, _SEED_DETECT_BATCH,
     )
 
-    # ---- Process in chunks ----
+    # Check if disk frame cache is available for fast reads
+    _disk_cache_available = False
+    try:
+        from .disk_frame_cache import frame_cache_exists, read_cached_frame as _read_disk_frame
+        if frame_cache_exists(session.cache_key):
+            _disk_cache_available = True
+            logger.info("Seeding: disk frame cache available — using cached frames")
+    except ImportError:
+        pass
+
+    # ---- Process in chunks (batched detection) ----
     for chunk_start in range(0, total_frames, _SEED_CHUNK_SIZE):
         chunk_indices = all_targets[chunk_start:chunk_start + _SEED_CHUNK_SIZE]
         progress.step = (
@@ -420,33 +445,66 @@ def generate_seeds(
             f"-{chunk_start + len(chunk_indices)} / {total_frames}..."
         )
 
-        frames = _decode_frames_sequential(session.video_path, chunk_indices)
+        # Try disk frame cache first, fall back to video decode
+        if _disk_cache_available:
+            frames = {}
+            missing = []
+            for fidx in chunk_indices:
+                img = _read_disk_frame(session.cache_key, fidx)
+                if img is not None:
+                    frames[fidx] = img
+                else:
+                    missing.append(fidx)
+            if missing:
+                frames.update(_decode_frames_sequential(session.video_path, missing))
+        else:
+            frames = _decode_frames_sequential(session.video_path, chunk_indices)
+
+        # --- Batched detection: run all prompts via _detect_batch ---
+        # Collect detections grouped by frame_idx across all prompts
+        from collections import defaultdict
+        frame_detections: Dict[int, List[Tuple[np.ndarray, float]]] = defaultdict(list)
+
+        for prompt_text in prompts:
+            progress.step = (
+                f"Detecting '{prompt_text}' on frames "
+                f"{chunk_start + 1}-{chunk_start + len(chunk_indices)}..."
+            )
+            crops = _detect_batch(
+                detector, frames, prompt_text,
+                vid_width, vid_height,
+                batch_size=_SEED_DETECT_BATCH,
+                nms_iou=0.5,
+                pad_frac=0.1,
+                precomputed_text=precomputed_tokens.get(prompt_text),
+            )
+            for crop in crops:
+                frame_detections[crop.frame_idx].append(
+                    (crop.xyxy, crop.score)
+                )
+
+        progress.current = chunk_start + len(chunk_indices)
+
+        # --- Per-frame: cross-prompt NMS + features + MLP gate ---
         medium_candidates: List[Tuple[int, np.ndarray, float]] = []
 
-        for fi, frame_idx in enumerate(chunk_indices):
-            progress.current = chunk_start + fi + 1
+        for frame_idx in chunk_indices:
+            dets = frame_detections.get(frame_idx)
+            if not dets:
+                continue
+
             pil_frame = frames.get(frame_idx)
             if pil_frame is None:
                 continue
 
-            # Run ALL prompts for maximum recall (set_frame caches encoding)
-            all_detections = []
-            detector.set_frame(pil_frame)
-            for prompt_text in prompts:
-                dets = detector.detect(prompt_text)
-                all_detections.extend(dets)
+            boxes = np.array([d[0] for d in dets], dtype=np.float32)
+            det_scores = np.array([d[1] for d in dets], dtype=np.float32)
 
-            if not all_detections:
-                continue
-
-            boxes = np.array([d["xyxy"] for d in all_detections], dtype=np.float32)
-            det_scores = np.array([d["score"] for d in all_detections], dtype=np.float32)
-            masks = [d.get("mask") for d in all_detections]
-            boxes = pad_boxes(boxes, pil_frame.width, pil_frame.height)
-            keep = nms_numpy(boxes, det_scores, iou_threshold=0.5)
-            boxes = boxes[keep]
-            det_scores = det_scores[keep]
-            masks = [masks[k] for k in keep]
+            # Cross-prompt NMS (boxes are already padded by _detect_batch)
+            if len(prompts) > 1:
+                keep = nms_numpy(boxes, det_scores, iou_threshold=0.5)
+                boxes = boxes[keep]
+                det_scores = det_scores[keep]
 
             if len(boxes) == 0:
                 continue
@@ -467,7 +525,6 @@ def generate_seeds(
 
             boxes = boxes[valid_indices]
             det_scores = det_scores[valid_indices]
-            masks = [masks[vi] for vi in valid_indices]
 
             crop_features = extract_features(crop_images)
             metadata = np.array([
@@ -475,17 +532,11 @@ def generate_seeds(
                 for b in boxes
             ], dtype=np.float32)
 
-            # Compute mask quality features (4-dim per candidate)
-            mask_qualities = []
-            for idx, box in enumerate(boxes):
-                m = masks[idx]
-                if m is not None:
-                    mq = compute_mask_quality(m, box, pil_frame.width, pil_frame.height)
-                    mq[1] = float(det_scores[idx])  # fill in detection score
-                else:
-                    mq = np.array([0.0, float(det_scores[idx]), 0.0, 0.0], dtype=np.float32)
-                mask_qualities.append(mq)
-            mask_quality_arr = np.array(mask_qualities, dtype=np.float32)
+            # Mask quality: not available from _detect_batch (no masks returned)
+            mask_quality_arr = np.array([
+                [0.0, float(det_scores[idx]), 0.0, 0.0]
+                for idx in range(len(boxes))
+            ], dtype=np.float32)
 
             # Build 1032-dim input: [DINOv3(1024) + spatial(4) + mask_quality(4)]
             mlp_input = np.concatenate(
@@ -530,6 +581,13 @@ def generate_seeds(
                 )
                 if seed is not None:
                     seeds.append(seed)
+
+        # Free chunk memory before next iteration
+        del frames, frame_detections
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     # ---- Finalise ----
     with session._lock:

@@ -814,6 +814,119 @@ body {
   background: var(--text-muted);
 }
 
+/* -- ReID Cluster Gallery ------------------------------------------------- */
+.reid-cluster-gallery {
+  margin-bottom: 20px;
+  max-height: 55vh;
+  overflow-y: auto;
+}
+
+.reid-cluster-section {
+  margin-bottom: 16px;
+}
+
+.reid-cluster-header {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin-bottom: 8px;
+}
+
+.reid-cluster-row {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding: 8px 0;
+  scrollbar-width: thin;
+}
+
+.reid-cluster-row .reid-thumb-wrap {
+  position: relative;
+  flex-shrink: 0;
+}
+
+.reid-thumb-wrap img {
+  width: 80px;
+  height: 80px;
+  object-fit: cover;
+  border-radius: var(--radius-sm);
+  border: 2px solid var(--border-default);
+  cursor: pointer;
+  transition: border-color var(--transition-fast);
+  display: block;
+}
+
+.reid-thumb-wrap img:hover {
+  border-color: var(--highlight);
+}
+
+.reid-thumb-wrap img.flagged {
+  border-color: var(--color-rejected);
+  opacity: 0.7;
+}
+
+.reid-thumb-flag {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: rgba(231, 76, 60, 0.85);
+  color: #fff;
+  font-size: 10px;
+  line-height: 18px;
+  text-align: center;
+  cursor: pointer;
+  border: none;
+  padding: 0;
+  opacity: 0;
+  transition: opacity var(--transition-fast);
+}
+
+.reid-thumb-wrap:hover .reid-thumb-flag {
+  opacity: 1;
+}
+
+.reid-overflow-badge {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 60px;
+  height: 80px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-accent);
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.reid-recluster-panel {
+  padding: 16px;
+  background: var(--bg-accent);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  margin-top: 12px;
+  display: flex;
+  gap: 12px;
+  align-items: flex-end;
+  flex-wrap: wrap;
+}
+
+.reid-recluster-panel .form-group {
+  margin-bottom: 0;
+}
+
+/* -- Accuracy Trend Widget ------------------------------------------------ */
+.accuracy-trend { display: flex; align-items: flex-end; gap: 2px; height: 28px; padding: 2px 0; }
+.accuracy-trend-bar { width: 12px; min-height: 3px; border-radius: 2px; transition: height var(--transition-fast); cursor: default; }
+.accuracy-trend-bar.low { background: var(--color-rejected); }
+.accuracy-trend-bar.mid { background: var(--color-pending, #f59e0b); }
+.accuracy-trend-bar.high { background: var(--color-accepted); }
+.accuracy-trend-label { font-size: 0.7rem; color: var(--text-muted); white-space: nowrap; }
+.accuracy-trend-value { font-size: 0.75rem; font-weight: 600; color: var(--text-primary); white-space: nowrap; }
+
 /* -- Utility -------------------------------------------------------------- */
 .hidden { display: none !important; }
 

@@ -62,6 +62,7 @@ class CropData:
     features: Optional[np.ndarray] = None  # DINOv3 CLS token (1024,)
     metadata: Optional[np.ndarray] = None  # [norm_cx, norm_cy, scale, aspect] (4,)
     mask_quality: Optional[np.ndarray] = None  # [fill_ratio, det_score, edge_contact, compactness] (4,)
+    histogram: Optional[np.ndarray] = None  # HSV color histogram for ReID
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize for JSON (excludes numpy arrays)."""
@@ -155,6 +156,10 @@ class InterviewSession:
     round_history: List[Dict[str, Any]] = field(default_factory=list)
     round_frames: Dict[int, List[int]] = field(default_factory=dict)
 
+    # Held-out validation (selected in Round 1, never used for training)
+    validation_frames: List[int] = field(default_factory=list)
+    validation_history: List[Dict[str, Any]] = field(default_factory=list)
+
     # Classification
     model_trained: bool = False
     training_epochs: int = 0
@@ -164,6 +169,7 @@ class InterviewSession:
     reid_pairs: Dict[str, ReIDPair] = field(default_factory=dict)
     reid_clusters: Dict[int, List[str]] = field(default_factory=dict)  # cluster_id -> [crop_ids]
     n_identities: int = 0
+    reid_round: int = 0  # current ReID pair resolution round
 
     # Seeding
     seed_config: SeedConfig = field(default_factory=SeedConfig)
@@ -206,6 +212,11 @@ class InterviewSession:
         pending = [c for c in self.crops.values() if c.label == CropLabel.PENDING]
         return sorted(pending, key=lambda c: -c.uncertainty)
 
+    def get_validation_crop_ids(self) -> List[str]:
+        """Return crop IDs on validation frames (for held-out evaluation)."""
+        val_set = set(self.validation_frames)
+        return [c.crop_id for c in self.crops.values() if c.frame_idx in val_set]
+
     # -- Phase transitions --
 
     def advance_to(self, phase: Phase) -> None:
@@ -237,6 +248,7 @@ class InterviewSession:
             "prompts": self.prompts,
             "current_round": self.current_round,
             "rounds_completed": len(self.round_history),
+            "validation_history": self.validation_history,
         }
 
 
@@ -268,7 +280,13 @@ def create_session(project_id: int, task_id: int, annotation_id: Optional[int] =
 def get_session(session_id: str) -> Optional[InterviewSession]:
     """Retrieve a session by ID."""
     with _registry_lock:
-        return _sessions.get(session_id)
+        session = _sessions.get(session_id)
+        if session is None and session_id:
+            logger.warning(
+                "get_session(%r) → None. Registry has %d sessions: %s",
+                session_id, len(_sessions), list(_sessions.keys()),
+            )
+        return session
 
 
 def list_sessions() -> List[Dict[str, Any]]:

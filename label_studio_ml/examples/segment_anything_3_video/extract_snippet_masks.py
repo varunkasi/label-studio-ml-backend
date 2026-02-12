@@ -1,13 +1,19 @@
-"""Extract per-frame instance segmentation masks from snippet videos using SAM3.
+"""Extract per-frame segmentation masks from snippet videos using SAM3 Tracker.
+
+Uses Sam3TrackerModel (Promptable Visual Segmentation) which treats bounding
+boxes as spatial constraints, segmenting the specific object within the box.
+Unlike Sam3Model (Promptable Concept Segmentation) which uses boxes as exemplars
+to search the entire image, Sam3TrackerModel segments strictly at the prompted
+location — ideal for per-frame mask extraction from annotated bounding boxes.
 
 End-to-end pipeline:
-  1. SAM3 inference — per-frame mask extraction using Sam3Model with text+box prompts
+  1. SAM3 inference — per-frame mask extraction using Sam3TrackerModel with box prompts
   2. ffmpeg encoding — mask-only and overlay videos (same encoding as overlay_snippet_bboxes.sh)
   3. Permission fix — chown outputs to host user when running inside Docker
 
 Usage (single snippet):
-  python extract_snippet_masks.py \
-    --snippet snippets_proj.../casualty_2_f25425-25601_fps25.mp4 \
+  python extract_snippet_masks.py \\
+    --snippet snippets_proj.../casualty_2_f25425-25601_fps25.mp4 \\
     --bbox-json snippets_proj.../casualty_2_f25425-25601_fps25.json
 
 Usage (batch — all pairs in a folder):
@@ -20,6 +26,7 @@ import argparse
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -75,6 +82,37 @@ def build_frame_bbox_map(
     return frame_map
 
 
+def percent_xywh_to_pixel_xywh(
+    x_pct: float, y_pct: float, w_pct: float, h_pct: float,
+    img_w: int, img_h: int,
+) -> Tuple[int, int, int, int]:
+    """Convert percent [0,100] xywh bbox to pixel xywh for ffmpeg drawbox.
+
+    Uses int() truncation (floor for positive values) to match the shell
+    script's jq floor().
+    """
+    x = max(0, min(img_w, int(x_pct * img_w / 100.0)))
+    y = max(0, min(img_h, int(y_pct * img_h / 100.0)))
+    w = max(1, min(img_w, int(w_pct * img_w / 100.0)))
+    h = max(1, min(img_h, int(h_pct * img_h / 100.0)))
+    return x, y, w, h
+
+
+# ---------------------------------------------------------------------------
+# SAM3 Tracker model loading
+# ---------------------------------------------------------------------------
+
+def _load_tracker_model(model_name: str = "facebook/sam3"):
+    """Load Sam3TrackerModel + Sam3TrackerProcessor from HuggingFace."""
+    from transformers import Sam3TrackerModel, Sam3TrackerProcessor
+    model = Sam3TrackerModel.from_pretrained(model_name)
+    processor = Sam3TrackerProcessor.from_pretrained(model_name)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = model.to(device)
+    logger.info("Sam3TrackerModel loaded on %s", device)
+    return model, processor
+
+
 # ---------------------------------------------------------------------------
 # SAM3 mask extraction
 # ---------------------------------------------------------------------------
@@ -85,52 +123,53 @@ def extract_mask_for_frame(
     *,
     model,
     processor,
-    text_prompt: str = "person",
-    threshold: float = 0.5,
-    mask_threshold: float = 0.5,
     device: str = "cpu",
     dtype=None,
 ) -> Tuple[np.ndarray, float]:
-    """Run Sam3Model on a single frame and return (mask_uint8, score)."""
+    """Run Sam3TrackerModel on a single frame with box prompt, return (mask_uint8, iou_score).
+
+    Sam3TrackerModel treats the box as a spatial constraint — it segments
+    the object *within* the box, not searching elsewhere in the image.
+    """
     w, h = frame.size
     blank = np.zeros((h, w), dtype=np.uint8)
 
     try:
+        # Sam3TrackerProcessor: input_boxes is 3D [[box_xyxy]]
+        # Nesting: [batch=1 × [objects=1 × [x1,y1,x2,y2]]]
         inputs = processor(
             images=frame,
-            text=text_prompt,
             input_boxes=[[box_xyxy]],
-            input_boxes_labels=[[1]],
             return_tensors="pt",
         ).to(device)
 
         with torch.inference_mode():
             if dtype is not None and device != "cpu":
                 with torch.autocast(device_type=device, dtype=dtype):
-                    outputs = model(**inputs)
+                    outputs = model(**inputs, multimask_output=False)
             else:
-                outputs = model(**inputs)
+                outputs = model(**inputs, multimask_output=False)
 
-        original_sizes = inputs.get("original_sizes")
-        if hasattr(original_sizes, "tolist"):
-            original_sizes = original_sizes.tolist()
-        results = processor.post_process_instance_segmentation(
-            outputs, threshold=threshold, mask_threshold=mask_threshold,
-            target_sizes=original_sizes,
-        )[0]
+        # outputs.pred_masks: (batch, objects, num_masks, H, W)
+        # outputs.iou_scores: (batch, objects, num_masks)
+        original_sizes = inputs["original_sizes"]
+        masks = processor.post_process_masks(
+            outputs.pred_masks.cpu(), original_sizes,
+        )[0]  # first batch item: (objects, num_masks, orig_H, orig_W)
 
-        masks = results.get("masks", [])
-        scores = results.get("scores", [])
-        if len(masks) == 0:
-            return blank, 0.0
+        iou_scores = outputs.iou_scores[0]  # (objects, num_masks)
 
-        score_vals = [
-            s.item() if hasattr(s, "item") else float(s) for s in scores
-        ] if len(scores) > 0 else [0.5]
-        best_idx = int(np.argmax(score_vals))
-        best_score = score_vals[best_idx]
+        # With multimask_output=False: (objects=1, num_masks=1, H, W)
+        # With multimask_output=True:  (objects=1, num_masks=3, H, W)
+        num_masks = masks.shape[1]
+        if num_masks > 1:
+            best_idx = int(iou_scores[0].argmax())
+        else:
+            best_idx = 0
 
-        best_mask = masks[best_idx]
+        best_score = float(iou_scores[0, best_idx].item())
+        best_mask = masks[0, best_idx]  # (H, W) — boolean after post_process_masks
+
         # bfloat16 safety: always .float() before .numpy()
         if hasattr(best_mask, "cpu"):
             best_mask = best_mask.cpu().float().numpy()
@@ -158,20 +197,16 @@ def process_snippet(
     *,
     model=None,
     processor=None,
-    text_prompt: str = "person",
-    threshold: float = 0.5,
-    mask_threshold: float = 0.5,
     device: str = "cpu",
     dtype=None,
 ) -> Dict[str, Any]:
-    """Extract SAM3 masks for every frame and save as PNGs + scores.json."""
+    """Extract Sam3Tracker masks for every frame and save as PNGs + scores.json."""
     import av
 
     if model is None or processor is None:
-        import seeding_common as base
-        model, processor = base._get_sam3_image_model()
-        device = base.DEVICE
-        dtype = base.DTYPE
+        model, processor = _load_tracker_model()
+        device = next(model.parameters()).device.type
+        dtype = torch.bfloat16
 
     entries = load_bbox_json(bbox_json_path)
 
@@ -206,8 +241,7 @@ def process_snippet(
                 mask, score = extract_mask_for_frame(
                     av_frame.to_image(), frame_map[frame_idx],
                     model=model, processor=processor,
-                    text_prompt=text_prompt, threshold=threshold,
-                    mask_threshold=mask_threshold, device=device, dtype=dtype,
+                    device=device, dtype=dtype,
                 )
                 frames_processed += 1
                 scores_map[str(snippet_frame)] = round(float(score), 4)
@@ -322,6 +356,149 @@ def encode_overlay_video(
 
 
 # ---------------------------------------------------------------------------
+# Bounding box overlay video (replaces overlay_snippet_bboxes.sh)
+# ---------------------------------------------------------------------------
+
+def build_drawbox_filter(
+    entries: List[Dict[str, Any]], img_w: int, img_h: int,
+    frame_offset: int = 0,
+) -> str:
+    """Build ffmpeg drawbox filter string from bbox entries.
+
+    Each entry becomes a drawbox with ``enable=eq(n\\,FRAME)`` so the box
+    only appears on its target frame.  Entries are comma-joined.
+
+    The ``\\,`` inside the enable expression is an ffmpeg filter escape —
+    without it, ffmpeg treats the comma as a filter chain separator.
+    """
+    parts = []
+    for entry in entries:
+        x, y, w, h = percent_xywh_to_pixel_xywh(
+            float(entry["x"]), float(entry["y"]),
+            float(entry["width"]), float(entry["height"]),
+            img_w, img_h,
+        )
+        n = int(entry["snippet_frame"]) - 1 - frame_offset
+        parts.append(
+            f"drawbox=x={x}:y={y}:w={w}:h={h}"
+            f":color=red@0.6:t=2:enable=eq(n\\,{n})"
+        )
+    return ",".join(parts)
+
+
+def _get_video_fps_float(video_path: str) -> float:
+    """Get video FPS as float via ffprobe avg_frame_rate."""
+    r = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=avg_frame_rate", "-of", "csv=p=0", video_path],
+        capture_output=True, text=True,
+    )
+    raw = r.stdout.strip()
+    if "/" in raw:
+        num, den = raw.split("/")
+        return float(num) / float(den)
+    return float(raw)
+
+
+def encode_bbox_video(
+    source_video: str, bbox_json_path: str, output_path: str,
+    chunk_size: int = 1000,
+) -> None:
+    """Overlay bounding boxes onto video using ffmpeg drawbox filters.
+
+    Delegates to single-pass (<=chunk_size entries) or chunked encoding.
+    """
+    entries = load_bbox_json(bbox_json_path)
+    img_w, img_h = _get_video_dims(source_video)
+
+    if len(entries) <= chunk_size:
+        _encode_bbox_single_pass(source_video, entries, img_w, img_h, output_path)
+    else:
+        _encode_bbox_chunked(
+            source_video, entries, img_w, img_h, output_path, chunk_size,
+        )
+    logger.info("Wrote bbox overlay video: %s", output_path)
+
+
+def _encode_bbox_single_pass(
+    source_video: str, entries: List[Dict[str, Any]],
+    img_w: int, img_h: int, output_path: str,
+) -> None:
+    """Single-pass bbox overlay for <=chunk_size frames."""
+    filter_text = build_drawbox_filter(entries, img_w, img_h)
+    fd, filter_path = tempfile.mkstemp(suffix=".txt", prefix="drawbox_filter_")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(filter_text)
+        _run_ffmpeg([
+            "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+            "-i", source_video,
+            "-filter_complex_script", filter_path,
+            "-c:v", "libx264", "-crf", "18", "-preset", "veryfast",
+            "-c:a", "copy",
+            output_path,
+        ])
+    finally:
+        os.unlink(filter_path)
+
+
+def _encode_bbox_chunked(
+    source_video: str, entries: List[Dict[str, Any]],
+    img_w: int, img_h: int, output_path: str,
+    chunk_size: int,
+) -> None:
+    """Chunked bbox overlay for long videos (>chunk_size frames)."""
+    fps = _get_video_fps_float(source_video)
+    tmp_dir = tempfile.mkdtemp(prefix="bbox_chunks_")
+    try:
+        segment_files = []
+        start_idx = 0
+        chunk_index = 0
+        while start_idx < len(entries):
+            end_idx = min(start_idx + chunk_size, len(entries))
+            chunk_entries = entries[start_idx:end_idx]
+
+            filter_text = build_drawbox_filter(
+                chunk_entries, img_w, img_h, frame_offset=start_idx,
+            )
+            filter_path = os.path.join(tmp_dir, f"drawbox_{chunk_index}.txt")
+            with open(filter_path, "w") as f:
+                f.write(filter_text)
+
+            chunk_start_time = f"{start_idx / fps:.10f}"
+            chunk_end_time = f"{end_idx / fps:.10f}"
+            segment_file = os.path.join(tmp_dir, f"segment_{chunk_index}.mp4")
+
+            _run_ffmpeg([
+                "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                "-ss", chunk_start_time, "-to", chunk_end_time,
+                "-i", source_video,
+                "-filter_complex_script", filter_path,
+                "-c:v", "libx264", "-crf", "18", "-preset", "veryfast",
+                "-c:a", "copy",
+                segment_file,
+            ])
+            segment_files.append(segment_file)
+            start_idx = end_idx
+            chunk_index += 1
+
+        # Concatenate segments
+        list_path = os.path.join(tmp_dir, "segments.txt")
+        with open(list_path, "w") as f:
+            for sf in segment_files:
+                f.write(f"file '{os.path.abspath(sf)}'\n")
+
+        _run_ffmpeg([
+            "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "concat", "-safe", "0", "-i", list_path,
+            "-c", "copy",
+            output_path,
+        ])
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
 # Permission fix
 # ---------------------------------------------------------------------------
 
@@ -338,7 +515,7 @@ def fix_ownership(path: str, uid: int = 1000, gid: int = 1000) -> None:
     base = os.path.basename(path)
     if base.endswith("_masks"):
         stem = base[:-6]  # strip _masks suffix
-        for suffix in ("_masks.mp4", "_overlaid_masks.mp4"):
+        for suffix in ("_masks.mp4", "_overlaid_masks.mp4", "_bbox_overlaid.mp4"):
             fp = os.path.join(parent, stem + suffix)
             if os.path.isfile(fp):
                 os.chown(fp, uid, gid)
@@ -355,7 +532,7 @@ def _find_pairs(directory: str) -> List[Tuple[str, str]]:
     for mp4 in sorted(glob.glob(os.path.join(directory, "*_fps*.mp4"))):
         if any(tag in mp4 for tag in ("_bbox_overlaid", "_masks", "_overlaid_masks")):
             continue
-        json_path = os.path.splitext(mp4)[0] + ".json"
+        json_path = os.path.splitext(mp4)[0] + "_frame_bbox.json"
         if os.path.isfile(json_path):
             pairs.append((mp4, json_path))
     return pairs
@@ -376,10 +553,12 @@ def _parse_args() -> argparse.Namespace:
         help="Path to a snippet folder — processes all MP4+JSON pairs.",
     )
     parser.add_argument("--bbox-json", help="Per-frame bbox JSON (required with --snippet).")
-    parser.add_argument("--text-prompt", default="person")
-    parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--no-mask-video", action="store_true")
     parser.add_argument("--no-overlay-video", action="store_true")
+    parser.add_argument("--no-bbox-video", action="store_true",
+                        help="Skip bounding box overlay video generation.")
+    parser.add_argument("--chunk-size", type=int, default=1000,
+                        help="Max frames per chunk for bbox overlay encoding (default: 1000).")
     parser.add_argument("--host-uid", type=int, default=1000, help="Host UID for chown.")
     parser.add_argument("--host-gid", type=int, default=1000, help="Host GID for chown.")
     parser.add_argument(
@@ -400,11 +579,10 @@ def process_one(
     logger.info("  BBox JSON: %s", bbox_json)
     logger.info("  Mask dir:  %s", mask_dir)
 
-    # Step 1: SAM3 mask extraction
+    # Step 1: SAM3 Tracker mask extraction
     stats = process_snippet(
         video_path=snippet, bbox_json_path=bbox_json, output_dir=mask_dir,
         model=model, processor=processor,
-        text_prompt=args.text_prompt, threshold=args.threshold,
         device=device, dtype=dtype,
     )
 
@@ -419,6 +597,12 @@ def process_one(
         encode_overlay_video(
             snippet, mask_dir, f"{snippet_base}_overlaid_masks.mp4",
             fps, width, height,
+        )
+
+    if not args.no_bbox_video:
+        encode_bbox_video(
+            snippet, bbox_json, f"{snippet_base}_bbox_overlaid.mp4",
+            chunk_size=args.chunk_size,
         )
 
     # Step 3: fix ownership
@@ -437,12 +621,11 @@ def main() -> None:
 
     # Load model once
     import time
-    logger.info("Loading SAM3 model...")
+    logger.info("Loading Sam3TrackerModel...")
     t0 = time.time()
-    import seeding_common as base
-    model, processor = base._get_sam3_image_model()
-    device = base.DEVICE
-    dtype = base.DTYPE
+    model, processor = _load_tracker_model()
+    device = next(model.parameters()).device.type
+    dtype = torch.bfloat16
     logger.info("Model loaded in %.1fs (device=%s)", time.time() - t0, device)
 
     # Build list of (snippet, bbox_json) pairs

@@ -159,17 +159,31 @@ def spherical_kmeans(features: np.ndarray, k: int, max_iter: int = 50) -> np.nda
 # 3. Silhouette-based K estimation
 # ---------------------------------------------------------------------------
 
-def estimate_k(features: np.ndarray, k_range: Tuple[int, int] = (2, 10)) -> int:
-    """Estimate optimal number of clusters using silhouette score heuristic.
+REID_OVERCLUSTER_BIAS = float(os.getenv("REID_OVERCLUSTER_BIAS", "0.15"))
+
+
+def estimate_k(
+    features: np.ndarray,
+    k_range: Tuple[int, int] = (2, 10),
+    overcluster_bias: float = REID_OVERCLUSTER_BIAS,
+) -> int:
+    """Estimate optimal number of clusters using silhouette score with overclustering bias.
 
     Runs spherical K-Means for each candidate K in the given range and
-    picks the K with the highest average silhouette score. The silhouette
-    score for a point measures how similar it is to its own cluster vs.
-    the nearest neighboring cluster, using cosine distance.
+    picks the K with the highest *biased* silhouette score. The bias term
+    gives higher K values a linear bonus so that the estimator prefers
+    overclustering (more clusters) over underclustering. Humans can merge
+    clusters down, but without a split mechanism underclustering is much
+    harder to fix.
+
+    The biased score is:
+        biased = avg_silhouette + overcluster_bias * (k - min_k) / (max_k - min_k)
 
     Args:
         features: (N, D) feature matrix.
         k_range: (min_k, max_k) inclusive range of K values to try.
+        overcluster_bias: Linear bonus for higher K values (default from
+            REID_OVERCLUSTER_BIAS env var, typically 0.15).
 
     Returns:
         Optimal K value. Returns 1 if the dataset is too small for
@@ -194,6 +208,7 @@ def estimate_k(features: np.ndarray, k_range: Tuple[int, int] = (2, 10)) -> int:
 
     best_k = min_k
     best_score = -1.0
+    k_span = max(max_k - min_k, 1)
 
     for k in range(min_k, max_k + 1):
         assignments = spherical_kmeans(features, k)
@@ -234,13 +249,20 @@ def estimate_k(features: np.ndarray, k_range: Tuple[int, int] = (2, 10)) -> int:
                 silhouette_sum += (b_i - a_i) / denom
 
         avg_silhouette = silhouette_sum / n
-        logger.debug("K=%d silhouette=%.4f", k, avg_silhouette)
 
-        if avg_silhouette > best_score:
-            best_score = avg_silhouette
+        # Apply overclustering bias: higher K gets a linear bonus
+        biased_score = avg_silhouette + overcluster_bias * (k - min_k) / k_span
+        logger.debug(
+            "K=%d silhouette=%.4f biased=%.4f (bias=%.4f)",
+            k, avg_silhouette, biased_score,
+            overcluster_bias * (k - min_k) / k_span,
+        )
+
+        if biased_score > best_score:
+            best_score = biased_score
             best_k = k
 
-    logger.info("Estimated optimal K=%d (silhouette=%.4f)", best_k, best_score)
+    logger.info("Estimated optimal K=%d (biased_score=%.4f)", best_k, best_score)
     return best_k
 
 
@@ -312,6 +334,7 @@ def extract_crop_histograms(
 
             hist = _compute_hist(crop_rgb, bins)
             histograms[crop.crop_id] = hist
+            crop.histogram = hist
 
         progress.current = frame_count
 
@@ -320,6 +343,56 @@ def extract_crop_histograms(
         len(histograms), len(accepted_crops),
     )
     return histograms
+
+
+def _rebuild_sim_matrix(
+    session: InterviewSession,
+) -> Tuple[np.ndarray, List[str]]:
+    """Rebuild fused similarity matrix from persisted crop features + histograms.
+
+    Used by generate_next_round_pairs() to pick informative pairs without
+    re-reading video frames. Crops missing features are skipped; crops
+    missing histograms use a zero histogram (DINOv3-only similarity).
+
+    Returns:
+        (sim_matrix, crop_ids) where sim_matrix is (N, N) float32 and
+        crop_ids[i] is the crop ID for row/column i.
+    """
+    accepted = session.get_crops_by_label(CropLabel.ACCEPTED)
+    featured = [c for c in accepted if c.features is not None]
+    if len(featured) < 2:
+        crop_ids = [c.crop_id for c in featured]
+        n = len(crop_ids)
+        return np.eye(n, dtype=np.float32), crop_ids
+
+    crop_ids = [c.crop_id for c in featured]
+    n = len(crop_ids)
+
+    feature_matrix = np.stack([c.features for c in featured])
+
+    # Find a reference histogram shape from any crop that has one
+    ref_hist = None
+    for c in featured:
+        if c.histogram is not None:
+            ref_hist = c.histogram
+            break
+    default_hist = np.zeros_like(ref_hist) if ref_hist is not None else np.zeros(512, dtype=np.float32)
+
+    hist_list = [c.histogram if c.histogram is not None else default_hist for c in featured]
+    hist_matrix = np.stack(hist_list)
+
+    sim_matrix = np.zeros((n, n), dtype=np.float32)
+    for i in range(n):
+        sim_matrix[i, i] = 1.0
+        for j in range(i + 1, n):
+            sim = compute_fused_similarity(
+                feature_matrix[i], feature_matrix[j],
+                hist_matrix[i], hist_matrix[j],
+            )
+            sim_matrix[i, j] = sim
+            sim_matrix[j, i] = sim
+
+    return sim_matrix, crop_ids
 
 
 # ---------------------------------------------------------------------------
@@ -332,116 +405,369 @@ def sample_pairs(
     similarity_matrix: np.ndarray,
     crop_ids: List[str],
     max_pairs: int = 30,
+    round_num: int = 1,
 ) -> List[ReIDPair]:
-    """Sample calibrated pairs from three pools for human verification.
+    """Sample pairs with coverage-first allocation across cluster-pair relationships.
 
-    Pools:
-        - Ambiguous (~60%): pairs from different clusters with borderline
-          similarity (0.3 -- 0.7). These are the most informative for
-          resolving cluster boundaries.
-        - Confident same (~20%): high-similarity pairs within the same
-          cluster (> 0.8). Serve as positive calibration anchors.
-        - Confident different (~20%): low-similarity pairs from different
-          clusters (< 0.3). Serve as negative calibration anchors.
+    Priority order for cross-cluster pairs:
+        1. Merge candidates (sim > 0.7): most likely same-person across clusters.
+        2. Ambiguous (0.3 <= sim <= 0.7): borderline cases needing human judgment.
+        3. Separation confirmation (sim < 0.3): confirm they're different.
 
-    Pairs are interleaved (shuffled) so the human reviewer does not see
-    blocks of one type, which could bias their responses.
+    Algorithm:
+        - First pass: 1 best pair per cluster-pair (highest sim), all relationships.
+        - Second pass: add 2nd pair per cluster-pair (different crops) if budget allows.
+        - Round 1 only: append up to 4 calibration pairs (2 intra-same, 2 cross-diff).
+        - Truncate to max_pairs, shuffle for presentation.
 
     Args:
         session: Current interview session.
-        clusters: Mapping from cluster_id to list of crop_ids in that cluster.
-        similarity_matrix: (N, N) symmetric similarity matrix indexed by crop_ids.
-        crop_ids: Ordered list of crop IDs corresponding to matrix rows/columns.
-        max_pairs: Maximum total number of pairs to generate.
+        clusters: Mapping from cluster_id to list of crop_ids.
+        similarity_matrix: (N, N) symmetric similarity matrix.
+        crop_ids: Ordered list mapping matrix indices to crop IDs.
+        max_pairs: Maximum pairs per round.
+        round_num: Current round (1-based). Calibration only in round 1.
 
     Returns:
-        List of ReIDPair objects, interleaved across pools.
+        List of ReIDPair objects, shuffled for unbiased presentation.
     """
     id_to_idx = {cid: i for i, cid in enumerate(crop_ids)}
-    id_to_cluster = {}
-    for cid_int, members in clusters.items():
-        for cid in members:
-            id_to_cluster[cid] = cid_int
-
-    ambiguous: List[ReIDPair] = []
-    confident_same: List[ReIDPair] = []
-    confident_diff: List[ReIDPair] = []
-
     cluster_ids_sorted = sorted(clusters.keys())
 
-    # Collect confident_same candidates: pairs within the same cluster
-    for cid_int in cluster_ids_sorted:
-        members = clusters[cid_int]
-        for i in range(len(members)):
-            for j in range(i + 1, len(members)):
-                a, b = members[i], members[j]
-                if a not in id_to_idx or b not in id_to_idx:
-                    continue
-                sim = float(similarity_matrix[id_to_idx[a], id_to_idx[b]])
-                if sim > 0.8:
-                    confident_same.append(ReIDPair(
-                        pair_id=str(uuid.uuid4())[:12],
-                        crop_id_a=a,
-                        crop_id_b=b,
-                        cluster_a=cid_int,
-                        cluster_b=cid_int,
-                        pool="confident_same",
-                        similarity=sim,
-                    ))
+    # -- Collect ALL cross-cluster crop pairs, grouped by cluster-pair --
+    cluster_pair_candidates: Dict[Tuple[int, int], List[Tuple[str, str, float]]] = {}
 
-    # Collect cross-cluster candidates (ambiguous and confident_different)
     for i_idx, ci in enumerate(cluster_ids_sorted):
         for j_idx in range(i_idx + 1, len(cluster_ids_sorted)):
             cj = cluster_ids_sorted[j_idx]
+            key = (ci, cj)
+            candidates = []
             for a in clusters[ci]:
+                if a not in id_to_idx:
+                    continue
                 for b in clusters[cj]:
+                    if b not in id_to_idx:
+                        continue
+                    sim = float(similarity_matrix[id_to_idx[a], id_to_idx[b]])
+                    candidates.append((a, b, sim))
+            candidates.sort(key=lambda x: -x[2])
+            cluster_pair_candidates[key] = candidates
+
+    def _pool_for_sim(sim: float) -> str:
+        if sim > 0.7:
+            return "merge_candidate"
+        elif sim >= 0.3:
+            return "ambiguous"
+        else:
+            return "confident_different"
+
+    # -- First pass: 1 best pair per cluster-pair --
+    first_pass: List[ReIDPair] = []
+    used_crop_pairs: set = set()
+
+    sorted_cluster_pairs = sorted(
+        cluster_pair_candidates.keys(),
+        key=lambda k: cluster_pair_candidates[k][0][2] if cluster_pair_candidates[k] else -1,
+        reverse=True,
+    )
+
+    for key in sorted_cluster_pairs:
+        candidates = cluster_pair_candidates[key]
+        if not candidates:
+            continue
+        a, b, sim = candidates[0]
+        ci, cj = key
+        first_pass.append(ReIDPair(
+            pair_id=str(uuid.uuid4())[:12],
+            crop_id_a=a,
+            crop_id_b=b,
+            cluster_a=ci,
+            cluster_b=cj,
+            pool=_pool_for_sim(sim),
+            similarity=sim,
+        ))
+        used_crop_pairs.add((a, b))
+
+    # -- Second pass: add 2nd pair per cluster-pair (different crops) --
+    second_pass: List[ReIDPair] = []
+    for key in sorted_cluster_pairs:
+        candidates = cluster_pair_candidates[key]
+        ci, cj = key
+        for a, b, sim in candidates:
+            if (a, b) not in used_crop_pairs:
+                second_pass.append(ReIDPair(
+                    pair_id=str(uuid.uuid4())[:12],
+                    crop_id_a=a,
+                    crop_id_b=b,
+                    cluster_a=ci,
+                    cluster_b=cj,
+                    pool=_pool_for_sim(sim),
+                    similarity=sim,
+                ))
+                used_crop_pairs.add((a, b))
+                break
+
+    # -- Calibration (round 1 only) --
+    calibration: List[ReIDPair] = []
+    if round_num == 1:
+        intra_candidates = []
+        for ci in cluster_ids_sorted:
+            members = clusters[ci]
+            for i in range(len(members)):
+                for j in range(i + 1, len(members)):
+                    a, b = members[i], members[j]
                     if a not in id_to_idx or b not in id_to_idx:
                         continue
                     sim = float(similarity_matrix[id_to_idx[a], id_to_idx[b]])
-                    pair_base = dict(
-                        crop_id_a=a,
-                        crop_id_b=b,
-                        cluster_a=ci,
-                        cluster_b=cj,
-                        similarity=sim,
-                    )
-                    if 0.3 <= sim <= 0.7:
-                        ambiguous.append(ReIDPair(
-                            pair_id=str(uuid.uuid4())[:12],
-                            pool="ambiguous",
-                            **pair_base,
-                        ))
-                    elif sim < 0.3:
-                        confident_diff.append(ReIDPair(
-                            pair_id=str(uuid.uuid4())[:12],
-                            pool="confident_different",
-                            **pair_base,
-                        ))
+                    if sim > 0.8:
+                        intra_candidates.append((a, b, sim, ci))
 
-    # Budget allocation: ~60% ambiguous, ~20% confident_same, ~20% confident_different
-    n_ambiguous = max(1, int(round(max_pairs * 0.6)))
-    n_same = max(1, int(round(max_pairs * 0.2)))
-    n_diff = max(1, int(round(max_pairs * 0.2)))
+        rng = random.Random(42)
+        rng.shuffle(intra_candidates)
+        for a, b, sim, ci in intra_candidates[:2]:
+            calibration.append(ReIDPair(
+                pair_id=str(uuid.uuid4())[:12],
+                crop_id_a=a,
+                crop_id_b=b,
+                cluster_a=ci,
+                cluster_b=ci,
+                pool="confident_same",
+                similarity=sim,
+            ))
 
-    # Shuffle each pool and take up to budget
+        diff_candidates = []
+        for key, candidates in cluster_pair_candidates.items():
+            ci, cj = key
+            for a, b, sim in candidates:
+                if sim < 0.3 and (a, b) not in used_crop_pairs:
+                    diff_candidates.append((a, b, sim, ci, cj))
+        rng.shuffle(diff_candidates)
+        for a, b, sim, ci, cj in diff_candidates[:2]:
+            calibration.append(ReIDPair(
+                pair_id=str(uuid.uuid4())[:12],
+                crop_id_a=a,
+                crop_id_b=b,
+                cluster_a=ci,
+                cluster_b=cj,
+                pool="confident_different",
+                similarity=sim,
+            ))
+
+    # -- Assemble and truncate --
+    all_pairs = first_pass + second_pass + calibration
+    if len(all_pairs) > max_pairs:
+        budget_remaining = max_pairs - len(first_pass)
+        extras = second_pass + calibration
+        rng = random.Random(42)
+        rng.shuffle(extras)
+        all_pairs = first_pass + extras[:max(0, budget_remaining)]
+
     rng = random.Random(42)
-    rng.shuffle(ambiguous)
-    rng.shuffle(confident_same)
-    rng.shuffle(confident_diff)
-
-    selected_ambiguous = ambiguous[:n_ambiguous]
-    selected_same = confident_same[:n_same]
-    selected_diff = confident_diff[:n_diff]
-
-    # Interleave: combine and shuffle so presentation is not blocked by pool
-    all_pairs = selected_ambiguous + selected_same + selected_diff
     rng.shuffle(all_pairs)
 
     logger.info(
-        "Sampled %d pairs: %d ambiguous, %d confident_same, %d confident_different",
-        len(all_pairs), len(selected_ambiguous), len(selected_same), len(selected_diff),
+        "Sampled %d pairs (round %d): %d first-pass, %d second-pass, %d calibration "
+        "(cluster-pairs: %d total)",
+        len(all_pairs), round_num, len(first_pass), len(second_pass),
+        len(calibration), len(cluster_pair_candidates),
     )
     return all_pairs
+
+
+# ---------------------------------------------------------------------------
+# 5b. Convergence check + adaptive round generation
+# ---------------------------------------------------------------------------
+
+MAX_PAIRS_PER_ROUND = int(os.getenv("REID_MAX_PAIRS_PER_ROUND", "30"))
+
+
+def compute_cluster_pair_coverage(
+    session: InterviewSession,
+) -> Dict[str, Any]:
+    """Check whether all cluster-pair relationships have sufficient evidence.
+
+    A cluster-pair is "resolved" if any of:
+      - same >= 2  (enough human confirmations to trigger a merge)
+      - different >= 1  (single veto is decisive)
+      - unsure >= 2  (humans genuinely uncertain; treat as separate)
+
+    Args:
+        session: Interview session with reid_clusters and reid_pairs populated.
+
+    Returns:
+        Dict with keys: needs_more_rounds, uncovered_count, uncovered_pairs,
+        resolved_count, total_cluster_pairs.
+    """
+    # 1. Build crop_to_cluster mapping from live session state
+    crop_to_cluster: Dict[str, int] = {}
+    for cid_int, members in session.reid_clusters.items():
+        for crop_id in members:
+            crop_to_cluster[crop_id] = cid_int
+
+    # 2. Accumulate evidence per cluster-pair from resolved pairs
+    evidence: Dict[Tuple[int, int], Dict[str, int]] = {}
+
+    for pair in session.reid_pairs.values():
+        if pair.resolution is None:
+            continue
+        ca = crop_to_cluster.get(pair.crop_id_a)
+        cb = crop_to_cluster.get(pair.crop_id_b)
+        if ca is None or cb is None:
+            continue
+        if ca == cb:
+            continue  # same-cluster pairs don't count
+        key = (min(ca, cb), max(ca, cb))
+        if key not in evidence:
+            evidence[key] = {"same": 0, "different": 0, "unsure": 0}
+
+        if pair.resolution == "same":
+            evidence[key]["same"] += 1
+        elif pair.resolution == "different":
+            evidence[key]["different"] += 1
+        else:  # "unsure"
+            evidence[key]["unsure"] += 1
+
+    # 4. Enumerate all C(k,2) cluster-pair relationships
+    cluster_ids_sorted = sorted(session.reid_clusters.keys())
+    all_pairs_set: List[Tuple[int, int]] = []
+    for i in range(len(cluster_ids_sorted)):
+        for j in range(i + 1, len(cluster_ids_sorted)):
+            all_pairs_set.append((cluster_ids_sorted[i], cluster_ids_sorted[j]))
+
+    total_cluster_pairs = len(all_pairs_set)
+
+    # 5. Check resolution status per pair
+    uncovered: List[Tuple[int, int]] = []
+    resolved_count = 0
+
+    for cp in all_pairs_set:
+        ev = evidence.get(cp)
+        if ev is None:
+            uncovered.append(cp)
+            continue
+        # Resolved if: same >= 2 OR different >= 1 OR unsure >= 2
+        if ev["same"] >= 2 or ev["different"] >= 1 or ev["unsure"] >= 2:
+            resolved_count += 1
+        else:
+            uncovered.append(cp)
+
+    needs_more = len(uncovered) > 0
+
+    return {
+        "needs_more_rounds": needs_more,
+        "uncovered_count": len(uncovered),
+        "uncovered_pairs": uncovered,
+        "resolved_count": resolved_count,
+        "total_cluster_pairs": total_cluster_pairs,
+    }
+
+
+def generate_next_round_pairs(
+    session: InterviewSession,
+    max_pairs: int = MAX_PAIRS_PER_ROUND,
+) -> Tuple[List[ReIDPair], Dict[str, Any]]:
+    """Generate targeted pairs for the next ReID round, focusing on uncovered cluster-pairs.
+
+    Steps:
+      1. Check cluster-pair coverage to find gaps.
+      2. If converged (no gaps), return empty list.
+      3. Rebuild similarity matrix from persisted features.
+      4. For each uncovered cluster-pair, pick up to 2 crop pairs (highest sim)
+         that haven't been shown before.
+      5. Increment reid_round, save, and return new pairs + coverage info.
+
+    Args:
+        session: Interview session with reid_clusters and reid_pairs populated.
+        max_pairs: Maximum number of new pairs to generate.
+
+    Returns:
+        (new_pairs, coverage) where new_pairs is a list of ReIDPair objects
+        and coverage is the dict from compute_cluster_pair_coverage.
+    """
+    # 1. Check coverage
+    coverage = compute_cluster_pair_coverage(session)
+
+    # 2. If converged, return empty
+    if not coverage["needs_more_rounds"]:
+        return ([], coverage)
+
+    # 3. Rebuild similarity matrix
+    sim_matrix, sim_crop_ids = _rebuild_sim_matrix(session)
+    id_to_idx = {cid: i for i, cid in enumerate(sim_crop_ids)}
+
+    # 4. Build set of existing crop pairs (both directions)
+    existing_crop_pairs: set = set()
+    for pair in session.reid_pairs.values():
+        existing_crop_pairs.add((pair.crop_id_a, pair.crop_id_b))
+        existing_crop_pairs.add((pair.crop_id_b, pair.crop_id_a))
+
+    # 5. Increment round
+    session.reid_round += 1
+
+    def _pool_for_sim(sim: float) -> str:
+        if sim > 0.7:
+            return "merge_candidate"
+        elif sim >= 0.3:
+            return "ambiguous"
+        else:
+            return "confident_different"
+
+    # 6. For each uncovered cluster-pair, find new crop pairs
+    new_pairs: List[ReIDPair] = []
+
+    for (ca, cb) in coverage["uncovered_pairs"]:
+        members_a = session.reid_clusters.get(ca, [])
+        members_b = session.reid_clusters.get(cb, [])
+
+        # Collect candidate crop pairs with similarity
+        candidates: List[Tuple[str, str, float]] = []
+        for a in members_a:
+            if a not in id_to_idx:
+                continue
+            for b in members_b:
+                if b not in id_to_idx:
+                    continue
+                if (a, b) in existing_crop_pairs:
+                    continue
+                sim = float(sim_matrix[id_to_idx[a], id_to_idx[b]])
+                candidates.append((a, b, sim))
+
+        # Sort by similarity descending, take up to 2
+        candidates.sort(key=lambda x: -x[2])
+        for a, b, sim in candidates[:2]:
+            pair = ReIDPair(
+                pair_id=str(uuid.uuid4())[:12],
+                crop_id_a=a,
+                crop_id_b=b,
+                cluster_a=ca,
+                cluster_b=cb,
+                pool=_pool_for_sim(sim),
+                similarity=sim,
+            )
+            new_pairs.append(pair)
+            existing_crop_pairs.add((a, b))
+            existing_crop_pairs.add((b, a))
+
+        if len(new_pairs) >= max_pairs:
+            break
+
+    # Truncate to max_pairs
+    new_pairs = new_pairs[:max_pairs]
+
+    # 8. Add new pairs to session
+    for p in new_pairs:
+        session.reid_pairs[p.pair_id] = p
+
+    # 9. Save
+    session.touch()
+    save_session(session)
+
+    logger.info(
+        "Generated %d next-round pairs (round %d): %d uncovered cluster-pairs",
+        len(new_pairs), session.reid_round, coverage["uncovered_count"],
+    )
+
+    return (new_pairs, coverage)
 
 
 # ---------------------------------------------------------------------------
@@ -452,6 +778,7 @@ def run_reid_pipeline(
     session: InterviewSession,
     n_clusters: Optional[int],
     progress: JobProgress,
+    overcluster_bias: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Full ReID pipeline for the interview workflow.
 
@@ -518,7 +845,8 @@ def run_reid_pipeline(
     # Step 4: Cluster with spherical K-Means
     progress.step = "Clustering identities"
     if n_clusters is None or n_clusters < 2:
-        k = estimate_k(feature_matrix, k_range=(2, min(10, n - 1)))
+        bias = overcluster_bias if overcluster_bias is not None else REID_OVERCLUSTER_BIAS
+        k = estimate_k(feature_matrix, k_range=(2, min(15, n - 1)), overcluster_bias=bias)
     else:
         k = min(n_clusters, n - 1)
     k = max(2, k)
@@ -538,7 +866,9 @@ def run_reid_pipeline(
 
     # Step 5: Generate calibrated pairs
     progress.step = "Generating verification pairs"
-    pairs = sample_pairs(session, clusters, sim_matrix, crop_ids, max_pairs=30)
+    session.reid_round = 1
+    pairs = sample_pairs(session, clusters, sim_matrix, crop_ids,
+                         max_pairs=MAX_PAIRS_PER_ROUND, round_num=1)
     progress.current = 5
 
     # Step 6: Update session state
@@ -565,7 +895,140 @@ def run_reid_pipeline(
 
 
 # ---------------------------------------------------------------------------
-# 7. Apply resolutions (merge/split logic)
+# 7. Outlier flagging (split mechanism)
+# ---------------------------------------------------------------------------
+
+def flag_outlier(session: InterviewSession, crop_id: str) -> Dict[str, Any]:
+    """Flag a crop as an outlier and move it to a new singleton cluster.
+
+    This is the split mechanism: when a human spots a crop that doesn't
+    belong in its current cluster, flagging it:
+      1. Removes it from its current cluster.
+      2. Creates a new singleton cluster for it.
+      3. Generates ~1 new pair per existing cluster (flagged crop vs.
+         a representative from each cluster) for human verification.
+      4. Renumbers clusters and saves.
+
+    Args:
+        session: Current interview session with reid_clusters populated.
+        crop_id: ID of the crop to flag.
+
+    Returns:
+        Dict with keys: new_cluster_id, new_pairs_count, cluster_sizes.
+
+    Raises:
+        ValueError: If crop_id not found or not in any cluster.
+    """
+    # Find the crop's current cluster
+    old_cluster_id = None
+    for cid_int, members in session.reid_clusters.items():
+        if crop_id in members:
+            old_cluster_id = cid_int
+            break
+
+    if old_cluster_id is None:
+        raise ValueError(f"Crop {crop_id} not found in any cluster")
+
+    # Remove from old cluster
+    session.reid_clusters[old_cluster_id].remove(crop_id)
+
+    # If old cluster is now empty, remove it
+    if not session.reid_clusters[old_cluster_id]:
+        del session.reid_clusters[old_cluster_id]
+
+    # Create new singleton cluster
+    existing_keys = list(session.reid_clusters.keys())
+    new_cluster_id = (max(existing_keys) + 1) if existing_keys else 0
+    session.reid_clusters[new_cluster_id] = [crop_id]
+
+    # Update crop's cluster assignment
+    crop = session.get_crop(crop_id)
+    if crop is not None:
+        crop.reid_cluster_id = new_cluster_id
+
+    # Generate new pairs: flagged crop vs. 1 representative per cluster
+    flagged_crop = session.get_crop(crop_id)
+    new_pairs: List[ReIDPair] = []
+
+    if flagged_crop is not None and flagged_crop.features is not None:
+        for cid_int, members in session.reid_clusters.items():
+            if cid_int == new_cluster_id:
+                continue  # Skip the new singleton cluster
+
+            # Pick the representative with highest cosine similarity to the flagged crop
+            best_rep = None
+            best_sim = -1.0
+            for rep_id in members:
+                rep_crop = session.get_crop(rep_id)
+                if rep_crop is None or rep_crop.features is None:
+                    continue
+                norm_a = float(np.linalg.norm(flagged_crop.features))
+                norm_b = float(np.linalg.norm(rep_crop.features))
+                if norm_a < 1e-8 or norm_b < 1e-8:
+                    cos_sim = 0.0
+                else:
+                    cos_sim = float(
+                        np.dot(flagged_crop.features, rep_crop.features) / (norm_a * norm_b)
+                    )
+                if cos_sim > best_sim:
+                    best_sim = cos_sim
+                    best_rep = rep_id
+
+            if best_rep is not None:
+                # Map cosine similarity from [-1, 1] to [0, 1]
+                mapped_sim = 0.5 * (best_sim + 1.0)
+                pair = ReIDPair(
+                    pair_id=str(uuid.uuid4())[:12],
+                    crop_id_a=crop_id,
+                    crop_id_b=best_rep,
+                    cluster_a=new_cluster_id,
+                    cluster_b=cid_int,
+                    pool="ambiguous",
+                    similarity=mapped_sim,
+                )
+                new_pairs.append(pair)
+
+    # Add new pairs to session
+    for p in new_pairs:
+        session.reid_pairs[p.pair_id] = p
+
+    # Renumber clusters from 0
+    old_clusters = dict(session.reid_clusters)
+    new_clusters: Dict[int, List[str]] = {}
+    for new_id, (_, members) in enumerate(sorted(old_clusters.items())):
+        new_clusters[new_id] = members
+        for cid in members:
+            c = session.get_crop(cid)
+            if c is not None:
+                c.reid_cluster_id = new_id
+
+    session.reid_clusters = new_clusters
+    session.n_identities = len(new_clusters)
+    session.touch()
+    save_session(session)
+
+    # Find the new cluster ID of the flagged crop after renumbering
+    flagged_new_id = None
+    for cid_int, members in new_clusters.items():
+        if crop_id in members:
+            flagged_new_id = cid_int
+            break
+
+    cluster_sizes = {cid: len(m) for cid, m in new_clusters.items()}
+    logger.info(
+        "Flagged crop %s: moved to cluster %s, generated %d new pairs",
+        crop_id, flagged_new_id, len(new_pairs),
+    )
+    return {
+        "new_cluster_id": flagged_new_id,
+        "new_pairs_count": len(new_pairs),
+        "n_identities": len(new_clusters),
+        "cluster_sizes": cluster_sizes,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 8. Apply resolutions (merge/split logic)
 # ---------------------------------------------------------------------------
 
 def apply_resolutions(
@@ -576,7 +1039,7 @@ def apply_resolutions(
 
     Merge rules:
         - Need 2+ confirming "same" (Yes) pairs between the same two clusters
-          to trigger a merge, OR 1 "same" pair if its similarity exceeds 0.85.
+          to trigger a merge.
         - A single "different" (No) pair vetoes the merge entirely for that
           cluster pair, regardless of how many "same" pairs exist.
         - "unsure" pairs are treated as abstentions; at the end, any cluster
@@ -599,6 +1062,15 @@ def apply_resolutions(
         if pair is not None:
             pair.resolution = resolution
 
+    # Build crop_id → current cluster_id mapping from live session state.
+    # This is critical: pair.cluster_a/cluster_b may be stale after prior
+    # merges renumbered clusters. Using crop IDs to look up CURRENT cluster
+    # membership ensures evidence is accumulated correctly.
+    crop_to_cluster: Dict[str, int] = {}
+    for cid_int, members in session.reid_clusters.items():
+        for crop_id in members:
+            crop_to_cluster[crop_id] = cid_int
+
     # Accumulate evidence per cluster pair
     # Use sorted tuple keys so (a, b) and (b, a) are treated identically
     evidence: Dict[Tuple[int, int], Dict[str, Any]] = {}
@@ -606,9 +1078,13 @@ def apply_resolutions(
     for pair in session.reid_pairs.values():
         if pair.resolution is None:
             continue
-        ca, cb = pair.cluster_a, pair.cluster_b
+        # Look up CURRENT cluster for each crop (not stale pair fields)
+        ca = crop_to_cluster.get(pair.crop_id_a)
+        cb = crop_to_cluster.get(pair.crop_id_b)
+        if ca is None or cb is None:
+            continue
         if ca == cb:
-            # Same-cluster pair; no merge decision needed
+            # Already in the same cluster (possibly from a prior merge); skip
             continue
         key = (min(ca, cb), max(ca, cb))
         if key not in evidence:
@@ -632,9 +1108,6 @@ def apply_resolutions(
             vetoed.append((ca, cb))
             continue
         if ev["yes_count"] >= 2:
-            merges_to_execute.append((ca, cb))
-        elif ev["yes_count"] == 1 and ev["max_sim"] > 0.85:
-            # High-confidence single pair is sufficient
             merges_to_execute.append((ca, cb))
         # Otherwise: insufficient evidence, leave separate
 
@@ -688,12 +1161,27 @@ def apply_resolutions(
     session.touch()
     save_session(session)
 
+    # Build clusters response (crop_ids per cluster) for frontend display
+    clusters_info = {
+        str(cid): {"crop_ids": members, "count": len(members)}
+        for cid, members in new_clusters.items()
+    }
+
     summary = {
         "merges_executed": len(merges_to_execute),
         "vetoed_pairs": len(vetoed),
         "final_clusters": len(new_clusters),
+        "n_identities": len(new_clusters),
         "cluster_sizes": {cid: len(m) for cid, m in new_clusters.items()},
+        "clusters": clusters_info,
     }
+
+    # Add convergence information
+    coverage = compute_cluster_pair_coverage(session)
+    summary["needs_more_rounds"] = coverage["needs_more_rounds"]
+    summary["uncovered_count"] = coverage["uncovered_count"]
+    summary["reid_round"] = session.reid_round
+
     logger.info(
         "Applied resolutions: %d merges, %d vetoed, %d final clusters",
         summary["merges_executed"], summary["vetoed_pairs"], summary["final_clusters"],

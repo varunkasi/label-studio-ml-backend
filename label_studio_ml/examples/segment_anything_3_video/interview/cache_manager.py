@@ -178,6 +178,10 @@ def save_session(session: InterviewSession) -> None:
     }
     _write_json(d / "clusters.json", reid_data)
 
+    # seeds.json — generated seed regions (survive container restarts)
+    if session.seeds:
+        _write_json(d / "seeds.json", session.seeds)
+
     # Update project index
     _update_project_index(
         session.project_id, session.cache_key, session.task_id, session.phase.value
@@ -252,6 +256,11 @@ def load_session(cache_key: str) -> Optional[InterviewSession]:
         session.reid_clusters = {int(k): v for k, v in clusters.items()}
         pairs = reid_data.get("pairs", {})
         session.reid_pairs = {pid: _pair_from_dict(pdata) for pid, pdata in pairs.items()}
+
+    # Load seeds
+    seeds_data = _read_json(d / "seeds.json")
+    if seeds_data:
+        session.seeds = seeds_data
 
     logger.info("Loaded session %s from %s (phase=%s)", session.session_id, d, session.phase.value)
     return session

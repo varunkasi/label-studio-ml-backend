@@ -22,6 +22,7 @@ class ReIDUI {
         this.nIdentities = 0;
         this.totalPairs = 0;
         this.onComplete = null;      // callback(mergeResult) when all pairs resolved
+        this.reidRound = 1;          // current ReID round number
 
         this._boundKeyHandler = this._handleKeyDown.bind(this);
     }
@@ -43,6 +44,7 @@ class ReIDUI {
             this.clusters = data.clusters || {};
             this.nIdentities = data.n_identities || 0;
             this.totalPairs = data.total_pairs || 0;
+            this.reidRound = data.reid_round || 1;
         } catch (err) {
             showToast('Failed to load ReID clusters: ' + err.message, 'error');
             return;
@@ -97,6 +99,23 @@ class ReIDUI {
             'and color histograms, then verify ambiguous pairs.';
         box.appendChild(desc);
 
+        // K input
+        var kGroup = document.createElement('div');
+        kGroup.className = 'form-group';
+        var kLabel = document.createElement('label');
+        kLabel.textContent = 'Expected number of identities (leave blank for auto)';
+        kLabel.setAttribute('for', 'reid-k-input');
+        kGroup.appendChild(kLabel);
+        var kInput = document.createElement('input');
+        kInput.type = 'number';
+        kInput.id = 'reid-k-input';
+        kInput.min = '2';
+        kInput.max = '50';
+        kInput.placeholder = 'Auto';
+        kInput.style.maxWidth = '120px';
+        kGroup.appendChild(kInput);
+        box.appendChild(kGroup);
+
         var actions = document.createElement('div');
         actions.className = 'session-actions';
 
@@ -104,7 +123,9 @@ class ReIDUI {
         btnStart.className = 'btn btn-primary';
         btnStart.textContent = 'Start Clustering';
         btnStart.addEventListener('click', function () {
-            this._runClustering();
+            var val = kInput.value.trim();
+            var nClusters = val ? parseInt(val, 10) : null;
+            this._runClustering(nClusters);
         }.bind(this));
         actions.appendChild(btnStart);
 
@@ -136,7 +157,7 @@ class ReIDUI {
         this.container.appendChild(panel);
     }
 
-    async _runClustering() {
+    async _runClustering(nClusters) {
         var progressArea = document.getElementById('reid-progress-area');
         if (progressArea) {
             progressArea.innerHTML =
@@ -147,9 +168,11 @@ class ReIDUI {
         }
 
         try {
-            var resp = await API.post('/reid/start', {
-                session_id: this.sessionId,
-            });
+            var payload = { session_id: this.sessionId };
+            if (nClusters != null && nClusters >= 2) {
+                payload.n_clusters = nClusters;
+            }
+            var resp = await API.post('/reid/start', payload);
 
             // Poll until done
             var self = this;
@@ -339,8 +362,8 @@ class ReIDUI {
         }
 
         text.innerHTML =
-            '<span>Pair ' + (this.currentPairIndex + 1) + '/' + this.pairs.length + '</span>' +
-            '<span>Ambiguous remaining: ' + ambiguousRemaining + '</span>';
+            '<span>Round ' + this.reidRound + ' — Pair ' + (this.currentPairIndex + 1) + '/' + this.pairs.length + '</span>' +
+            '<span>Remaining: ' + ambiguousRemaining + ' ambiguous</span>';
 
         progressWrapper.appendChild(track);
         progressWrapper.appendChild(text);
@@ -384,15 +407,21 @@ class ReIDUI {
         poolLabel.style.fontSize = '0.65rem';
         poolLabel.style.color = 'var(--text-muted)';
 
-        if (pair.pool === 'ambiguous') {
+        if (pair.pool === 'merge_candidate') {
+            dot.style.background = '#e74c3c';
+            poolLabel.textContent = 'merge candidate (high similarity)';
+        } else if (pair.pool === 'ambiguous') {
             dot.style.background = '#3498db';
             poolLabel.textContent = 'ambiguous';
         } else if (pair.pool === 'confident_same') {
             dot.style.background = '#2ecc71';
             poolLabel.textContent = 'calibration (likely same)';
-        } else {
+        } else if (pair.pool === 'confident_different') {
             dot.style.background = '#e67e22';
             poolLabel.textContent = 'calibration (likely different)';
+        } else {
+            dot.style.background = '#95a5a6';
+            poolLabel.textContent = pair.pool || 'unknown';
         }
 
         poolIndicator.appendChild(dot);
@@ -463,14 +492,32 @@ class ReIDUI {
 
         this.resolutions[pair.pair_id] = resolution;
 
-        // Submit to backend
-        var resolutionPayload = {};
-        resolutionPayload[pair.pair_id] = resolution;
+        // Move to next unresolved pair (no per-pair API call — batch on summary)
+        var nextIndex = this._findNextUnresolved(this.currentPairIndex + 1);
+        if (nextIndex !== -1) {
+            this._showPair(nextIndex);
+        } else {
+            // All pairs resolved — batch-submit then show summary
+            await this._submitAndShowSummary();
+        }
+    }
 
+    async _submitAndShowSummary() {
+        this.container.innerHTML = '';
+        var loading = document.createElement('div');
+        loading.className = 'seeding-panel';
+        loading.style.marginTop = '40px';
+        loading.style.textAlign = 'center';
+        loading.innerHTML =
+            '<div class="spinner"></div>' +
+            '<p style="color:var(--text-secondary);margin-top:12px">Applying resolutions…</p>';
+        this.container.appendChild(loading);
+
+        var result = {};
         try {
-            var result = await API.post('/reid/resolve', {
+            result = await API.post('/reid/resolve', {
                 session_id: this.sessionId,
-                resolutions: resolutionPayload,
+                resolutions: this.resolutions,
             });
 
             if (result.n_identities !== undefined) {
@@ -480,16 +527,108 @@ class ReIDUI {
                 this.clusters = result.clusters;
             }
         } catch (err) {
-            showToast('Failed to submit resolution: ' + err.message, 'error');
-            // Keep the local resolution anyway to not block the user
+            showToast('Failed to submit resolutions: ' + err.message, 'error');
         }
 
-        // Move to next unresolved pair
-        var nextIndex = this._findNextUnresolved(this.currentPairIndex + 1);
-        if (nextIndex !== -1) {
-            this._showPair(nextIndex);
+        if (result.needs_more_rounds) {
+            this._renderNextRoundPrompt(result);
         } else {
-            // All pairs resolved
+            this._renderSummary();
+        }
+    }
+
+    _renderNextRoundPrompt(resolveResult) {
+        this.container.innerHTML = '';
+
+        var panel = document.createElement('div');
+        panel.className = 'seeding-panel';
+        panel.style.marginTop = '20px';
+
+        var box = document.createElement('div');
+        box.className = 'session-setup';
+        box.style.maxWidth = '600px';
+
+        var h2 = document.createElement('h2');
+        h2.textContent = 'Round ' + this.reidRound + ' Complete';
+        box.appendChild(h2);
+
+        var info = document.createElement('div');
+        info.style.marginBottom = '16px';
+        info.style.color = 'var(--text-secondary)';
+        info.style.fontSize = '0.85rem';
+        var merges = resolveResult.merges_executed || 0;
+        var vetoed = resolveResult.vetoed_pairs || 0;
+        var uncovered = resolveResult.uncovered_count || 0;
+        info.innerHTML =
+            '<p>Merges: <strong>' + merges + '</strong> | ' +
+            'Vetoed: <strong>' + vetoed + '</strong> | ' +
+            'Identities: <strong>' + this.nIdentities + '</strong></p>' +
+            '<p style="margin-top:8px">' + uncovered +
+            ' cluster-pair relationship(s) still need verification.</p>';
+        box.appendChild(info);
+
+        var actions = document.createElement('div');
+        actions.className = 'session-actions';
+
+        var btnContinue = document.createElement('button');
+        btnContinue.className = 'btn btn-primary';
+        btnContinue.textContent = 'Continue — Next Round';
+        btnContinue.addEventListener('click', async function () {
+            await this._loadNextRound();
+        }.bind(this));
+        actions.appendChild(btnContinue);
+
+        var btnFinish = document.createElement('button');
+        btnFinish.className = 'btn btn-secondary';
+        btnFinish.textContent = 'Finish (View Summary)';
+        btnFinish.addEventListener('click', function () {
+            this._renderSummary();
+        }.bind(this));
+        actions.appendChild(btnFinish);
+
+        box.appendChild(actions);
+        panel.appendChild(box);
+        this.container.appendChild(panel);
+    }
+
+    async _loadNextRound() {
+        this.container.innerHTML = '';
+        var loading = document.createElement('div');
+        loading.className = 'seeding-panel';
+        loading.style.marginTop = '40px';
+        loading.style.textAlign = 'center';
+        loading.innerHTML =
+            '<div class="spinner"></div>' +
+            '<p style="color:var(--text-secondary);margin-top:12px">Generating next round…</p>';
+        this.container.appendChild(loading);
+
+        try {
+            var data = await API.post('/reid/next_round', {
+                session_id: this.sessionId,
+            });
+
+            this.reidRound = data.reid_round || (this.reidRound + 1);
+            var newPairs = data.pairs || [];
+
+            if (newPairs.length === 0) {
+                showToast('All cluster-pairs resolved!', 'success');
+                this._renderSummary();
+                return;
+            }
+
+            // Reset for new round
+            this.pairs = newPairs;
+            this.resolutions = {};
+            this.currentPairIndex = 0;
+            this.totalPairs += newPairs.length;
+
+            document.addEventListener('keydown', this._boundKeyHandler);
+            this._render();
+            this._showPair(0);
+
+            showToast('Round ' + this.reidRound + ': ' + newPairs.length + ' pairs', 'info');
+        } catch (err) {
+            showToast('Failed to load next round: ' + err.message, 'error');
             this._renderSummary();
         }
     }
@@ -597,53 +736,70 @@ class ReIDUI {
 
         var panel = document.createElement('div');
         panel.className = 'seeding-panel';
-        panel.style.marginTop = '40px';
+        panel.style.marginTop = '20px';
 
         var box = document.createElement('div');
         box.className = 'session-setup';
-        box.style.maxWidth = '600px';
+        box.style.maxWidth = '800px';
 
         var h2 = document.createElement('h2');
-        h2.textContent = 'ReID Complete';
+        h2.textContent = 'ReID Summary';
         box.appendChild(h2);
 
         var resolved = Object.keys(this.resolutions).length;
 
         var stats = document.createElement('div');
-        stats.style.marginBottom = '20px';
+        stats.style.marginBottom = '16px';
         stats.innerHTML =
-            '<p style="margin-bottom:8px;color:var(--text-secondary)">' +
+            '<p style="margin-bottom:4px;color:var(--text-secondary);font-size:0.85rem">' +
             'Resolved <strong>' + resolved + '</strong> of ' +
-            '<strong>' + this.pairs.length + '</strong> pairs.' +
-            '</p>' +
-            '<p style="margin-bottom:8px;color:var(--text-secondary)">' +
+            '<strong>' + this.totalPairs + '</strong> pairs. ' +
             'Final identity count: <strong>' + this.nIdentities + '</strong>' +
             '</p>';
         box.appendChild(stats);
 
-        // Cluster summary table
+        // Visual cluster gallery
         var clusterKeys = Object.keys(this.clusters);
         if (clusterKeys.length > 0) {
-            var table = document.createElement('table');
-            table.className = 'seed-table';
-            table.style.marginBottom = '20px';
-            table.innerHTML =
-                '<thead><tr>' +
-                '<th>Identity</th>' +
-                '<th>Crops</th>' +
-                '</tr></thead>';
+            var gallery = document.createElement('div');
+            gallery.className = 'reid-cluster-gallery';
 
-            var tbody = document.createElement('tbody');
+            var MAX_THUMBS = 20;
             for (var c = 0; c < clusterKeys.length; c++) {
-                var cluster = this.clusters[clusterKeys[c]];
-                var tr = document.createElement('tr');
-                tr.innerHTML =
-                    '<td>Cluster ' + clusterKeys[c] + '</td>' +
-                    '<td>' + cluster.count + '</td>';
-                tbody.appendChild(tr);
+                var cKey = clusterKeys[c];
+                var cluster = this.clusters[cKey];
+                var cropIds = cluster.crop_ids || [];
+                var count = cluster.count || cropIds.length;
+
+                var section = document.createElement('div');
+                section.className = 'reid-cluster-section';
+
+                var header = document.createElement('div');
+                header.className = 'reid-cluster-header';
+                header.textContent = 'Identity ' + cKey + ' (' + count + ' crops)';
+                section.appendChild(header);
+
+                var row = document.createElement('div');
+                row.className = 'reid-cluster-row';
+
+                var visible = Math.min(cropIds.length, MAX_THUMBS);
+                for (var t = 0; t < visible; t++) {
+                    var wrap = this._createThumbWrap(cropIds[t]);
+                    row.appendChild(wrap);
+                }
+
+                if (cropIds.length > MAX_THUMBS) {
+                    var overflow = document.createElement('div');
+                    overflow.className = 'reid-overflow-badge';
+                    overflow.textContent = '+' + (cropIds.length - MAX_THUMBS) + ' more';
+                    row.appendChild(overflow);
+                }
+
+                section.appendChild(row);
+                gallery.appendChild(section);
             }
-            table.appendChild(tbody);
-            box.appendChild(table);
+
+            box.appendChild(gallery);
         }
 
         // Action buttons
@@ -663,11 +819,217 @@ class ReIDUI {
         }.bind(this));
         actions.appendChild(btnProceed);
 
+        var btnRecluster = document.createElement('button');
+        btnRecluster.className = 'btn btn-secondary';
+        btnRecluster.textContent = 'Re-cluster';
+        btnRecluster.addEventListener('click', function () {
+            this._toggleReclusterPanel(box);
+        }.bind(this));
+        actions.appendChild(btnRecluster);
+
+        var btnBack = document.createElement('button');
+        btnBack.className = 'btn btn-ghost';
+        btnBack.textContent = 'Back to Detection';
+        btnBack.addEventListener('click', function () {
+            if (typeof navigate === 'function') navigate('detection');
+        });
+        actions.appendChild(btnBack);
+
         box.appendChild(actions);
+
+        // Re-cluster panel placeholder
+        var reclusterSlot = document.createElement('div');
+        reclusterSlot.id = 'reid-recluster-slot';
+        box.appendChild(reclusterSlot);
+
+        // Progress area (for re-cluster)
+        var progressArea = document.createElement('div');
+        progressArea.id = 'reid-progress-area';
+        progressArea.style.marginTop = '12px';
+        box.appendChild(progressArea);
+
         panel.appendChild(box);
         this.container.appendChild(panel);
 
         this.destroy();
+    }
+
+    /**
+     * Create a thumbnail wrapper with image + flag ("x") button.
+     */
+    _createThumbWrap(cropId) {
+        var wrap = document.createElement('div');
+        wrap.className = 'reid-thumb-wrap';
+
+        var img = document.createElement('img');
+        img.src = '/interview/api/detect/crop/' + cropId +
+            '/image?session_id=' + encodeURIComponent(this.sessionId);
+        img.alt = cropId;
+        img.title = 'Crop ' + cropId;
+        wrap.appendChild(img);
+
+        var flagBtn = document.createElement('button');
+        flagBtn.className = 'reid-thumb-flag';
+        flagBtn.textContent = '\u00d7'; // ×
+        flagBtn.title = 'Flag as outlier (move to new cluster)';
+        flagBtn.addEventListener('click', async function (e) {
+            e.stopPropagation();
+            await this._flagOutlier(cropId);
+        }.bind(this));
+        wrap.appendChild(flagBtn);
+
+        return wrap;
+    }
+
+    /**
+     * Toggle the inline re-cluster settings panel.
+     */
+    _toggleReclusterPanel(parentBox) {
+        var slot = document.getElementById('reid-recluster-slot');
+        if (!slot) return;
+
+        // Toggle: if already showing, remove
+        if (slot.children.length > 0) {
+            slot.innerHTML = '';
+            return;
+        }
+
+        var rpanel = document.createElement('div');
+        rpanel.className = 'reid-recluster-panel';
+
+        // Auto checkbox
+        var autoGroup = document.createElement('div');
+        autoGroup.className = 'form-group';
+        var autoLabel = document.createElement('label');
+        autoLabel.style.display = 'flex';
+        autoLabel.style.alignItems = 'center';
+        autoLabel.style.gap = '6px';
+        autoLabel.style.cursor = 'pointer';
+        var autoCb = document.createElement('input');
+        autoCb.type = 'checkbox';
+        autoCb.id = 'recluster-auto';
+        autoCb.checked = true;
+        autoLabel.appendChild(autoCb);
+        autoLabel.appendChild(document.createTextNode('Auto (with overclustering bias)'));
+        autoGroup.appendChild(autoLabel);
+        rpanel.appendChild(autoGroup);
+
+        // K input
+        var kGroup = document.createElement('div');
+        kGroup.className = 'form-group';
+        var kLbl = document.createElement('label');
+        kLbl.textContent = 'Number of identities';
+        kLbl.setAttribute('for', 'recluster-k');
+        kGroup.appendChild(kLbl);
+        var kInput = document.createElement('input');
+        kInput.type = 'number';
+        kInput.id = 'recluster-k';
+        kInput.min = '2';
+        kInput.max = '50';
+        kInput.value = String((this.nIdentities || 2) + 2);
+        kInput.style.maxWidth = '80px';
+        kInput.disabled = true; // disabled when auto is checked
+        kGroup.appendChild(kInput);
+        rpanel.appendChild(kGroup);
+
+        autoCb.addEventListener('change', function () {
+            kInput.disabled = autoCb.checked;
+        });
+
+        // Run button
+        var btnRun = document.createElement('button');
+        btnRun.className = 'btn btn-primary btn-small';
+        btnRun.textContent = 'Run';
+        btnRun.addEventListener('click', function () {
+            var useAuto = autoCb.checked;
+            var k = useAuto ? null : parseInt(kInput.value, 10);
+            this._runRecluster(k, useAuto);
+        }.bind(this));
+        rpanel.appendChild(btnRun);
+
+        slot.appendChild(rpanel);
+    }
+
+    /**
+     * Call the recluster endpoint and reload on completion.
+     */
+    async _runRecluster(nClusters, useAuto) {
+        var progressArea = document.getElementById('reid-progress-area');
+        if (progressArea) {
+            progressArea.innerHTML =
+                '<div class="progress-bar-wrapper">' +
+                '<div class="progress-bar-track"><div class="progress-bar-fill indeterminate"></div></div>' +
+                '<div class="progress-text"><span>Re-clustering...</span></div>' +
+                '</div>';
+        }
+
+        try {
+            var payload = { session_id: this.sessionId };
+            if (!useAuto && nClusters != null && nClusters >= 2) {
+                payload.n_clusters = nClusters;
+            }
+            var resp = await API.post('/reid/recluster', payload);
+
+            var self = this;
+            if (typeof pollJob === 'function') {
+                pollJob(
+                    resp.job_id,
+                    function (p) {
+                        if (progressArea) {
+                            var text = progressArea.querySelector('.progress-text span');
+                            if (text) text.textContent = p.step || 'Re-clustering...';
+                            var fill = progressArea.querySelector('.progress-bar-fill');
+                            if (fill && p.percent > 0) {
+                                fill.classList.remove('indeterminate');
+                                fill.style.width = p.percent + '%';
+                            }
+                        }
+                    },
+                    function (p) {
+                        if (p.status === 'completed') {
+                            showToast('Re-clustering complete!', 'success');
+                            self.init(self.sessionId);
+                        } else {
+                            showToast('Re-clustering failed: ' + (p.error || 'Unknown'), 'error');
+                            if (progressArea) progressArea.innerHTML = '';
+                        }
+                    },
+                    1000
+                );
+            }
+        } catch (err) {
+            showToast('Failed to start re-clustering: ' + err.message, 'error');
+            if (progressArea) progressArea.innerHTML = '';
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Flag outlier
+    // ------------------------------------------------------------------
+
+    async _flagOutlier(cropId) {
+        try {
+            var result = await API.post('/reid/flag_outlier', {
+                session_id: this.sessionId,
+                crop_id: cropId,
+            });
+
+            // Notify about new pairs
+            if (result.new_pairs_count > 0) {
+                showToast(
+                    result.new_pairs_count + ' new pair(s) to review',
+                    'warning'
+                );
+            } else {
+                showToast('Crop moved to new cluster', 'success');
+            }
+
+            // Re-init: fetches updated clusters and unresolved pairs,
+            // routes to pair comparison if new pairs exist, else summary
+            this.init(this.sessionId);
+        } catch (err) {
+            showToast('Failed to flag outlier: ' + err.message, 'error');
+        }
     }
 
     // ------------------------------------------------------------------

@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# NOTE: For a unified Python pipeline (export + snippets + SAM3 masks), use
+# process_annotation.py instead. This bash script remains useful as a
+# lightweight standalone tool with no Python/torch dependency.
 set -euo pipefail
 
 usage() {
@@ -577,7 +580,7 @@ EOF
   while IFS=$'\t' read -r casualty_id start_frame end_frame start_time end_time; do
     counter=$((counter + 1))
     local output_video="$SNIPPETS_DIR/casualty_${casualty_id}_f${start_frame}-${end_frame}_fps${fps_name}.mp4"
-    local output_json="$SNIPPETS_DIR/casualty_${casualty_id}_f${start_frame}-${end_frame}_fps${fps_name}.json"
+    local output_json="$SNIPPETS_DIR/casualty_${casualty_id}_f${start_frame}-${end_frame}_fps${fps_name}_frame_bbox.json"
 
     local keep_frames_json
     keep_frames_json=$(build_keep_frames_json "$start_frame" "$end_frame" "$start_time" "$end_time" "$summary_fps" "$FPS_TARGET")
