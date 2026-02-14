@@ -900,6 +900,12 @@ body {
   font-size: 0.75rem;
   font-weight: 600;
   flex-shrink: 0;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.reid-overflow-badge:hover {
+  background: var(--bg-hover);
 }
 
 .reid-recluster-panel {
@@ -926,6 +932,120 @@ body {
 .accuracy-trend-bar.high { background: var(--color-accepted); }
 .accuracy-trend-label { font-size: 0.7rem; color: var(--text-muted); white-space: nowrap; }
 .accuracy-trend-value { font-size: 0.75rem; font-weight: 600; color: var(--text-primary); white-space: nowrap; }
+
+/* -- Visual Pipeline ------------------------------------------------------ */
+.visual-pipeline-stats {
+  display: flex;
+  gap: 16px;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+}
+
+.visual-pipeline-stat {
+  background: var(--bg-accent);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  padding: 6px 14px;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+}
+
+.visual-pipeline-stat strong {
+  color: var(--text-primary);
+}
+
+.visual-proposal-card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  padding: 16px;
+  margin-bottom: 12px;
+}
+
+.visual-proposal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+  font-size: 0.85rem;
+}
+
+.visual-proposal-clusters {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 12px;
+}
+
+.visual-proposal-cluster-thumbs {
+  display: flex;
+  gap: 4px;
+}
+
+.visual-proposal-cluster-thumbs img {
+  width: 56px;
+  height: 56px;
+  object-fit: cover;
+  border-radius: var(--radius-sm);
+  border: 2px solid var(--border-default);
+}
+
+.visual-proposal-arrow {
+  font-size: 1.2rem;
+  color: var(--text-muted);
+}
+
+.visual-cue-bars {
+  margin-bottom: 12px;
+}
+
+.visual-cue-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+  font-size: 0.7rem;
+}
+
+.visual-cue-label {
+  width: 80px;
+  color: var(--text-secondary);
+  text-align: right;
+}
+
+.visual-cue-bar-track {
+  flex: 1;
+  height: 8px;
+  background: var(--progress-track);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.visual-cue-bar-fill {
+  height: 100%;
+  border-radius: 4px;
+  transition: width 300ms ease;
+}
+
+.visual-cue-value {
+  width: 36px;
+  color: var(--text-muted);
+  font-size: 0.65rem;
+}
+
+.visual-proposal-flags {
+  font-size: 0.7rem;
+  color: var(--color-pending);
+  margin-bottom: 8px;
+}
+
+.visual-proposal-verdict {
+  display: flex;
+  gap: 10px;
+  justify-content: center;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-default);
+}
 
 /* -- Utility -------------------------------------------------------------- */
 .hidden { display: none !important; }

@@ -23,6 +23,7 @@ class ReIDUI {
         this.totalPairs = 0;
         this.onComplete = null;      // callback(mergeResult) when all pairs resolved
         this.reidRound = 1;          // current ReID round number
+        this.phaseStage = 1;         // 1=centroid_building, 2=ambiguous, 3=auto_assignment
 
         this._boundKeyHandler = this._handleKeyDown.bind(this);
     }
@@ -45,6 +46,9 @@ class ReIDUI {
             this.nIdentities = data.n_identities || 0;
             this.totalPairs = data.total_pairs || 0;
             this.reidRound = data.reid_round || 1;
+            this.phaseStage = data.reid_phase_stage || 1;
+            this.mustLinkCount = data.must_link_count || 0;
+            this.cannotLinkCount = data.cannot_link_count || 0;
         } catch (err) {
             showToast('Failed to load ReID clusters: ' + err.message, 'error');
             return;
@@ -129,6 +133,14 @@ class ReIDUI {
         }.bind(this));
         actions.appendChild(btnStart);
 
+        var btnVisual = document.createElement('button');
+        btnVisual.className = 'btn btn-secondary';
+        btnVisual.textContent = 'Visual Pipeline';
+        btnVisual.addEventListener('click', function () {
+            this._runVisualPipeline();
+        }.bind(this));
+        actions.appendChild(btnVisual);
+
         var btnSkip = document.createElement('button');
         btnSkip.className = 'btn btn-ghost';
         btnSkip.textContent = 'Skip to Seeding';
@@ -206,6 +218,429 @@ class ReIDUI {
         } catch (err) {
             showToast('Failed to start clustering: ' + err.message, 'error');
             if (progressArea) progressArea.innerHTML = '';
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Visual Pipeline (multi-cue merge proposals)
+    // ------------------------------------------------------------------
+
+    async _runVisualPipeline() {
+        this.container.innerHTML = '';
+
+        var loading = document.createElement('div');
+        loading.className = 'seeding-panel';
+        loading.style.marginTop = '40px';
+        loading.style.textAlign = 'center';
+        loading.innerHTML =
+            '<div class="spinner"></div>' +
+            '<p style="color:var(--text-secondary);margin-top:12px">Running visual pipeline...</p>';
+        this.container.appendChild(loading);
+
+        try {
+            var result = await API.post('/reid/visual_pipeline', {
+                session_id: this.sessionId,
+            });
+            this._renderVisualPipelineResults(result);
+        } catch (err) {
+            showToast('Visual pipeline failed: ' + err.message, 'error');
+            this._renderSummary();
+        }
+    }
+
+    _renderVisualPipelineResults(result) {
+        this.container.innerHTML = '';
+
+        var panel = document.createElement('div');
+        panel.className = 'seeding-panel';
+        panel.style.marginTop = '20px';
+
+        var box = document.createElement('div');
+        box.className = 'session-setup';
+        box.style.maxWidth = '900px';
+
+        var h2 = document.createElement('h2');
+        h2.textContent = 'Visual Pipeline';
+        box.appendChild(h2);
+
+        // -- Stats bar --
+        var sessionStats = result.session_stats || {};
+        var statsRow = document.createElement('div');
+        statsRow.className = 'visual-pipeline-stats';
+
+        var statItems = [
+            { label: 'Crops', value: sessionStats.n_crops || '?' },
+            { label: 'Runs', value: sessionStats.n_runs || '?' },
+            { label: 'Clusters', value: sessionStats.n_clusters || '?' },
+        ];
+        for (var si = 0; si < statItems.length; si++) {
+            var badge = document.createElement('span');
+            badge.className = 'visual-pipeline-stat';
+            badge.innerHTML = '<strong>' + statItems[si].value + '</strong> ' + statItems[si].label;
+            statsRow.appendChild(badge);
+        }
+        box.appendChild(statsRow);
+
+        // -- Weights display (optional) --
+        var weights = result.weights;
+        if (weights && typeof weights === 'object') {
+            var wKeys = Object.keys(weights);
+            if (wKeys.length > 0) {
+                var wRow = document.createElement('div');
+                wRow.style.fontSize = '0.7rem';
+                wRow.style.color = 'var(--text-muted)';
+                wRow.style.marginBottom = '12px';
+                var wParts = [];
+                for (var wi = 0; wi < wKeys.length; wi++) {
+                    var wVal = weights[wKeys[wi]];
+                    wParts.push(wKeys[wi] + ': ' + (typeof wVal === 'number' ? wVal.toFixed(3) : wVal));
+                }
+                wRow.textContent = 'Cue weights: ' + wParts.join(', ');
+                box.appendChild(wRow);
+            }
+        }
+
+        // -- Cluster gallery (reuse summary pattern) --
+        var clusters = result.clusters || {};
+        var clusterKeys = Object.keys(clusters);
+        if (clusterKeys.length > 0) {
+            var gallery = document.createElement('div');
+            gallery.className = 'reid-cluster-gallery';
+
+            var MAX_THUMBS = 12;
+            for (var c = 0; c < clusterKeys.length; c++) {
+                (function (cKey, clusterData, self) {
+                    var cropIds = [];
+                    // clusters can be {identity_name: [crop_ids]} or {identity_name: {crop_ids: [...]}}
+                    if (Array.isArray(clusterData)) {
+                        cropIds = clusterData;
+                    } else if (clusterData && Array.isArray(clusterData.crop_ids)) {
+                        cropIds = clusterData.crop_ids;
+                    }
+
+                    var section = document.createElement('div');
+                    section.className = 'reid-cluster-section';
+
+                    var header = document.createElement('div');
+                    header.className = 'reid-cluster-header';
+                    header.textContent = 'Identity ' + cKey + ' (' + cropIds.length + ' crops)';
+                    section.appendChild(header);
+
+                    var row = document.createElement('div');
+                    row.className = 'reid-cluster-row';
+
+                    var visible = Math.min(cropIds.length, MAX_THUMBS);
+                    for (var t = 0; t < visible; t++) {
+                        var wrap = self._createThumbWrap(cropIds[t]);
+                        row.appendChild(wrap);
+                    }
+                    if (cropIds.length > MAX_THUMBS) {
+                        var overflow = document.createElement('div');
+                        overflow.className = 'reid-overflow-badge';
+                        overflow.textContent = '+' + (cropIds.length - MAX_THUMBS) + ' more';
+                        row.appendChild(overflow);
+                    }
+
+                    section.appendChild(row);
+                    gallery.appendChild(section);
+                })(clusterKeys[c], clusters[clusterKeys[c]], this);
+            }
+            box.appendChild(gallery);
+        }
+
+        // -- Merge proposals --
+        var proposals = result.merge_proposals || [];
+        if (proposals.length > 0) {
+            var proposalHeader = document.createElement('h3');
+            proposalHeader.style.fontSize = '0.95rem';
+            proposalHeader.style.marginTop = '16px';
+            proposalHeader.style.marginBottom = '10px';
+            proposalHeader.textContent = 'Merge Proposals (' + proposals.length + ')';
+            box.appendChild(proposalHeader);
+
+            // Build a map of cluster -> crop_ids for thumbnails
+            var clusterCropMap = {};
+            for (var ck = 0; ck < clusterKeys.length; ck++) {
+                var cd = clusters[clusterKeys[ck]];
+                if (Array.isArray(cd)) {
+                    clusterCropMap[clusterKeys[ck]] = cd;
+                } else if (cd && Array.isArray(cd.crop_ids)) {
+                    clusterCropMap[clusterKeys[ck]] = cd.crop_ids;
+                } else {
+                    clusterCropMap[clusterKeys[ck]] = [];
+                }
+            }
+
+            var verdicts = {};
+            var proposalContainer = document.createElement('div');
+
+            // Show top 3 most informative
+            var maxProposals = Math.min(proposals.length, 3);
+            for (var pi = 0; pi < maxProposals; pi++) {
+                this._renderProposalCard(proposals[pi], pi, proposalContainer, verdicts, clusterCropMap);
+            }
+            box.appendChild(proposalContainer);
+
+            // -- Apply Verdicts button --
+            var verdictActions = document.createElement('div');
+            verdictActions.className = 'session-actions';
+            verdictActions.style.marginTop = '16px';
+
+            var self = this;
+            var btnApply = document.createElement('button');
+            btnApply.className = 'btn btn-primary';
+            btnApply.textContent = 'Apply Verdicts';
+            btnApply.addEventListener('click', function () {
+                // Collect all verdicts that have been set
+                var verdictList = [];
+                var vKeys = Object.keys(verdicts);
+                for (var vi = 0; vi < vKeys.length; vi++) {
+                    verdictList.push(verdicts[vKeys[vi]]);
+                }
+                if (verdictList.length === 0) {
+                    showToast('No verdicts to submit. Judge at least one proposal.', 'warning');
+                    return;
+                }
+                self._submitVisualVerdicts(verdictList);
+            });
+            verdictActions.appendChild(btnApply);
+
+            var btnSkipVerdicts = document.createElement('button');
+            btnSkipVerdicts.className = 'btn btn-ghost';
+            btnSkipVerdicts.textContent = 'Skip — View Summary';
+            btnSkipVerdicts.addEventListener('click', function () {
+                self._renderSummary();
+            });
+            verdictActions.appendChild(btnSkipVerdicts);
+
+            box.appendChild(verdictActions);
+        } else {
+            var noProposals = document.createElement('p');
+            noProposals.style.color = 'var(--text-secondary)';
+            noProposals.style.fontSize = '0.85rem';
+            noProposals.style.marginTop = '16px';
+            noProposals.textContent = 'No merge proposals generated. Clusters appear well-separated.';
+            box.appendChild(noProposals);
+
+            var doneActions = document.createElement('div');
+            doneActions.className = 'session-actions';
+            doneActions.style.marginTop = '16px';
+
+            var btnDone = document.createElement('button');
+            btnDone.className = 'btn btn-primary';
+            btnDone.textContent = 'View Summary';
+            btnDone.addEventListener('click', function () {
+                this._renderSummary();
+            }.bind(this));
+            doneActions.appendChild(btnDone);
+            box.appendChild(doneActions);
+        }
+
+        panel.appendChild(box);
+        this.container.appendChild(panel);
+    }
+
+    _renderProposalCard(proposal, index, container, verdicts, clusterCropMap) {
+        var self = this;
+        var card = document.createElement('div');
+        card.className = 'visual-proposal-card';
+
+        // -- Header: cluster names + scores --
+        var header = document.createElement('div');
+        header.className = 'visual-proposal-header';
+
+        var title = document.createElement('span');
+        title.style.fontWeight = '600';
+        title.textContent = proposal.cluster_a + '  ↔  ' + proposal.cluster_b;
+        header.appendChild(title);
+
+        var scores = document.createElement('span');
+        scores.style.color = 'var(--text-secondary)';
+        var scoreText = 'Score: ' + (typeof proposal.merge_score === 'number' ? proposal.merge_score.toFixed(2) : '?');
+        if (typeof proposal.information_gain === 'number') {
+            scoreText += '  IG: ' + proposal.information_gain.toFixed(2);
+        }
+        scores.textContent = scoreText;
+        header.appendChild(scores);
+
+        card.appendChild(header);
+
+        // -- Cluster thumbnails side by side --
+        var clustersRow = document.createElement('div');
+        clustersRow.className = 'visual-proposal-clusters';
+
+        var cropsA = clusterCropMap[proposal.cluster_a] || [];
+        var cropsB = clusterCropMap[proposal.cluster_b] || [];
+
+        var thumbsA = document.createElement('div');
+        thumbsA.className = 'visual-proposal-cluster-thumbs';
+        var maxThumbs = 3;
+        for (var ta = 0; ta < Math.min(cropsA.length, maxThumbs); ta++) {
+            (function (cropId) {
+                var img = document.createElement('img');
+                img.src = '/interview/api/detect/crop/' + cropId +
+                    '/image?session_id=' + encodeURIComponent(self.sessionId);
+                img.alt = cropId;
+                thumbsA.appendChild(img);
+            })(cropsA[ta]);
+        }
+        clustersRow.appendChild(thumbsA);
+
+        var arrow = document.createElement('span');
+        arrow.className = 'visual-proposal-arrow';
+        arrow.textContent = '↔';
+        clustersRow.appendChild(arrow);
+
+        var thumbsB = document.createElement('div');
+        thumbsB.className = 'visual-proposal-cluster-thumbs';
+        for (var tb = 0; tb < Math.min(cropsB.length, maxThumbs); tb++) {
+            (function (cropId) {
+                var img = document.createElement('img');
+                img.src = '/interview/api/detect/crop/' + cropId +
+                    '/image?session_id=' + encodeURIComponent(self.sessionId);
+                img.alt = cropId;
+                thumbsB.appendChild(img);
+            })(cropsB[tb]);
+        }
+        clustersRow.appendChild(thumbsB);
+
+        card.appendChild(clustersRow);
+
+        // -- Per-cue evidence bars --
+        var perCue = proposal.per_cue || {};
+        var cueKeys = Object.keys(perCue);
+        if (cueKeys.length > 0) {
+            var barsDiv = document.createElement('div');
+            barsDiv.className = 'visual-cue-bars';
+
+            for (var ci = 0; ci < cueKeys.length; ci++) {
+                (function (cueName, cueVal) {
+                    var row = document.createElement('div');
+                    row.className = 'visual-cue-row';
+
+                    var label = document.createElement('span');
+                    label.className = 'visual-cue-label';
+                    label.textContent = cueName;
+                    row.appendChild(label);
+
+                    var track = document.createElement('div');
+                    track.className = 'visual-cue-bar-track';
+
+                    var fill = document.createElement('div');
+                    fill.className = 'visual-cue-bar-fill';
+                    var pct = Math.max(0, Math.min(100, (typeof cueVal === 'number' ? cueVal : 0) * 100));
+                    fill.style.width = pct + '%';
+
+                    // Color based on value
+                    if (cueVal < 0.3) {
+                        fill.style.background = 'var(--color-rejected)';
+                    } else if (cueVal < 0.7) {
+                        fill.style.background = 'var(--color-pending)';
+                    } else {
+                        fill.style.background = 'var(--color-accepted)';
+                    }
+
+                    track.appendChild(fill);
+                    row.appendChild(track);
+
+                    var valSpan = document.createElement('span');
+                    valSpan.className = 'visual-cue-value';
+                    valSpan.textContent = typeof cueVal === 'number' ? cueVal.toFixed(2) : '?';
+                    row.appendChild(valSpan);
+
+                    barsDiv.appendChild(row);
+                })(cueKeys[ci], perCue[cueKeys[ci]]);
+            }
+            card.appendChild(barsDiv);
+        }
+
+        // -- Flags (co-occurrence conflict, temporal overlap) --
+        var flags = [];
+        if (proposal.cooccurrence_conflict) {
+            flags.push('co-occurrence conflict');
+        }
+        if (proposal.temporal_overlap) {
+            flags.push('temporal overlap');
+        }
+        if (flags.length > 0) {
+            var flagDiv = document.createElement('div');
+            flagDiv.className = 'visual-proposal-flags';
+            flagDiv.textContent = '⚠ ' + flags.join(', ');
+            card.appendChild(flagDiv);
+        }
+
+        // -- Verdict buttons --
+        var verdictRow = document.createElement('div');
+        verdictRow.className = 'visual-proposal-verdict';
+
+        var pairKey = proposal.cluster_a + '::' + proposal.cluster_b;
+
+        var btnSame = document.createElement('button');
+        btnSame.className = 'btn btn-accept btn-small';
+        btnSame.textContent = 'Same Person';
+        btnSame.addEventListener('click', function () {
+            verdicts[pairKey] = {
+                cluster_a: proposal.cluster_a,
+                cluster_b: proposal.cluster_b,
+                verdict: 'same',
+            };
+            btnSame.style.outline = '2px solid #fff';
+            btnDiff.style.outline = 'none';
+            card.style.borderColor = 'var(--color-accepted)';
+        });
+        verdictRow.appendChild(btnSame);
+
+        var btnDiff = document.createElement('button');
+        btnDiff.className = 'btn btn-reject btn-small';
+        btnDiff.textContent = 'Different Person';
+        btnDiff.addEventListener('click', function () {
+            verdicts[pairKey] = {
+                cluster_a: proposal.cluster_a,
+                cluster_b: proposal.cluster_b,
+                verdict: 'different',
+            };
+            btnDiff.style.outline = '2px solid #fff';
+            btnSame.style.outline = 'none';
+            card.style.borderColor = 'var(--color-rejected)';
+        });
+        verdictRow.appendChild(btnDiff);
+
+        card.appendChild(verdictRow);
+        container.appendChild(card);
+    }
+
+    async _submitVisualVerdicts(verdictList) {
+        this.container.innerHTML = '';
+        var loading = document.createElement('div');
+        loading.className = 'seeding-panel';
+        loading.style.marginTop = '40px';
+        loading.style.textAlign = 'center';
+        loading.innerHTML =
+            '<div class="spinner"></div>' +
+            '<p style="color:var(--text-secondary);margin-top:12px">Applying verdicts...</p>';
+        this.container.appendChild(loading);
+
+        try {
+            var result = await API.post('/reid/merge_verdict', {
+                session_id: this.sessionId,
+                verdicts: verdictList,
+            });
+
+            if (result.clusters) {
+                this.clusters = result.clusters;
+                this.nIdentities = Object.keys(this.clusters).length;
+            }
+
+            if (result.converged) {
+                showToast('Visual pipeline converged!', 'success');
+                this._renderSummary();
+            } else {
+                // Show updated proposals for next round
+                this._renderVisualPipelineResults(result);
+            }
+        } catch (err) {
+            showToast('Failed to submit verdicts: ' + err.message, 'error');
+            this._renderSummary();
         }
     }
 
@@ -361,8 +796,11 @@ class ReIDUI {
             }
         }
 
+        var phaseLabel = this.phaseStage === 1 ? 'Centroid Building'
+            : this.phaseStage === 2 ? 'Ambiguous Resolution'
+            : 'Auto-Assignment';
         text.innerHTML =
-            '<span>Round ' + this.reidRound + ' — Pair ' + (this.currentPairIndex + 1) + '/' + this.pairs.length + '</span>' +
+            '<span>' + phaseLabel + ' — Round ' + this.reidRound + ' — Pair ' + (this.currentPairIndex + 1) + '/' + this.pairs.length + '</span>' +
             '<span>Remaining: ' + ambiguousRemaining + ' ambiguous</span>';
 
         progressWrapper.appendChild(track);
@@ -407,7 +845,10 @@ class ReIDUI {
         poolLabel.style.fontSize = '0.65rem';
         poolLabel.style.color = 'var(--text-muted)';
 
-        if (pair.pool === 'merge_candidate') {
+        if (pair.pool === 'centroid_building') {
+            dot.style.background = '#9b59b6';
+            poolLabel.textContent = 'centroid building (intra-cluster)';
+        } else if (pair.pool === 'merge_candidate') {
             dot.style.background = '#e74c3c';
             poolLabel.textContent = 'merge candidate (high similarity)';
         } else if (pair.pool === 'ambiguous') {
@@ -472,9 +913,9 @@ class ReIDUI {
         var hints = document.createElement('div');
         hints.className = 'keyboard-hints';
         hints.innerHTML =
-            '<kbd>Y</kbd> Same ' +
-            '<kbd>N</kbd> Different ' +
-            '<kbd>U</kbd> Unsure ' +
+            '<kbd>F</kbd> Same ' +
+            '<kbd>J</kbd> Different ' +
+            '<kbd>Space</kbd> Unsure ' +
             '<kbd>&larr;</kbd> Previous';
         container.appendChild(hints);
 
@@ -526,14 +967,21 @@ class ReIDUI {
             if (result.clusters) {
                 this.clusters = result.clusters;
             }
+            if (result.reid_phase_stage !== undefined) {
+                this.phaseStage = result.reid_phase_stage;
+            }
         } catch (err) {
             showToast('Failed to submit resolutions: ' + err.message, 'error');
         }
 
-        if (result.needs_more_rounds) {
+        if (result.reid_phase_stage >= 2 && result.centroid_assignments) {
+            // Phase 2: show centroid-based assignments
+            this._renderCentroidAssignments(result.centroid_assignments);
+        } else if (result.needs_more_rounds) {
             this._renderNextRoundPrompt(result);
         } else {
-            this._renderSummary();
+            // Rounds complete — check for auto-assignments
+            this._checkAutoAssignments();
         }
     }
 
@@ -649,6 +1097,517 @@ class ReIDUI {
     }
 
     // ------------------------------------------------------------------
+    // Phase 3: Auto-assignment quick-confirm cards
+    // ------------------------------------------------------------------
+
+    async _checkAutoAssignments() {
+        // If in Phase 2, use centroid assignment view instead
+        if (this.phaseStage >= 2) {
+            try {
+                var cData = await API.get('/reid/centroid_assignments', {
+                    session_id: this.sessionId,
+                });
+                var nD = Object.keys(cData.decisive || {}).length;
+                var nI = Object.keys(cData.indecisive || {}).length;
+                if (nD > 0 || nI > 0) {
+                    this._renderCentroidAssignments(cData);
+                    return;
+                }
+            } catch (e) {
+                // fall through to legacy
+            }
+        }
+
+        try {
+            var data = await API.get('/reid/auto_assignments', {
+                session_id: this.sessionId,
+            });
+            var autoAssigned = data.auto_assigned || {};
+            var unresolved = data.unresolved || {};
+            var autoCount = Object.keys(autoAssigned).length;
+            var unresolvedCount = Object.keys(unresolved).length;
+
+            if (autoCount > 0) {
+                this._renderAutoAssignments(autoAssigned, unresolvedCount);
+            } else {
+                this._renderSummary();
+            }
+        } catch (err) {
+            this._renderSummary();
+        }
+    }
+
+    _renderAutoAssignments(autoAssigned, unresolvedCount) {
+        this.container.innerHTML = '';
+
+        var panel = document.createElement('div');
+        panel.className = 'seeding-panel';
+        panel.style.marginTop = '20px';
+
+        var box = document.createElement('div');
+        box.className = 'session-setup';
+        box.style.maxWidth = '900px';
+
+        // Header
+        var h2 = document.createElement('h2');
+        h2.textContent = 'Auto-Assignment Review';
+        box.appendChild(h2);
+
+        var desc = document.createElement('p');
+        desc.style.color = 'var(--text-secondary)';
+        desc.style.fontSize = '0.85rem';
+        desc.style.marginBottom = '16px';
+        var cropIds = Object.keys(autoAssigned);
+        var newCount = 0;
+        var confirmCount = 0;
+        for (var ci = 0; ci < cropIds.length; ci++) {
+            if (autoAssigned[cropIds[ci]].already_clustered) {
+                confirmCount++;
+            } else {
+                newCount++;
+            }
+        }
+        var descParts = [];
+        if (newCount > 0) descParts.push(newCount + ' new assignment(s)');
+        if (confirmCount > 0) descParts.push(confirmCount + ' confident confirmation(s)');
+        desc.textContent =
+            descParts.join(', ') +
+            ' across identity clusters. Review and confirm each below.' +
+            (unresolvedCount > 0 ? ' (' + unresolvedCount + ' crops are too ambiguous for auto-assignment.)' : '');
+        box.appendChild(desc);
+
+        // Quick-confirm card grid
+        var grid = document.createElement('div');
+        grid.style.display = 'grid';
+        grid.style.gridTemplateColumns = 'repeat(auto-fill, minmax(200px, 1fr))';
+        grid.style.gap = '12px';
+        grid.style.marginBottom = '20px';
+
+        var acceptedMap = {};   // crop_id -> cluster_id
+        var rejectedSet = {};   // crop_id -> true
+
+        var self = this;
+        for (var i = 0; i < cropIds.length; i++) {
+            (function (cropId) {
+                var info = autoAssigned[cropId];
+
+                var card = document.createElement('div');
+                card.className = 'reid-auto-card';
+                card.style.border = '1px solid var(--border-default)';
+                card.style.borderRadius = '8px';
+                card.style.padding = '8px';
+                card.style.background = 'var(--bg-secondary)';
+                card.style.textAlign = 'center';
+
+                // Crop image
+                var img = document.createElement('img');
+                img.src = '/interview/api/detect/crop/' + cropId +
+                    '/image?session_id=' + encodeURIComponent(self.sessionId);
+                img.alt = cropId;
+                img.style.width = '100%';
+                img.style.maxHeight = '120px';
+                img.style.objectFit = 'contain';
+                img.style.borderRadius = '4px';
+                card.appendChild(img);
+
+                // Info text
+                var infoEl = document.createElement('div');
+                infoEl.style.fontSize = '0.7rem';
+                infoEl.style.color = 'var(--text-secondary)';
+                infoEl.style.margin = '6px 0';
+                var matchNote = '';
+                if (info.already_clustered) {
+                    if (info.current_cluster === info.cluster_id) {
+                        matchNote = '<span style="color:var(--color-accepted)"> (confirms current)</span>';
+                    } else {
+                        matchNote = '<span style="color:var(--color-rejected)"> (reassign from ' + info.current_cluster + ')</span>';
+                    }
+                }
+                infoEl.innerHTML =
+                    'Identity <strong>' + info.cluster_id + '</strong> ' +
+                    '(conf: ' + (info.confidence != null ? info.confidence.toFixed(2) : '?') + ', ' +
+                    'margin: ' + (info.margin != null ? info.margin.toFixed(2) : '?') + ')' + matchNote;
+                card.appendChild(infoEl);
+
+                // Accept / Reject buttons
+                var btns = document.createElement('div');
+                btns.style.display = 'flex';
+                btns.style.gap = '4px';
+                btns.style.justifyContent = 'center';
+
+                var btnAccept = document.createElement('button');
+                btnAccept.className = 'btn btn-accept btn-small';
+                btnAccept.textContent = 'Accept';
+                btnAccept.style.fontSize = '0.7rem';
+                btnAccept.style.padding = '2px 10px';
+                btnAccept.addEventListener('click', function () {
+                    acceptedMap[cropId] = info.cluster_id;
+                    delete rejectedSet[cropId];
+                    card.style.borderColor = 'var(--color-accepted)';
+                    card.style.borderWidth = '2px';
+                });
+                btns.appendChild(btnAccept);
+
+                var btnReject = document.createElement('button');
+                btnReject.className = 'btn btn-reject btn-small';
+                btnReject.textContent = 'Reject';
+                btnReject.style.fontSize = '0.7rem';
+                btnReject.style.padding = '2px 10px';
+                btnReject.addEventListener('click', function () {
+                    rejectedSet[cropId] = true;
+                    delete acceptedMap[cropId];
+                    card.style.borderColor = 'var(--color-rejected)';
+                    card.style.borderWidth = '2px';
+                });
+                btns.appendChild(btnReject);
+
+                card.appendChild(btns);
+
+                // Pre-accept by default (user can reject)
+                acceptedMap[cropId] = info.cluster_id;
+                card.style.borderColor = 'var(--color-accepted)';
+                card.style.borderWidth = '2px';
+
+                grid.appendChild(card);
+            })(cropIds[i]);
+        }
+
+        box.appendChild(grid);
+
+        // Action buttons
+        var actions = document.createElement('div');
+        actions.className = 'session-actions';
+
+        var btnApply = document.createElement('button');
+        btnApply.className = 'btn btn-primary';
+        btnApply.textContent = 'Apply Assignments';
+        btnApply.addEventListener('click', async function () {
+            try {
+                await API.post('/reid/apply_auto_assignments', {
+                    session_id: self.sessionId,
+                    assignments: acceptedMap,
+                });
+                var appliedCount = Object.keys(acceptedMap).length;
+                showToast(appliedCount + ' crop(s) assigned to identities', 'success');
+                self._renderSummary();
+            } catch (err) {
+                showToast('Failed to apply: ' + err.message, 'error');
+            }
+        });
+        actions.appendChild(btnApply);
+
+        var btnSkip = document.createElement('button');
+        btnSkip.className = 'btn btn-ghost';
+        btnSkip.textContent = 'Skip — Go to Summary';
+        btnSkip.addEventListener('click', function () {
+            self._renderSummary();
+        });
+        actions.appendChild(btnSkip);
+
+        box.appendChild(actions);
+        panel.appendChild(box);
+        this.container.appendChild(panel);
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 2: Centroid-based crop assignment (decisive + indecisive)
+    // ------------------------------------------------------------------
+
+    _renderCentroidAssignments(data) {
+        this.container.innerHTML = '';
+
+        var panel = document.createElement('div');
+        panel.className = 'seeding-panel';
+        panel.style.marginTop = '20px';
+
+        var box = document.createElement('div');
+        box.className = 'session-setup';
+        box.style.maxWidth = '1000px';
+
+        // Header
+        var h2 = document.createElement('h2');
+        h2.textContent = 'Identity Assignment (Phase 2)';
+        box.appendChild(h2);
+
+        var desc = document.createElement('p');
+        desc.style.color = 'var(--text-secondary)';
+        desc.style.fontSize = '0.85rem';
+        desc.style.marginBottom = '16px';
+        var nDecisive = Object.keys(data.decisive || {}).length;
+        var nIndecisive = Object.keys(data.indecisive || {}).length;
+        desc.textContent = nDecisive + ' confident assignment(s), ' +
+            nIndecisive + ' need your input. ' +
+            'Centroids formed from ' + (data.centroid_count || '?') + ' confirmed groups.';
+        box.appendChild(desc);
+
+        var assignmentMap = {};  // crop_id -> cluster_id or null
+        var self = this;
+
+        // --- Decisive section: auto-confirm cards ---
+        if (nDecisive > 0) {
+            var decisiveHeader = document.createElement('h3');
+            decisiveHeader.style.fontSize = '0.9rem';
+            decisiveHeader.style.marginBottom = '8px';
+            decisiveHeader.textContent = 'Confident Assignments (pre-accepted)';
+            box.appendChild(decisiveHeader);
+
+            var dGrid = document.createElement('div');
+            dGrid.style.display = 'grid';
+            dGrid.style.gridTemplateColumns = 'repeat(auto-fill, minmax(180px, 1fr))';
+            dGrid.style.gap = '10px';
+            dGrid.style.marginBottom = '20px';
+
+            var decisiveIds = Object.keys(data.decisive);
+            for (var di = 0; di < decisiveIds.length; di++) {
+                (function (cropId) {
+                    var info = data.decisive[cropId];
+                    assignmentMap[cropId] = info.cluster_id;  // pre-accept
+
+                    var card = document.createElement('div');
+                    card.style.border = '2px solid var(--color-accepted)';
+                    card.style.borderRadius = '8px';
+                    card.style.padding = '8px';
+                    card.style.background = 'var(--bg-secondary)';
+                    card.style.textAlign = 'center';
+
+                    var img = document.createElement('img');
+                    img.src = '/interview/api/detect/crop/' + cropId +
+                        '/image?session_id=' + encodeURIComponent(self.sessionId);
+                    img.alt = cropId;
+                    img.style.width = '100%';
+                    img.style.maxHeight = '100px';
+                    img.style.objectFit = 'contain';
+                    img.style.borderRadius = '4px';
+                    card.appendChild(img);
+
+                    var label = document.createElement('div');
+                    label.style.fontSize = '0.7rem';
+                    label.style.color = 'var(--text-secondary)';
+                    label.style.margin = '4px 0';
+                    label.innerHTML = 'Identity <strong>' + info.cluster_id +
+                        '</strong> (conf: ' + info.confidence.toFixed(2) + ')';
+                    card.appendChild(label);
+
+                    // Reject button
+                    var btnReject = document.createElement('button');
+                    btnReject.className = 'btn btn-reject btn-small';
+                    btnReject.textContent = 'Reject';
+                    btnReject.style.fontSize = '0.65rem';
+                    btnReject.style.padding = '2px 8px';
+                    btnReject.addEventListener('click', function () {
+                        delete assignmentMap[cropId];
+                        card.style.borderColor = 'var(--color-rejected)';
+                        btnReject.disabled = true;
+                    });
+                    card.appendChild(btnReject);
+
+                    dGrid.appendChild(card);
+                })(decisiveIds[di]);
+            }
+            box.appendChild(dGrid);
+        }
+
+        // --- Indecisive section: crop vs centroid cards ---
+        if (nIndecisive > 0) {
+            var indecisiveHeader = document.createElement('h3');
+            indecisiveHeader.style.fontSize = '0.9rem';
+            indecisiveHeader.style.marginBottom = '8px';
+            indecisiveHeader.textContent = 'Needs Your Input';
+            box.appendChild(indecisiveHeader);
+
+            var iGrid = document.createElement('div');
+            iGrid.style.display = 'grid';
+            iGrid.style.gridTemplateColumns = 'repeat(auto-fill, minmax(300px, 1fr))';
+            iGrid.style.gap = '12px';
+            iGrid.style.marginBottom = '20px';
+
+            var indecisiveIds = Object.keys(data.indecisive);
+            for (var ii = 0; ii < indecisiveIds.length; ii++) {
+                (function (cropId) {
+                    var info = data.indecisive[cropId];
+                    var candidates = info.candidates || [];
+
+                    var card = document.createElement('div');
+                    card.style.border = '1px solid var(--border-default)';
+                    card.style.borderRadius = '8px';
+                    card.style.padding = '10px';
+                    card.style.background = 'var(--bg-secondary)';
+
+                    // Crop image (left)
+                    var topRow = document.createElement('div');
+                    topRow.style.display = 'flex';
+                    topRow.style.gap = '10px';
+                    topRow.style.marginBottom = '8px';
+
+                    var cropCol = document.createElement('div');
+                    cropCol.style.flex = '0 0 90px';
+                    var cropImg = document.createElement('img');
+                    cropImg.src = '/interview/api/detect/crop/' + cropId +
+                        '/image?session_id=' + encodeURIComponent(self.sessionId);
+                    cropImg.alt = cropId;
+                    cropImg.style.width = '90px';
+                    cropImg.style.height = '80px';
+                    cropImg.style.objectFit = 'contain';
+                    cropImg.style.borderRadius = '4px';
+                    cropImg.style.border = '2px solid var(--border-default)';
+                    cropCol.appendChild(cropImg);
+                    var cropLabel = document.createElement('div');
+                    cropLabel.style.fontSize = '0.65rem';
+                    cropLabel.style.color = 'var(--text-secondary)';
+                    cropLabel.style.textAlign = 'center';
+                    cropLabel.style.marginTop = '2px';
+                    cropLabel.textContent = 'This crop';
+                    cropCol.appendChild(cropLabel);
+                    topRow.appendChild(cropCol);
+
+                    // Candidate centroids (right)
+                    var candCol = document.createElement('div');
+                    candCol.style.flex = '1';
+                    candCol.style.display = 'flex';
+                    candCol.style.gap = '8px';
+
+                    for (var ci = 0; ci < candidates.length; ci++) {
+                        (function (cand, candIdx) {
+                            var candCard = document.createElement('div');
+                            candCard.style.flex = '1';
+                            candCard.style.textAlign = 'center';
+                            candCard.style.padding = '4px';
+                            candCard.style.border = '1px solid var(--border-default)';
+                            candCard.style.borderRadius = '6px';
+                            candCard.style.cursor = 'pointer';
+
+                            // Representative thumbnails
+                            var reps = cand.representatives || [];
+                            var repRow = document.createElement('div');
+                            repRow.style.display = 'flex';
+                            repRow.style.gap = '2px';
+                            repRow.style.justifyContent = 'center';
+                            for (var ri = 0; ri < Math.min(reps.length, 3); ri++) {
+                                var repImg = document.createElement('img');
+                                repImg.src = '/interview/api/detect/crop/' + reps[ri] +
+                                    '/image?session_id=' + encodeURIComponent(self.sessionId);
+                                repImg.style.width = '40px';
+                                repImg.style.height = '36px';
+                                repImg.style.objectFit = 'contain';
+                                repImg.style.borderRadius = '3px';
+                                repRow.appendChild(repImg);
+                            }
+                            candCard.appendChild(repRow);
+
+                            var candInfo = document.createElement('div');
+                            candInfo.style.fontSize = '0.65rem';
+                            candInfo.style.color = 'var(--text-secondary)';
+                            candInfo.style.marginTop = '2px';
+                            candInfo.textContent = 'Identity ' + cand.cluster_id +
+                                ' (sim: ' + cand.similarity.toFixed(2) + ')';
+                            candCard.appendChild(candInfo);
+
+                            // Click to assign
+                            candCard.addEventListener('click', function () {
+                                assignmentMap[cropId] = cand.cluster_id;
+                                card.style.borderColor = 'var(--color-accepted)';
+                                card.style.borderWidth = '2px';
+                                // Highlight selected candidate
+                                var siblings = candCol.children;
+                                for (var s = 0; s < siblings.length; s++) {
+                                    siblings[s].style.borderColor = 'var(--border-default)';
+                                    siblings[s].style.background = '';
+                                }
+                                candCard.style.borderColor = 'var(--color-accepted)';
+                                candCard.style.background = 'var(--bg-accent)';
+                            });
+
+                            candCol.appendChild(candCard);
+                        })(candidates[ci], ci);
+                    }
+
+                    topRow.appendChild(candCol);
+                    card.appendChild(topRow);
+
+                    // "Neither" button
+                    var btnNeither = document.createElement('button');
+                    btnNeither.className = 'btn btn-ghost btn-small';
+                    btnNeither.textContent = 'Neither / New Identity';
+                    btnNeither.style.fontSize = '0.65rem';
+                    btnNeither.style.width = '100%';
+                    btnNeither.addEventListener('click', function () {
+                        assignmentMap[cropId] = null;
+                        card.style.borderColor = 'var(--text-secondary)';
+                        card.style.borderWidth = '2px';
+                        var siblings = candCol.children;
+                        for (var s = 0; s < siblings.length; s++) {
+                            siblings[s].style.borderColor = 'var(--border-default)';
+                            siblings[s].style.background = '';
+                        }
+                    });
+                    card.appendChild(btnNeither);
+
+                    iGrid.appendChild(card);
+                })(indecisiveIds[ii]);
+            }
+            box.appendChild(iGrid);
+        }
+
+        // --- Action buttons ---
+        var actions = document.createElement('div');
+        actions.className = 'session-actions';
+
+        var btnApply = document.createElement('button');
+        btnApply.className = 'btn btn-primary';
+        btnApply.textContent = 'Apply & Continue';
+        btnApply.addEventListener('click', async function () {
+            try {
+                var result = await API.post('/reid/apply_associations', {
+                    session_id: self.sessionId,
+                    assignments: assignmentMap,
+                });
+
+                if (result.n_identities !== undefined) {
+                    self.nIdentities = result.n_identities;
+                }
+                if (result.clusters) {
+                    self.clusters = result.clusters;
+                }
+                if (result.reid_phase_stage !== undefined) {
+                    self.phaseStage = result.reid_phase_stage;
+                }
+
+                var newDecisive = result.new_decisive || {};
+                var newIndecisive = result.new_indecisive || {};
+                var nNew = Object.keys(newDecisive).length + Object.keys(newIndecisive).length;
+
+                if (result.converged || nNew === 0) {
+                    showToast('Centroid assignment complete!', 'success');
+                    self._renderSummary();
+                } else {
+                    showToast(Object.keys(newDecisive).length + ' new confident, ' +
+                        Object.keys(newIndecisive).length + ' need input', 'info');
+                    self._renderCentroidAssignments({
+                        decisive: newDecisive,
+                        indecisive: newIndecisive,
+                        centroid_count: result.n_identities,
+                    });
+                }
+            } catch (err) {
+                showToast('Failed to apply: ' + err.message, 'error');
+            }
+        });
+        actions.appendChild(btnApply);
+
+        var btnFinish = document.createElement('button');
+        btnFinish.className = 'btn btn-secondary';
+        btnFinish.textContent = 'Finish ReID';
+        btnFinish.addEventListener('click', function () {
+            self._renderSummary();
+        });
+        actions.appendChild(btnFinish);
+
+        box.appendChild(actions);
+        panel.appendChild(box);
+        this.container.appendChild(panel);
+    }
+
+    // ------------------------------------------------------------------
     // Merge status panel
     // ------------------------------------------------------------------
 
@@ -746,15 +1705,31 @@ class ReIDUI {
         h2.textContent = 'ReID Summary';
         box.appendChild(h2);
 
-        var resolved = Object.keys(this.resolutions).length;
+        // Resolved = pairs resolved in this session + pairs already resolved at init
+        var localResolved = Object.keys(this.resolutions).length;
+        var backendResolved = this.totalPairs - this.pairs.length;
+        var resolved = backendResolved + localResolved;
 
         var stats = document.createElement('div');
         stats.style.marginBottom = '16px';
+        var phaseNames = {1: 'Centroid Building', 2: 'Ambiguous Resolution', 3: 'Auto-Assignment'};
+        var constraintInfo = '';
+        if (this.mustLinkCount > 0 || this.cannotLinkCount > 0) {
+            constraintInfo = '<br>Constraints: <strong>' +
+                this.mustLinkCount + '</strong> same-person, <strong>' +
+                this.cannotLinkCount + '</strong> different-person' +
+                ' (preserved across re-clusters)';
+        }
+        var phaseInfo = '<br>Phase: <strong>' + (phaseNames[this.phaseStage] || 'Unknown') + '</strong>';
+        var pairInfo = this.totalPairs > 0
+            ? 'Resolved <strong>' + resolved + '</strong> of ' +
+              '<strong>' + this.totalPairs + '</strong> pairs. '
+            : '';
         stats.innerHTML =
             '<p style="margin-bottom:4px;color:var(--text-secondary);font-size:0.85rem">' +
-            'Resolved <strong>' + resolved + '</strong> of ' +
-            '<strong>' + this.totalPairs + '</strong> pairs. ' +
+            pairInfo +
             'Final identity count: <strong>' + this.nIdentities + '</strong>' +
+            constraintInfo + phaseInfo +
             '</p>';
         box.appendChild(stats);
 
@@ -766,37 +1741,54 @@ class ReIDUI {
 
             var MAX_THUMBS = 20;
             for (var c = 0; c < clusterKeys.length; c++) {
-                var cKey = clusterKeys[c];
-                var cluster = this.clusters[cKey];
-                var cropIds = cluster.crop_ids || [];
-                var count = cluster.count || cropIds.length;
+                (function (cKey, cluster, self) {
+                    var cropIds = cluster.crop_ids || [];
+                    var count = cluster.count || cropIds.length;
 
-                var section = document.createElement('div');
-                section.className = 'reid-cluster-section';
+                    var section = document.createElement('div');
+                    section.className = 'reid-cluster-section';
 
-                var header = document.createElement('div');
-                header.className = 'reid-cluster-header';
-                header.textContent = 'Identity ' + cKey + ' (' + count + ' crops)';
-                section.appendChild(header);
+                    var header = document.createElement('div');
+                    header.className = 'reid-cluster-header';
+                    header.textContent = 'Identity ' + cKey + ' (' + count + ' crops)';
+                    section.appendChild(header);
 
-                var row = document.createElement('div');
-                row.className = 'reid-cluster-row';
+                    var row = document.createElement('div');
+                    row.className = 'reid-cluster-row';
 
-                var visible = Math.min(cropIds.length, MAX_THUMBS);
-                for (var t = 0; t < visible; t++) {
-                    var wrap = this._createThumbWrap(cropIds[t]);
-                    row.appendChild(wrap);
-                }
+                    var visible = Math.min(cropIds.length, MAX_THUMBS);
+                    for (var t = 0; t < visible; t++) {
+                        var wrap = self._createThumbWrap(cropIds[t]);
+                        row.appendChild(wrap);
+                    }
 
-                if (cropIds.length > MAX_THUMBS) {
-                    var overflow = document.createElement('div');
-                    overflow.className = 'reid-overflow-badge';
-                    overflow.textContent = '+' + (cropIds.length - MAX_THUMBS) + ' more';
-                    row.appendChild(overflow);
-                }
+                    if (cropIds.length > MAX_THUMBS) {
+                        var overflow = document.createElement('div');
+                        overflow.className = 'reid-overflow-badge';
+                        var remaining = cropIds.length - MAX_THUMBS;
+                        overflow.textContent = '+' + remaining + ' more';
+                        row.appendChild(overflow);
 
-                section.appendChild(row);
-                gallery.appendChild(section);
+                        var visibleCount = MAX_THUMBS;
+                        overflow.addEventListener('click', function expandMore() {
+                            var nextBatch = Math.min(visibleCount + MAX_THUMBS, cropIds.length);
+                            for (var i = visibleCount; i < nextBatch; i++) {
+                                var w = self._createThumbWrap(cropIds[i]);
+                                row.insertBefore(w, overflow);
+                            }
+                            visibleCount = nextBatch;
+                            var left = cropIds.length - visibleCount;
+                            if (left > 0) {
+                                overflow.textContent = '+' + left + ' more';
+                            } else {
+                                overflow.remove();
+                            }
+                        });
+                    }
+
+                    section.appendChild(row);
+                    gallery.appendChild(section);
+                })(clusterKeys[c], this.clusters[clusterKeys[c]], this);
             }
 
             box.appendChild(gallery);
@@ -826,6 +1818,14 @@ class ReIDUI {
             this._toggleReclusterPanel(box);
         }.bind(this));
         actions.appendChild(btnRecluster);
+
+        var btnVisualPipeline = document.createElement('button');
+        btnVisualPipeline.className = 'btn btn-secondary';
+        btnVisualPipeline.textContent = 'Visual Pipeline';
+        btnVisualPipeline.addEventListener('click', function () {
+            this._runVisualPipeline();
+        }.bind(this));
+        actions.appendChild(btnVisualPipeline);
 
         var btnBack = document.createElement('button');
         btnBack.className = 'btn btn-ghost';
@@ -1041,13 +2041,13 @@ class ReIDUI {
         if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
 
         var key = e.key.toLowerCase();
-        if (key === 'y') {
+        if (key === 'f') {
             e.preventDefault();
             this._resolvePair('same');
-        } else if (key === 'n') {
+        } else if (key === 'j') {
             e.preventDefault();
             this._resolvePair('different');
-        } else if (key === 'u') {
+        } else if (key === ' ') {
             e.preventDefault();
             this._resolvePair('unsure');
         } else if (key === 'arrowleft') {
