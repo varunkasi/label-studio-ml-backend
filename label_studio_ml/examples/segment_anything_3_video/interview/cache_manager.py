@@ -18,7 +18,7 @@ import numpy as np
 
 from .state import (
     CropData, CropLabel, CropSource, InterviewSession, Phase,
-    ReIDPair, SeedConfig,
+    SeedConfig,
 )
 
 logger = logging.getLogger(__name__)
@@ -176,14 +176,6 @@ def save_session(session: InterviewSession) -> None:
         "clusters": {str(k): v for k, v in session.reid_clusters.items()},
         "ufm_complete": session.ufm_complete,
         "ufm_crop_ids": session.ufm_crop_ids,
-        # Legacy fields (backward compat)
-        "pairs": {pid: _pair_to_dict(p) for pid, p in session.reid_pairs.items()},
-        "must_links": [list(pair) for pair in session.reid_must_links],
-        "cannot_links": [list(pair) for pair in session.reid_cannot_links],
-        "phase_stage": session.reid_phase_stage,
-        "visual_reid_proposals": session.visual_reid_proposals,
-        "visual_reid_weights": session.visual_reid_weights,
-        "visual_reid_verdicts_count": session.visual_reid_verdicts_count,
     }
     _write_json(d / "clusters.json", reid_data)
 
@@ -273,19 +265,16 @@ def load_session(cache_key: str) -> Optional[InterviewSession]:
     # Load ReID data
     reid_data = _read_json(d / "clusters.json")
     if reid_data:
+        # Backward compat: discard stale fields from old cache format
+        for stale_key in ("pairs", "must_links", "cannot_links",
+                          "phase_stage", "visual_reid_proposals",
+                          "visual_reid_weights", "visual_reid_verdicts_count"):
+            reid_data.pop(stale_key, None)
+
         clusters = reid_data.get("clusters", {})
         session.reid_clusters = {int(k): v for k, v in clusters.items()}
         session.ufm_complete = reid_data.get("ufm_complete", False)
         session.ufm_crop_ids = reid_data.get("ufm_crop_ids", [])
-        # Legacy fields (backward compat)
-        pairs = reid_data.get("pairs", {})
-        session.reid_pairs = {pid: _pair_from_dict(pdata) for pid, pdata in pairs.items()}
-        session.reid_must_links = [tuple(pair) for pair in reid_data.get("must_links", [])]
-        session.reid_cannot_links = [tuple(pair) for pair in reid_data.get("cannot_links", [])]
-        session.reid_phase_stage = reid_data.get("phase_stage", 1)
-        session.visual_reid_proposals = reid_data.get("visual_reid_proposals", [])
-        session.visual_reid_weights = reid_data.get("visual_reid_weights", {})
-        session.visual_reid_verdicts_count = reid_data.get("visual_reid_verdicts_count", 0)
 
     # Load UFM similarity matrix
     ufm_path = d / "ufm_similarity.npz"
@@ -427,27 +416,3 @@ def _load_features(d: Path, session: InterviewSession) -> None:
         logger.warning("Failed to load features from %s: %s", path, e)
 
 
-def _pair_to_dict(pair: ReIDPair) -> Dict[str, Any]:
-    return {
-        "pair_id": pair.pair_id,
-        "crop_id_a": pair.crop_id_a,
-        "crop_id_b": pair.crop_id_b,
-        "cluster_a": pair.cluster_a,
-        "cluster_b": pair.cluster_b,
-        "pool": pair.pool,
-        "similarity": pair.similarity,
-        "resolution": pair.resolution,
-    }
-
-
-def _pair_from_dict(d: Dict[str, Any]) -> ReIDPair:
-    return ReIDPair(
-        pair_id=d["pair_id"],
-        crop_id_a=d["crop_id_a"],
-        crop_id_b=d["crop_id_b"],
-        cluster_a=d["cluster_a"],
-        cluster_b=d["cluster_b"],
-        pool=d["pool"],
-        similarity=d["similarity"],
-        resolution=d.get("resolution"),
-    )

@@ -99,19 +99,6 @@ class CropData:
 
 
 @dataclass
-class ReIDPair:
-    """A pair of crops presented for identity comparison."""
-    pair_id: str
-    crop_id_a: str
-    crop_id_b: str
-    cluster_a: int
-    cluster_b: int
-    pool: str  # "ambiguous", "confident_same", "confident_different"
-    similarity: float
-    resolution: Optional[str] = None  # "same", "different", "unsure"
-
-
-@dataclass
 class SeedConfig:
     """User-configurable seed generation parameters."""
     frame_pct: int = 100           # % of cached frames to scan (0-100)
@@ -316,16 +303,6 @@ class InterviewSession:
     ufm_crop_ids: List[str] = field(default_factory=list)  # ordered crop IDs matching matrix rows
     ufm_complete: bool = False
     ufm_job_id: Optional[str] = None
-
-    # Legacy ReID fields (kept for backward-compatible cache loading)
-    reid_pairs: Dict[str, ReIDPair] = field(default_factory=dict)
-    reid_round: int = 0
-    reid_phase_stage: int = 1
-    reid_must_links: List[Tuple[str, str]] = field(default_factory=list)
-    reid_cannot_links: List[Tuple[str, str]] = field(default_factory=list)
-    visual_reid_proposals: List[Dict[str, Any]] = field(default_factory=list)
-    visual_reid_weights: Dict[str, float] = field(default_factory=dict)
-    visual_reid_verdicts_count: int = 0
 
     # Seeding
     seed_config: SeedConfig = field(default_factory=SeedConfig)
