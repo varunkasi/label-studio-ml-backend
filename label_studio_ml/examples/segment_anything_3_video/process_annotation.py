@@ -876,8 +876,11 @@ def _cut_all_snippets(
                 keep_frames, source_fps, json_out,
             )
 
+            # ffmpeg -to must be strictly > -ss. A frame at time T occupies
+            # [T, T+1/fps), so extend end_time past the last frame.
+            ffmpeg_et = max(et + 1.0 / source_fps, st + 1.0 / source_fps)
             cut_snippet_video(
-                video_path, st, et, source_fps, target_fps, video_out,
+                video_path, st, ffmpeg_et, source_fps, target_fps, video_out,
             )
 
             pairs.append((video_out, json_out))

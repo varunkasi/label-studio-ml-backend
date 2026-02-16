@@ -58,6 +58,19 @@ from .cache_manager import save_session  # noqa: E402
 logger = logging.getLogger(__name__)
 
 
+def _read_frame_cached_or_pyav(
+    video_path: str,
+    frame_idx: int,
+    cache_key: Optional[str] = None,
+) -> Optional[Image.Image]:
+    """Read a frame via 3-tier cache (LRU → disk → PyAV seek).
+
+    Thin wrapper so callers don't need a local import each time.
+    """
+    from .frame_cache import read_frame_cached
+    return read_frame_cached(video_path, frame_idx, cache_key=cache_key)
+
+
 def _log_rss(tag: str) -> int:
     """Log current RSS (resident set size) in MB and return value."""
     rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
@@ -406,6 +419,7 @@ def _decode_frames_sequential(
     video_path: str,
     frame_indices: List[int],
     max_decode_after_seek: int = _MAX_DECODE_AFTER_SEEK,
+    cache_key: Optional[str] = None,
 ) -> Dict[int, Image.Image]:
     """Decode specific frames using keyframe-seeking for widely-spaced targets.
 
@@ -413,6 +427,9 @@ def _decode_frames_sequential(
     decodes forward to the exact frame.  This avoids decoding every frame
     in the video (which for 30K frames takes ~10 minutes) when only ~40
     uniformly-spaced frames are needed.
+
+    When *cache_key* is provided, the disk frame cache is checked first
+    and only frames not found on disk fall through to PyAV decode.
 
     A safety limit (``max_decode_after_seek``) caps how many frames we
     decode after each seek.  If the target isn't found within that window
@@ -422,6 +439,7 @@ def _decode_frames_sequential(
         video_path:             Path to video file.
         frame_indices:          List of 0-based frame indices to decode (need not be sorted).
         max_decode_after_seek:  Maximum frames to decode after each seek before giving up.
+        cache_key:              Optional session cache key for disk frame cache lookup.
 
     Returns:
         Dict mapping frame_idx -> PIL Image.
@@ -431,6 +449,24 @@ def _decode_frames_sequential(
 
     result: Dict[int, Image.Image] = {}
     sorted_targets = sorted(set(frame_indices))
+
+    # Check disk frame cache first (avoids PyAV seeks for cached frames)
+    if cache_key:
+        from .frame_cache import read_frame_cached
+        still_needed = []
+        for fidx in sorted_targets:
+            img = read_frame_cached(video_path, fidx, cache_key=cache_key)
+            if img is not None:
+                result[fidx] = img
+            else:
+                still_needed.append(fidx)
+        if result:
+            logger.info(
+                "Disk cache hit for %d / %d frames", len(result), len(sorted_targets),
+            )
+        if not still_needed:
+            return result
+        sorted_targets = still_needed
 
     container = av.open(video_path)
     try:
@@ -1114,7 +1150,9 @@ def run_detection_pipeline(
         progress.step = f"Detecting on frame {frame_idx} ({i + 1}/{len(keyframes)})..."
         progress.current = i + 2  # offset by 1 for sampling phase
 
-        pil_image = _read_frame_pyav(session.video_path, frame_idx)
+        pil_image = _read_frame_cached_or_pyav(
+            session.video_path, frame_idx, cache_key=session.cache_key,
+        )
         if pil_image is None:
             logger.warning("Failed to read frame %d, skipping", frame_idx)
             continue
@@ -1203,7 +1241,9 @@ def run_round_detection(
 
     # Step 2: Decode frames (single sequential PyAV pass)
     progress.step = f"Round {round_num}: Decoding {len(frame_indices)} frames..."
-    frame_images = _decode_frames_sequential(session.video_path, frame_indices)
+    frame_images = _decode_frames_sequential(
+        session.video_path, frame_indices, cache_key=session.cache_key,
+    )
     if not frame_images:
         raise RuntimeError(f"Failed to decode frames for round {round_num}")
     progress.current = 2
@@ -1244,7 +1284,9 @@ def run_round_detection(
         val_frame_indices = select_validation_frames(session)
         if val_frame_indices:
             progress.step = f"Round 1: Detecting on {len(val_frame_indices)} validation frames..."
-            val_frame_images = _decode_frames_sequential(session.video_path, val_frame_indices)
+            val_frame_images = _decode_frames_sequential(
+                session.video_path, val_frame_indices, cache_key=session.cache_key,
+            )
             if val_frame_images:
                 val_detector = Sam3TextBasedDetector()
                 val_crops = _detect_batch(
@@ -1455,7 +1497,9 @@ def _run_multi_prompt_strategy(
             )
             progress.current = step_counter
 
-            pil_image = _read_frame_pyav(session.video_path, frame_idx)
+            pil_image = _read_frame_cached_or_pyav(
+                session.video_path, frame_idx, cache_key=session.cache_key,
+            )
             if pil_image is None:
                 continue
 

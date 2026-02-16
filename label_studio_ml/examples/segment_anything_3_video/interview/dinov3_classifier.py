@@ -237,8 +237,9 @@ def _ensure_crop_features(
     # Try LRU cache first, batch-decode the rest
     frame_images: Dict[int, Image.Image] = {}
     uncached: List[int] = []
+    _ck = getattr(session, "cache_key", None)
     for fidx in sorted(frame_to_cids.keys()):
-        cached = read_frame_cached(session.video_path, fidx)
+        cached = read_frame_cached(session.video_path, fidx, cache_key=_ck)
         if cached is not None:
             frame_images[fidx] = cached
         else:
@@ -246,7 +247,7 @@ def _ensure_crop_features(
 
     if uncached:
         from .detection import _decode_frames_sequential
-        decoded = _decode_frames_sequential(session.video_path, uncached)
+        decoded = _decode_frames_sequential(session.video_path, uncached, cache_key=_ck)
         frame_images.update(decoded)
         # Populate the LRU cache with newly decoded frames
         from .frame_cache import put_cached_frame

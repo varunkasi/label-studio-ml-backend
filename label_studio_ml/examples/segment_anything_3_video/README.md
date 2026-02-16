@@ -167,7 +167,7 @@ The Interview UI is a browser-based active learning workflow for generating seed
 | **Init** | Create session with project/task IDs | Enter LS project + task ID |
 | **Detection** | Stage 1: SAM3 text detection on ~40 uniform keyframes (~30-60s). Stage 2: FPS-capped background embeddings with incremental change detection (paused during training). Round 2+ samples from change-detected keyframes | Review detected crops as they appear |
 | **Classification** | MLP quality-gate classifier trains on accepted/rejected crops with warm-start weights + LR decay. Active learning picks most uncertain crops for next labeling round. Click "Finish Labeling → ReID" after round 1+ to proceed | Label crops: Accept (good box) / Reject (bad box or not target) / Skip (ambiguous) |
-| **ReID** | Auto-prompts "Start Clustering" on entry. Spherical K-means on DINOv3 features + color histograms. Calibrated pair sampling (60% ambiguous, 20% confident same, 20% confident different) | Judge pairs: same person / different / unsure |
+| **ReID** | Three-phase centroid-growing pipeline: **Phase 1** (centroid building) — human judges crop pairs to accumulate must-links; confirmed "same" crops are averaged into strong cluster centroids. **Phase 2** (ambiguous resolution) — unassigned crops are compared against Phase 1 centroids; decisive matches auto-assign, ambiguous cases go to human. **Phase 3** (done) — summary view with expandable cluster thumbnails. Constraint-based clustering (COP-KMeans) respects must-links and cannot-links across re-clusters | Judge pairs: same person / different / unsure |
 | **Seeding** | Three-path dual-proposer pipeline generates dense seeds across all frames, filtered by MLP quality gate. Guards against missing ReID clusters. Upload to Label Studio | Configure frame interval + confidence threshold, review + upload |
 
 After upload, seeds are created with `enabled=false` keyframes in Label Studio. Run the tracking CLI to fill gaps:
@@ -190,7 +190,19 @@ docker compose exec segment_anything_3_video python /app/initial_seeding_video_b
 Detection runs in two decoupled stages so the user can start labeling immediately:
 
 1. **Stage 1 (fast, ~30-60s):** Selects ~40 uniformly-spaced keyframes, batch-decodes them via PyAV, runs SAM3 text detection in GPU batches, stores crops on the session. User sees crops and can start labeling.
-2. **Stage 2 (background, ~3-5 min):** GPU-batched SAM3 frame embeddings with prefetch threading. Computes temporal change scores and selects change-detected keyframes for active learning rounds. A progress banner shows completion in the UI.
+2. **Stage 2 (background, ~3-5 min):** GPU-batched SAM3 frame embeddings with prefetch threading. Computes temporal change scores and selects change-detected keyframes for active learning rounds. A progress banner shows completion in the UI. Decoded frames are saved to the disk frame cache for reuse by later phases.
+
+### 3-Tier Frame Cache
+
+Frame access uses a three-tier cache hierarchy to avoid redundant video decoding:
+
+| Tier | Location | Speed | Persistence |
+|------|----------|-------|-------------|
+| **1. LRU memory** (`frame_cache.py`) | OrderedDict, ~64 entries | Instant | Per-process (lost on restart) |
+| **2. Disk JPEG** (`disk_frame_cache.py`) | `/data/adapters/{cache_key}/frames/` | ~ms seek | Survives restarts (volume-mounted) |
+| **3. PyAV seek** (`seeding_common._read_frame_pyav`) | Video container seek | ~10-50ms | N/A (source video) |
+
+During background embedding (Stage 2), frames are decoded once and written to tier 2. All subsequent reads (change detection, seeding, UI crop display) go through `read_frame_cached()` which checks tiers 1→2→3 in order. Disk frame cache is ~6-10 GB per video at 10 FPS.
 
 ### Seeding Pipeline (Dual-Proposer)
 
@@ -216,6 +228,20 @@ The MLP classifier acts as a **quality gate** during dense seeding. It does NOT 
 
 **Critical distinction:** A person partially visible in the frame (walking out of frame edge) with a tight box around whatever IS visible is **Accept**. A person fully visible but only partially boxed is **Reject**. The judgment is always relative to what's visible.
 
+### ReID: Centroid-Growing Pipeline
+
+Re-identification uses a three-phase elicitation strategy designed to build strong identity centroids with minimal human effort:
+
+| Phase | Goal | Elicitation strategy | Outcome |
+|-------|------|---------------------|---------|
+| **1. Centroid building** | Accumulate must-links per cluster | Pairs chosen to maximize "same" confirmations across diverse clusters early | Confirmed crops averaged into reliable centroids |
+| **2. Ambiguous resolution** | Assign remaining crops to centroids | Compare unassigned crops against Phase 1 centroids; decisive matches auto-assign, ambiguous cases shown to human | All crops either assigned or flagged as new identity |
+| **3. Done** | Summary view | Expandable cluster thumbnails with "+N more" | Final identity clusters ready for seeding |
+
+**Constraints**: Human "same" verdicts create must-links, "different" create cannot-links. These persist across re-clusters (stored in `session.reid_must_links` / `reid_cannot_links`). COP-KMeans respects constraints when re-clustering. Centroid computation only uses confirmed (must-linked) members — clusters with no confirmed members are skipped during Phase 2 assignment.
+
+**Keyboard shortcuts**: `1` = same, `2` = different, `3` = unsure (configurable).
+
 ### Backend Modules
 
 | Module | Purpose |
@@ -226,9 +252,13 @@ The MLP classifier acts as a **quality gate** during dense seeding. It does NOT 
 | `interview/cache_manager.py` | Disk persistence for sessions, features, models, embedding indices |
 | `interview/detection.py` | Two-stage detection pipeline: batch SAM3 inference + FPS-capped background embeddings with incremental change detection |
 | `interview/dinov3_classifier.py` | DINOv3 feature extraction (batch decode + LRU cache), MLP quality-gate classifier with feature-level augmentation |
-| `interview/frame_cache.py` | Shared LRU frame cache (avoids circular imports between routes and classifier) |
 | `interview/mask_utils.py` | Mask-quality feature computation (fill ratio, edge contact, compactness) and LR decay |
-| `interview/reid_phase.py` | Spherical K-means clustering, calibrated pair sampling, burden-of-proof merge |
+| `interview/frame_cache.py` | Shared LRU frame cache (in-memory, ~64 entries) — tier 1 of 3-tier cache hierarchy |
+| `interview/disk_frame_cache.py` | Disk-based JPEG frame cache under `/data/adapters/{cache_key}/frames/` — tier 2 of 3-tier cache; populated during background embedding, reused by change detection, seeding, and UI |
+| `interview/reid_phase.py` | Three-phase centroid-growing ReID: COP-KMeans with must-link/cannot-link constraints, centroid averaging for confirmed crops, Phase 1→2→3 elicitation pipeline |
+| `interview/reid_pipeline.py` | Visual ReID pipeline — multi-cue enrichment (appearance, spatial, color, temporal), over-clustering, merge proposal scoring, weight learning from human feedback |
+| `interview/reid_ufm.py` | UFM (Universal Feature Model) pairwise similarity computation for ReID |
+| `interview/ufm_model.py` | UFM model definition and inference |
 | `interview/seeding_phase.py` | Three-path dual-proposer dense seeding + Label Studio upload |
 
 ### Interview Environment Variables
@@ -245,9 +275,13 @@ The MLP classifier acts as a **quality gate** during dense seeding. It does NOT 
 | `INTERVIEW_SEED_CHUNK_SIZE` | `100` | Frames per processing chunk in seeding |
 | `INTERVIEW_EMBEDDING_FPS` | `10` | FPS cap for background embedding (subsamples to this rate) |
 | `INTERVIEW_EMBEDDING_BATCH` | `64` | Batch size for SAM3 frame embedding |
-| `INTERVIEW_DETECT_BATCH` | `16` | Batch size for SAM3 text detection |
+| `INTERVIEW_DETECT_BATCH` | `8` | Batch size for SAM3 text detection |
 | `INTERVIEW_LR_DECAY` | `0.7` | Per-round learning rate decay factor for MLP classifier |
 | `INTERVIEW_FRAME_CACHE_SIZE` | `64` | LRU frame cache entries (~6 MB each) |
+| `INTERVIEW_FRAMES_PER_ROUND` | `40` | Frames selected per active learning round |
+| `INTERVIEW_VALIDATION_FRAMES` | `20` | Held-out frames for MLP validation accuracy tracking |
+| `INTERVIEW_CACHE_ROOT` | `/data/adapters` | Root directory for disk persistence (sessions, frames, models) |
+| `INTERVIEW_EMBEDDING_MODE` | `lightweight` | Embedding strategy: `lightweight` (change-detection) or `full` |
 
 ## Configuration
 
@@ -401,6 +435,9 @@ docker compose exec segment_anything_3_video python /app/initial_seeding_video_b
 | `--score-threshold` | No | `0.1` | Minimum `object_score_logits` sigmoid score; 3 consecutive frames below this terminates tracking |
 | `--enable-oracle` | No | `False` | Run Sam3VideoModel text detection per window to cross-check tracker output |
 | `--oracle-stride` | No | `30` | Check every N-th frame with the oracle (lower = more thorough, slower) |
+| `--forward-only` | No | `False` | Skip backward tracking (forward pass only) |
+| `--streaming` | No | `False` | Streaming mode: constant-memory forward tracking (implies `--forward-only`) |
+| `--streaming-chunk-size` | No | `2000` | Max frames per SAM3 session in streaming mode before GPU memory reset |
 | `--no-refine-seeds` | No | — | Disable seed box refinement (enabled by default) |
 | `--refine-search-scale` | No | `1.3` | Search scale for refinement (1.3 = 30% expansion) |
 | `--dump-payload` | No | `None` | Path to write submission payload JSON before upload |
@@ -411,6 +448,39 @@ docker compose exec segment_anything_3_video python /app/initial_seeding_video_b
 **Performance:** Seeds at the same keyframe are tracked in a single batched session (multi-object `obj_ids`), so the vision encoder runs once per direction per keyframe window instead of once per seed. This gives ~Nx speedup where N is the average seeds per keyframe.
 
 **Submission behavior:** If `--track-id`, `--global-start`, and `--global-end` are all provided, the script patches the existing annotation; otherwise it creates a new prediction.
+
+#### Streaming mode
+
+Use `--streaming` for long videos (thousands of frames) where loading all frames into memory would OOM. Streaming mode:
+
+- Processes frames one at a time via PyAV (constant memory)
+- Groups all keyframes for the same `--track-id` region into a single pass
+- First keyframe = seed, all subsequent keyframes = **drift-correction anchors** injected via `add_inputs_to_inference_session` as the tracker reaches each frame
+- GPU temporal memory is bounded by `--streaming-chunk-size`: after that many frames, the SAM3 session is destroyed and re-created with the last tracked box
+
+**Drift correction:** When a region has multiple keyframes (e.g., human annotations at frames 100, 500, 1200), streaming mode uses the first as the seed and injects the rest as corrections. At each correction frame, the tracker re-anchors to the human box, preventing accumulated drift over long ranges.
+
+**GPU memory per chunk** (measured with SAM3 `facebook/sam3`):
+- Model weights: ~2.6 GB (fixed)
+- Per-frame temporal memory: ~8.7 MB (linear growth)
+- Formula: `total ≈ 2.6 + (chunk_size × 0.0087)` GB
+
+| GPU | VRAM | Safe `--streaming-chunk-size` |
+|-----|------|-------------------------------|
+| RTX 6000 Ada | 49 GB | 5000 |
+| A100 (40 GB) | 40 GB | 4000 |
+| A100 / H100 (80 GB) | 80 GB | 8000 |
+
+**Example (long-range streaming with stride):**
+```bash
+docker compose exec segment_anything_3_video python /app/initial_seeding_video_boxes_manual_merge.py \
+  --ls-url "$LABEL_STUDIO_HOST" --ls-api-key "$LABEL_STUDIO_API_KEY" \
+  --project 123 --task 456 --annotation 789 \
+  --track-id=4NeFy4BYus --global-start 16650 --global-end 23639 \
+  --streaming --streaming-chunk-size 5000 --frame-stride 3
+```
+
+This tracks every 3rd frame (plus all correction keyframes) with 5000-frame GPU memory chunks.
 
 ### 3. Simple Forward Tracking (`cli.py`)
 
@@ -478,7 +548,7 @@ docker compose exec segment_anything_3_video python /app/video_tools.py sparsify
 | `--track-id` | Yes | — | Region track ID (e.g., auto-track-0) |
 | `--start-frame` | Yes | — | Start frame (1-based) |
 | `--end-frame` | Yes | — | End frame (1-based) |
-| `--ratio` | Yes | — | Fraction of frames to keep (0,1] |
+| `--ratio` | Yes | — | Fraction of frames to keep [0,1]. Use `0` to remove ALL keyframes in range. |
 
 **Swap IDs (Fix Identity Switches)**
 
@@ -793,31 +863,42 @@ All CLI tools now run in the `segment_anything_3_video` container. OpenCV (cv2) 
 Tests run without GPU or model weights using lightweight mocks. All tests are in the `segment_anything_3_video/` directory.
 
 ```bash
-# Run all tests (134 total)
-python -m pytest test_interview_detection.py test_tracking_fixes.py test_process_annotation.py -v
+# Run all tests (476 total)
+python -m pytest test_*.py -v
 
-# Detection + Interview tests only (57 tests)
-python -m pytest test_interview_detection.py -v
+# Interview pipeline tests (core)
+python -m pytest test_interview_detection.py test_interview_reid.py test_constraint_reid.py -v
 
-# Tracking tests only (25 tests)
-python -m pytest test_tracking_fixes.py -v
+# Tracking + CLI tests
+python -m pytest test_tracking_fixes.py test_cli.py -v
 
-# Annotation pipeline tests only (52 tests)
-python -m pytest test_process_annotation.py -v
+# Annotation pipeline tests
+python -m pytest test_process_annotation.py test_extract_snippet_masks.py -v
 ```
 
 | Test file | Tests | Coverage |
 |-----------|-------|----------|
-| `test_interview_detection.py` | 57 | NMS, batch detection, embedding pipeline, dual-proposer seeding (3 paths), mock isolation |
-| `test_tracking_fixes.py` | 25 | Seed frame handling, score extraction, early termination, oracle validation, batched sessions |
+| `test_interview_detection.py` | 106 | NMS, batch detection, embedding pipeline, dual-proposer seeding (3 paths), frame cache integration, mock isolation |
+| `test_interview_reid.py` | 64 | Fused similarity, spherical K-means, pair sampling, burden-of-proof policy, validation crops |
+| `test_constraint_reid.py` | 57 | COP-KMeans, must-link/cannot-link constraints, centroid averaging, phase transitions, apply_resolutions |
+| `test_tracking_fixes.py` | 40 | Seed frame handling, score extraction, early termination, oracle validation, batched sessions, streaming mode, correction keyframes |
 | `test_process_annotation.py` | 52 | Export API, annotation extraction (4 formats), summary generation, FPS resampling, bbox JSON, snippet cutting, end-to-end pipeline |
+| `test_cli.py` | 38 | CLI argument parsing, model invocation, SAM3 integration |
+| `test_interview_state.py` | 26 | Session state, crop CRUD, phase transitions |
+| `test_interview_cache.py` | 14 | Disk persistence, save/load round-trip, cache invalidation |
+| `test_interview_background.py` | 9 | Background job executor, pause/resume, progress polling |
+| `test_extract_snippet_masks.py` | 25 | SAM3 mask extraction, ffmpeg encoding |
+| `test_seed_frame_pct.py` | 20 | Frame percentage slider, seeding frame selection |
+| `test_disk_frame_cache.py` | 16 | 3-tier cache hierarchy, JPEG read/write, cache reuse |
+| `test_lightweight_change.py` | 14 | Change-detection keyframe scoring |
+| `test_reid_keybindings.py` | 10 | ReID keyboard shortcuts (1/2/3 for same/different/unsure) |
 
 ## Known Limitations
 
 - SAM3 is designed to run on GPU servers; CPU execution is not recommended for practical video workloads.
 - Currently, we do not support video segmentation (only bounding boxes).
 - For very long videos (40,000+ frames), tracking may take significant time. Consider using `MAX_FRAMES_TO_TRACK` to process in chunks.
-- The Interview UI stores sessions in memory; they are lost on container restart unless disk persistence is enabled via `cache_manager.py`.
+- The Interview UI persists sessions to disk via `cache_manager.py` under `/data/adapters/`. Sessions survive container restarts when the volume is mounted. Frame cache (decoded JPEGs) is also stored on disk and reused across restarts.
 
 ## Customization
 

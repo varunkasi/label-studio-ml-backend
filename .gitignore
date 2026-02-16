@@ -159,3 +159,11 @@ label_studio_ml/examples/segment_anything_2_video/update_video_paths.py
 label_studio_ml/examples/segment_anything_3_video/snippets_proj225156_task245567455_ann85565349_20260203T174550Z/*
 label_studio_ml/examples/segment_anything_3_video/snippets_proj225156_task245567456_ann85575507_20260203T181511Z/*
 label_studio_ml/examples/segment_anything_3_video/snippets_proj225664_task245750644_ann85399073_20260201T204055Z/*
+
+*mask*.png
+*casualty_*.mp4
+*casualty_*.json
+*scores.json
+*test_*.py
+
+*project*_task*.json

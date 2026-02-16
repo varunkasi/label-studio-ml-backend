@@ -98,6 +98,34 @@ const API = {
             throw err;
         }
     },
+
+    /**
+     * DELETE with JSON body.
+     * @param {string} path - Relative path.
+     * @param {Object} data - JSON body.
+     * @returns {Promise<Object>} Parsed JSON response.
+     */
+    async delete_(path, data) {
+        try {
+            const res = await fetch(`${this.base}${path}`, {
+                method: 'DELETE',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(data),
+            });
+            const json = await res.json();
+            if (!res.ok) {
+                const msg = json.error || `Request failed (${res.status})`;
+                showToast(msg, 'error');
+                throw new Error(msg);
+            }
+            return json;
+        } catch (err) {
+            if (!err.message.includes('Request failed')) {
+                showToast(`Network error: ${err.message}`, 'error');
+            }
+            throw err;
+        }
+    },
 };
 
 // ---------------------------------------------------------------------------
@@ -404,126 +432,261 @@ async function _onCheckCache() {
 }
 
 /**
- * Show cache options (Resume / Build On / Fresh) and start buttons.
+ * Show cache options split into two cards: Session State and Frame Cache.
  * @param {Object} result - Response from session/init.
  */
 function _renderCacheOptions(result) {
-    const infoEl = document.getElementById('setup-cache-info');
-    const actionsEl = document.getElementById('setup-actions');
+    var infoEl = document.getElementById('setup-cache-info');
+    var actionsEl = document.getElementById('setup-actions');
 
     infoEl.classList.remove('hidden');
+    infoEl.innerHTML = '';
     actionsEl.innerHTML = '';
 
-    if (result.has_cache) {
-        let cacheText = 'Existing cache found for this task.';
-        if (result.has_frame_cache) {
-            cacheText += ` Frame cache: ${result.frame_cache_size} (${result.frame_cache_frames.toLocaleString()} frames).`;
-        }
-        infoEl.textContent = cacheText;
+    // ------------------------------------------------------------------
+    // Card 1: Session State
+    // ------------------------------------------------------------------
+    var sessionCard = document.createElement('div');
+    sessionCard.style.cssText =
+        'padding:12px 16px;margin-bottom:12px;' +
+        'background:var(--bg-surface);border:1px solid var(--border-default);' +
+        'border-radius:var(--radius-sm);';
 
-        const resumeBtn = document.createElement('button');
+    var sessionHeader = document.createElement('div');
+    sessionHeader.style.cssText =
+        'font-size:0.75rem;font-weight:600;text-transform:uppercase;' +
+        'letter-spacing:0.05em;color:var(--text-secondary);margin-bottom:8px;';
+    sessionHeader.textContent = 'Session State';
+    sessionCard.appendChild(sessionHeader);
+
+    var sessionInfo = document.createElement('div');
+    sessionInfo.style.cssText = 'font-size:0.85rem;margin-bottom:10px;';
+
+    var sessionBtns = document.createElement('div');
+    sessionBtns.className = 'session-actions';
+    sessionBtns.style.marginTop = '8px';
+
+    if (result.has_cache) {
+        sessionInfo.textContent = 'Existing session cache found (config, crops, model, clusters).';
+
+        var resumeBtn = document.createElement('button');
         resumeBtn.className = 'btn btn-secondary';
         resumeBtn.textContent = 'Resume';
-        resumeBtn.addEventListener('click', () => _startSession('resume'));
-        actionsEl.appendChild(resumeBtn);
+        resumeBtn.title = 'Continue exactly where you left off — same phase, same crops, same model.';
+        resumeBtn.addEventListener('click', function () { _startSession('resume'); });
+        sessionBtns.appendChild(resumeBtn);
 
-        const buildBtn = document.createElement('button');
+        var buildBtn = document.createElement('button');
         buildBtn.className = 'btn btn-secondary';
         buildBtn.textContent = 'Build On';
-        buildBtn.addEventListener('click', () => _startSession('build_on'));
-        actionsEl.appendChild(buildBtn);
+        buildBtn.title = 'Keep crops, labels, and trained model but restart from the detection phase to add more rounds.';
+        buildBtn.addEventListener('click', function () { _startSession('build_on'); });
+        sessionBtns.appendChild(buildBtn);
 
-        const freshBtn = document.createElement('button');
+        var freshBtn = document.createElement('button');
         freshBtn.className = 'btn btn-primary';
         freshBtn.textContent = 'Fresh Start';
-        freshBtn.addEventListener('click', async () => {
-            const confirmed = await Modal.confirm(
+        freshBtn.title = 'Delete all session data (crops, model, clusters) and start over. Frame cache can be kept.';
+        freshBtn.addEventListener('click', async function () {
+            var confirmed = await Modal.confirm(
                 'Fresh Start',
-                'This will delete the existing cache. Continue?'
+                'This will delete the session state (config, crops, model, clusters). Continue?'
             );
-            if (confirmed) _startSession('fresh');
+            if (confirmed) {
+                // Check if user wants to keep frame cache
+                var keepCb = document.getElementById('keep-frame-cache-cb');
+                var keepFrames = keepCb ? keepCb.checked : false;
+                _startSession('fresh', keepFrames);
+            }
         });
-        actionsEl.appendChild(freshBtn);
+        sessionBtns.appendChild(freshBtn);
     } else if (result.other_caches && result.other_caches.length > 0) {
-        infoEl.textContent = 'Other task caches found in this project.';
+        sessionInfo.textContent = 'No cache for this task. Other task caches found in this project.';
 
-        result.other_caches.forEach((cache) => {
-            const btn = document.createElement('button');
+        result.other_caches.forEach(function (cache) {
+            var btn = document.createElement('button');
             btn.className = 'btn btn-secondary';
-            btn.textContent = `Use from Task ${cache.task_id}`;
-            btn.addEventListener('click', () => _startSession(`use_from_${cache.task_id}`));
-            actionsEl.appendChild(btn);
+            btn.textContent = 'Use from Task ' + cache.task_id;
+            btn.addEventListener('click', function () {
+                _startSession('use_from_' + cache.task_id);
+            });
+            sessionBtns.appendChild(btn);
         });
 
-        const freshBtn = document.createElement('button');
-        freshBtn.className = 'btn btn-primary';
-        freshBtn.textContent = 'Fresh Start';
-        freshBtn.addEventListener('click', () => _startSession('fresh'));
-        actionsEl.appendChild(freshBtn);
+        var freshBtn2 = document.createElement('button');
+        freshBtn2.className = 'btn btn-primary';
+        freshBtn2.textContent = 'Fresh Start';
+        freshBtn2.addEventListener('click', function () { _startSession('fresh'); });
+        sessionBtns.appendChild(freshBtn2);
     } else {
-        infoEl.textContent = 'No existing cache. Starting fresh.';
+        sessionInfo.textContent = 'No existing session cache.';
 
-        const startBtn = document.createElement('button');
+        var startBtn = document.createElement('button');
         startBtn.className = 'btn btn-primary';
         startBtn.textContent = 'Start';
-        startBtn.addEventListener('click', () => _startSession('fresh'));
-        actionsEl.appendChild(startBtn);
+        startBtn.addEventListener('click', function () { _startSession('fresh'); });
+        sessionBtns.appendChild(startBtn);
     }
 
-    // Show global disk frame cache usage
-    _fetchDiskUsage(actionsEl);
+    sessionCard.appendChild(sessionInfo);
+    sessionCard.appendChild(sessionBtns);
+    infoEl.appendChild(sessionCard);
+
+    // ------------------------------------------------------------------
+    // Card 2: Frame Cache
+    // ------------------------------------------------------------------
+    _renderFrameCacheCard(infoEl, result);
 }
 
 /**
- * Fetch and display total disk frame cache usage below the action buttons.
- * @param {HTMLElement} parentEl - Element to append the info card to.
+ * Render the Frame Cache card showing this-task info, global usage,
+ * keep-on-fresh checkbox, and delete button.
+ * @param {HTMLElement} parentEl
+ * @param {Object} result - session/init response
  */
-async function _fetchDiskUsage(parentEl) {
-    try {
-        const data = await API.get('/disk_usage');
-        if (data.total_bytes > 0) {
-            const card = document.createElement('div');
-            card.style.cssText =
-                'margin-top:16px;padding:10px 14px;font-size:0.8rem;' +
-                'color:var(--text-secondary);background:var(--bg-surface);' +
-                'border:1px solid var(--border-default);border-radius:var(--radius-sm);';
-            card.textContent =
-                `Frame Cache: ${data.total_human} ` +
-                `(${data.sessions_cached} video${data.sessions_cached !== 1 ? 's' : ''} cached)`;
-            parentEl.parentNode.appendChild(card);
-        }
-    } catch (err) {
-        // Non-critical — silently ignore
+async function _renderFrameCacheCard(parentEl, result) {
+    var card = document.createElement('div');
+    card.style.cssText =
+        'padding:12px 16px;' +
+        'background:var(--bg-surface);border:1px solid var(--border-default);' +
+        'border-radius:var(--radius-sm);';
+
+    var header = document.createElement('div');
+    header.style.cssText =
+        'font-size:0.75rem;font-weight:600;text-transform:uppercase;' +
+        'letter-spacing:0.05em;color:var(--text-secondary);margin-bottom:8px;';
+    header.textContent = 'Frame Cache';
+    card.appendChild(header);
+
+    var info = document.createElement('div');
+    info.style.cssText = 'font-size:0.85rem;margin-bottom:8px;';
+
+    // This-task frame cache info
+    if (result.has_frame_cache) {
+        info.innerHTML =
+            'This task: <strong>' + result.frame_cache_size + '</strong>' +
+            ' (' + result.frame_cache_frames.toLocaleString() + ' decoded frames)';
+    } else {
+        info.textContent = 'No frame cache for this task. Will be created during detection.';
     }
+    card.appendChild(info);
+
+    // Global disk usage (async)
+    var globalLine = document.createElement('div');
+    globalLine.style.cssText = 'font-size:0.8rem;color:var(--text-secondary);margin-bottom:10px;';
+    globalLine.textContent = '';
+    card.appendChild(globalLine);
+
+    try {
+        var data = await API.get('/disk_usage');
+        if (data.total_bytes > 0) {
+            globalLine.textContent =
+                'Total across all tasks: ' + data.total_human +
+                ' (' + data.sessions_cached +
+                ' video' + (data.sessions_cached !== 1 ? 's' : '') + ' cached)';
+        }
+    } catch (err) { /* non-critical */ }
+
+    // Controls row
+    var controls = document.createElement('div');
+    controls.style.cssText = 'display:flex;align-items:center;gap:16px;flex-wrap:wrap;';
+
+    // Keep frame cache checkbox (only relevant if session cache exists)
+    if (result.has_cache && result.has_frame_cache) {
+        var label = document.createElement('label');
+        label.style.cssText =
+            'display:flex;align-items:center;gap:6px;font-size:0.8rem;cursor:pointer;';
+        var cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.id = 'keep-frame-cache-cb';
+        cb.checked = true;  // default: keep frames
+        label.appendChild(cb);
+        label.appendChild(document.createTextNode('Keep on Fresh Start'));
+        controls.appendChild(label);
+    }
+
+    // Delete frame cache button (only if frame cache exists)
+    if (result.has_frame_cache) {
+        var delBtn = document.createElement('button');
+        delBtn.className = 'btn btn-ghost';
+        delBtn.style.cssText = 'font-size:0.8rem;margin-left:auto;';
+        delBtn.textContent = 'Delete Frame Cache';
+        delBtn.addEventListener('click', async function () {
+            var confirmed = await Modal.confirm(
+                'Delete Frame Cache',
+                'Delete ' + result.frame_cache_size +
+                ' of decoded frames? They will be re-created on next detection run.'
+            );
+            if (confirmed) {
+                try {
+                    await API.delete_('/frame_cache', {
+                        cache_key: result.cache_key,
+                    });
+                    showToast('Frame cache deleted', 'success');
+                    // Refresh cache options
+                    _onCheckCache();
+                } catch (err) {
+                    showToast('Failed to delete frame cache: ' + err.message, 'error');
+                }
+            }
+        });
+        controls.appendChild(delBtn);
+    }
+
+    if (controls.childNodes.length > 0) {
+        card.appendChild(controls);
+    }
+
+    parentEl.appendChild(card);
 }
 
 /**
  * Create/resume session, fetch video info, run detection, then navigate.
  * @param {string} mode - 'resume', 'build_on', 'fresh', or 'use_from_<id>'.
+ * @param {boolean} [keepFrameCache=false] - Preserve disk frame cache on fresh start.
  */
-async function _startSession(mode) {
-    const actionsEl = document.getElementById('setup-actions');
-    const progressEl = document.getElementById('setup-progress');
+async function _startSession(mode, keepFrameCache) {
+    var actionsEl = document.getElementById('setup-actions');
+    var progressEl = document.getElementById('setup-progress');
 
     // Disable buttons
-    actionsEl.querySelectorAll('.btn').forEach((b) => (b.disabled = true));
+    actionsEl.querySelectorAll('.btn').forEach(function (b) { b.disabled = true; });
     progressEl.classList.remove('hidden');
     progressEl.textContent = 'Initializing session...';
 
     try {
         // 1) Resume or create session
-        const sessionResult = await API.post('/session/resume', {
+        var payload = {
             project_id: AppState.projectId,
             task_id: AppState.taskId,
             annotation_id: AppState.annotationId,
-            mode,
-        });
+            mode: mode,
+        };
+        if (mode === 'fresh' && keepFrameCache) {
+            payload.keep_frame_cache = true;
+        }
+        var sessionResult = await API.post('/session/resume', payload);
 
         AppState.sessionId = sessionResult.session_id;
         AppState.stats = sessionResult;
 
         // If resuming into an advanced phase, go directly there
         if (mode === 'resume' && sessionResult.phase && sessionResult.phase !== 'init') {
+            // Re-download video if file was lost (e.g. container rebuild)
+            if (sessionResult.needs_video_info) {
+                progressEl.textContent = 'Re-downloading video file...';
+                var reVideoJob = await API.post('/session/' + AppState.sessionId + '/video_info', {});
+                await new Promise(function (resolve, reject) {
+                    pollJob(
+                        reVideoJob.job_id,
+                        function (p) { progressEl.textContent = p.step || 'Re-downloading video...'; },
+                        function (p) {
+                            if (p.status === 'failed') reject(new Error(p.error || 'Video download failed'));
+                            else resolve(p);
+                        }
+                    );
+                });
+            }
             _applyStats(sessionResult);
             showToast('Session resumed', 'success');
             navigate(sessionResult.phase);
@@ -1114,252 +1277,13 @@ function renderReID(app) {
         return;
     }
 
-    // Fallback: basic ReID interface
-    _renderReIDFallback(app);
-}
-
-/** Basic ReID interface when reid_ui.js is not loaded. */
-function _renderReIDFallback(app) {
+    // Fallback: reid_ui.js not loaded
     const panel = document.createElement('div');
-    panel.className = 'reid-panel';
-    panel.style.minWidth = '0';
-    panel.style.display = 'flex';
-    panel.style.flexDirection = 'column';
-    panel.style.gap = '16px';
-    panel.style.maxWidth = '1200px';
-    panel.style.margin = '0 auto';
-
-    // Header with start button
-    const header = document.createElement('div');
-    header.style.cssText = 'display:flex;align-items:center;gap:16px;';
-    header.innerHTML = '<h2 style="font-size:1.1rem;">Re-Identification</h2>';
-
-    const startBtn = document.createElement('button');
-    startBtn.className = 'btn btn-primary';
-    startBtn.textContent = 'Start Clustering';
-    startBtn.addEventListener('click', () => _startReIDClustering(panel));
-    header.appendChild(startBtn);
-
-    const advanceBtn = document.createElement('button');
-    advanceBtn.className = 'btn btn-secondary';
-    advanceBtn.textContent = 'Skip to Seeding';
-    advanceBtn.addEventListener('click', () => navigate('seeding'));
-    header.appendChild(advanceBtn);
-
-    panel.appendChild(header);
-
-    // Comparison area (populated after clustering)
-    const compArea = document.createElement('div');
-    compArea.id = 'reid-comparison-area';
-    panel.appendChild(compArea);
-
+    panel.style.cssText = 'padding:40px;text-align:center;';
+    panel.innerHTML =
+        '<h2>Re-Identification</h2>' +
+        '<p style="color:var(--text-secondary);">reid_ui.js is required but was not loaded.</p>';
     app.appendChild(panel);
-}
-
-/** Start the ReID clustering job and then show pairs. */
-async function _startReIDClustering(container) {
-    try {
-        showToast('Starting ReID clustering...', 'info');
-
-        const job = await API.post('/reid/start', {
-            session_id: AppState.sessionId,
-        });
-
-        pollJob(
-            job.job_id,
-            (p) => {
-                // Could show inline progress here
-            },
-            async (p) => {
-                if (p.status === 'completed') {
-                    showToast('Clustering complete', 'success');
-                    await _loadReIDPairs();
-                } else {
-                    showToast(`Clustering failed: ${p.error}`, 'error');
-                }
-            }
-        );
-    } catch (err) {
-        // Already toasted
-    }
-}
-
-/** Load ReID pairs and render the comparison UI. */
-async function _loadReIDPairs() {
-    try {
-        const data = await API.get('/reid/clusters', {
-            session_id: AppState.sessionId,
-        });
-
-        AppState._reidData = data;
-        AppState._reidPairIndex = 0;
-
-        const area = document.getElementById('reid-comparison-area');
-        if (!area) return;
-        area.innerHTML = '';
-
-        const info = document.createElement('div');
-        info.style.cssText = 'font-size:0.8rem;color:var(--text-secondary);margin-bottom:12px;';
-        info.textContent =
-            `${data.n_identities} identities estimated | ` +
-            `${data.total_pairs} pairs total | ` +
-            `${data.unresolved_pairs.length} unresolved`;
-        area.appendChild(info);
-
-        if (data.unresolved_pairs.length > 0) {
-            _renderReIDPair(area, data.unresolved_pairs, 0);
-        } else {
-            const done = document.createElement('p');
-            done.style.color = 'var(--color-accepted)';
-            done.textContent = 'All pairs resolved. Ready for seeding.';
-            area.appendChild(done);
-
-            const seedBtn = document.createElement('button');
-            seedBtn.className = 'btn btn-primary';
-            seedBtn.textContent = 'Proceed to Seeding';
-            seedBtn.addEventListener('click', () => navigate('seeding'));
-            area.appendChild(seedBtn);
-        }
-    } catch (err) {
-        // Already toasted
-    }
-}
-
-/**
- * Render a single ReID comparison pair.
- * @param {HTMLElement} area
- * @param {Array} pairs
- * @param {number} index
- */
-function _renderReIDPair(area, pairs, index) {
-    if (index >= pairs.length) {
-        area.innerHTML =
-            '<p style="color:var(--color-accepted)">All pairs resolved!</p>';
-        const seedBtn = document.createElement('button');
-        seedBtn.className = 'btn btn-primary';
-        seedBtn.textContent = 'Proceed to Seeding';
-        seedBtn.addEventListener('click', () => navigate('seeding'));
-        area.appendChild(seedBtn);
-        return;
-    }
-
-    const pair = pairs[index];
-    AppState._reidPairIndex = index;
-
-    // Remove existing pair UI
-    const existingPairUI = area.querySelector('.reid-pair-ui');
-    if (existingPairUI) existingPairUI.remove();
-
-    const pairUI = document.createElement('div');
-    pairUI.className = 'reid-pair-ui';
-    pairUI.style.cssText =
-        'display:flex;flex-direction:column;gap:16px;' +
-        'background:var(--bg-surface);border:1px solid var(--border-default);' +
-        'border-radius:var(--radius-md);padding:20px;';
-
-    // Counter
-    const counter = document.createElement('div');
-    counter.style.cssText = 'font-size:0.75rem;color:var(--text-muted);';
-    counter.textContent = `Pair ${index + 1} of ${pairs.length} | ` +
-        `Similarity: ${pair.similarity != null ? pair.similarity.toFixed(3) : 'N/A'} | ` +
-        `Pool: ${pair.pool || 'unknown'}`;
-    pairUI.appendChild(counter);
-
-    // Crop images side by side
-    const crops = document.createElement('div');
-    crops.className = 'reid-crops';
-
-    const imgA = document.createElement('img');
-    imgA.src = `/interview/api/detect/crop/${pair.crop_id_a}/image?session_id=${AppState.sessionId}`;
-    imgA.alt = 'Crop A';
-    imgA.style.cssText = 'max-height:240px;border-radius:var(--radius-sm);border:2px solid var(--border-default);';
-
-    const vsLabel = document.createElement('span');
-    vsLabel.style.cssText = 'font-size:1.2rem;font-weight:700;color:var(--text-muted);';
-    vsLabel.textContent = 'vs';
-
-    const imgB = document.createElement('img');
-    imgB.src = `/interview/api/detect/crop/${pair.crop_id_b}/image?session_id=${AppState.sessionId}`;
-    imgB.alt = 'Crop B';
-    imgB.style.cssText = 'max-height:240px;border-radius:var(--radius-sm);border:2px solid var(--border-default);';
-
-    crops.appendChild(imgA);
-    crops.appendChild(vsLabel);
-    crops.appendChild(imgB);
-    pairUI.appendChild(crops);
-
-    // Verdict buttons
-    const verdict = document.createElement('div');
-    verdict.className = 'reid-verdict';
-
-    const btnSame = document.createElement('button');
-    btnSame.className = 'btn btn-accept';
-    btnSame.innerHTML = 'Same <kbd style="margin-left:4px;font-size:0.65rem;">Y</kbd>';
-    btnSame.addEventListener('click', () => _resolveReIDPair(pair.pair_id, 'same', area, pairs, index));
-
-    const btnDiff = document.createElement('button');
-    btnDiff.className = 'btn btn-reject';
-    btnDiff.innerHTML = 'Different <kbd style="margin-left:4px;font-size:0.65rem;">N</kbd>';
-    btnDiff.addEventListener('click', () => _resolveReIDPair(pair.pair_id, 'different', area, pairs, index));
-
-    const btnUnsure = document.createElement('button');
-    btnUnsure.className = 'btn btn-unsure';
-    btnUnsure.innerHTML = 'Unsure <kbd style="margin-left:4px;font-size:0.65rem;">U</kbd>';
-    btnUnsure.addEventListener('click', () => _resolveReIDPair(pair.pair_id, 'unsure', area, pairs, index));
-
-    verdict.appendChild(btnSame);
-    verdict.appendChild(btnDiff);
-    verdict.appendChild(btnUnsure);
-    pairUI.appendChild(verdict);
-
-    // Keyboard hints
-    const hints = document.createElement('div');
-    hints.className = 'keyboard-hints';
-    hints.innerHTML =
-        '<span><kbd>Y</kbd> Same</span>' +
-        '<span><kbd>N</kbd> Different</span>' +
-        '<span><kbd>U</kbd> Unsure</span>';
-    pairUI.appendChild(hints);
-
-    area.appendChild(pairUI);
-}
-
-/**
- * Resolve a ReID pair and advance to the next.
- * @param {string} pairId
- * @param {string} resolution - 'same', 'different', 'unsure'.
- * @param {HTMLElement} area
- * @param {Array} pairs
- * @param {number} index
- */
-async function _resolveReIDPair(pairId, resolution, area, pairs, index) {
-    try {
-        await API.post('/reid/resolve', {
-            session_id: AppState.sessionId,
-            resolutions: { [pairId]: resolution },
-        });
-        _renderReIDPair(area, pairs, index + 1);
-    } catch (err) {
-        // Already toasted
-    }
-}
-
-/**
- * Resolve the current ReID pair (called by keyboard handler).
- * @param {string} resolution - 'same', 'different', 'unsure'.
- */
-function resolveCurrentPair(resolution) {
-    if (AppState.phase !== 'reid') return;
-    if (!AppState._reidData) return;
-
-    const pairs = AppState._reidData.unresolved_pairs;
-    const index = AppState._reidPairIndex || 0;
-    if (index >= pairs.length) return;
-
-    const area = document.getElementById('reid-comparison-area');
-    if (!area) return;
-
-    _resolveReIDPair(pairs[index].pair_id, resolution, area, pairs, index);
 }
 
 // ---------------------------------------------------------------------------
@@ -1720,19 +1644,7 @@ document.addEventListener('keydown', (e) => {
         }
     }
 
-    // ReID shortcuts
-    if (phase === 'reid') {
-        if (e.key === 'y' || e.key === 'Y') {
-            e.preventDefault();
-            resolveCurrentPair('same');
-        } else if (e.key === 'n' || e.key === 'N') {
-            e.preventDefault();
-            resolveCurrentPair('different');
-        } else if (e.key === 'u' || e.key === 'U') {
-            e.preventDefault();
-            resolveCurrentPair('unsure');
-        }
-    }
+    // ReID shortcuts are handled by reid_ui.js internally
 });
 
 /** Accept the current crop via keyboard. */

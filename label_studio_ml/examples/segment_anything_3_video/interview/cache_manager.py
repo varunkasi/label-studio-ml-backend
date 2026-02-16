@@ -151,7 +151,7 @@ def save_session(session: InterviewSession) -> None:
         "created_at": session.created_at,
         "updated_at": session.updated_at,
         "seed_config": {
-            "frame_interval": session.seed_config.frame_interval,
+            "frame_pct": session.seed_config.frame_pct,
             "confidence_threshold": session.seed_config.confidence_threshold,
         },
     }
@@ -174,9 +174,26 @@ def save_session(session: InterviewSession) -> None:
     # clusters.json — ReID data
     reid_data = {
         "clusters": {str(k): v for k, v in session.reid_clusters.items()},
+        "ufm_complete": session.ufm_complete,
+        "ufm_crop_ids": session.ufm_crop_ids,
+        # Legacy fields (backward compat)
         "pairs": {pid: _pair_to_dict(p) for pid, p in session.reid_pairs.items()},
+        "must_links": [list(pair) for pair in session.reid_must_links],
+        "cannot_links": [list(pair) for pair in session.reid_cannot_links],
+        "phase_stage": session.reid_phase_stage,
+        "visual_reid_proposals": session.visual_reid_proposals,
+        "visual_reid_weights": session.visual_reid_weights,
+        "visual_reid_verdicts_count": session.visual_reid_verdicts_count,
     }
     _write_json(d / "clusters.json", reid_data)
+
+    # ufm_similarity.npz — UFM pairwise similarity matrix
+    if session.ufm_similarity_matrix is not None:
+        np.savez_compressed(
+            d / "ufm_similarity.npz",
+            matrix=session.ufm_similarity_matrix,
+            crop_ids=np.array(session.ufm_crop_ids, dtype=object),
+        )
 
     # seeds.json — generated seed regions (survive container restarts)
     if session.seeds:
@@ -235,8 +252,12 @@ def load_session(cache_key: str) -> Optional[InterviewSession]:
     session.round_frames = {int(k): v for k, v in raw_rf.items()}
 
     sc = config.get("seed_config", {})
+    # Migration shim: old sessions may have "frame_interval" instead of "frame_pct"
+    if "frame_interval" in sc and "frame_pct" not in sc:
+        sc.pop("frame_interval")
+        sc["frame_pct"] = 100
     session.seed_config = SeedConfig(
-        frame_interval=sc.get("frame_interval", 5),
+        frame_pct=sc.get("frame_pct", 100),
         confidence_threshold=sc.get("confidence_threshold", 0.8),
     )
 
@@ -254,8 +275,28 @@ def load_session(cache_key: str) -> Optional[InterviewSession]:
     if reid_data:
         clusters = reid_data.get("clusters", {})
         session.reid_clusters = {int(k): v for k, v in clusters.items()}
+        session.ufm_complete = reid_data.get("ufm_complete", False)
+        session.ufm_crop_ids = reid_data.get("ufm_crop_ids", [])
+        # Legacy fields (backward compat)
         pairs = reid_data.get("pairs", {})
         session.reid_pairs = {pid: _pair_from_dict(pdata) for pid, pdata in pairs.items()}
+        session.reid_must_links = [tuple(pair) for pair in reid_data.get("must_links", [])]
+        session.reid_cannot_links = [tuple(pair) for pair in reid_data.get("cannot_links", [])]
+        session.reid_phase_stage = reid_data.get("phase_stage", 1)
+        session.visual_reid_proposals = reid_data.get("visual_reid_proposals", [])
+        session.visual_reid_weights = reid_data.get("visual_reid_weights", {})
+        session.visual_reid_verdicts_count = reid_data.get("visual_reid_verdicts_count", 0)
+
+    # Load UFM similarity matrix
+    ufm_path = d / "ufm_similarity.npz"
+    if ufm_path.is_file():
+        try:
+            data = np.load(ufm_path, allow_pickle=True)
+            session.ufm_similarity_matrix = data["matrix"].astype(np.float32)
+            session.ufm_crop_ids = list(data["crop_ids"])
+            session.ufm_complete = True
+        except Exception as e:
+            logger.warning("Failed to load UFM similarity from %s: %s", ufm_path, e)
 
     # Load seeds
     seeds_data = _read_json(d / "seeds.json")
@@ -266,13 +307,32 @@ def load_session(cache_key: str) -> Optional[InterviewSession]:
     return session
 
 
-def delete_cache(cache_key: str, project_id: Optional[int] = None) -> bool:
-    """Remove a cache directory and its project index entry."""
+def delete_cache(
+    cache_key: str,
+    project_id: Optional[int] = None,
+    keep_frame_cache: bool = False,
+) -> bool:
+    """Remove a cache directory and its project index entry.
+
+    If *keep_frame_cache* is True, the ``frames/`` subdirectory (decoded
+    JPEG frames) is preserved while all session state files are deleted.
+    """
     import shutil
     d = _cache_dir(cache_key)
     if d.is_dir():
-        shutil.rmtree(d)
-        logger.info("Deleted cache %s", cache_key)
+        if keep_frame_cache:
+            # Delete everything EXCEPT the frames/ subdirectory
+            for child in d.iterdir():
+                if child.name == "frames":
+                    continue
+                if child.is_dir():
+                    shutil.rmtree(child)
+                else:
+                    child.unlink()
+            logger.info("Deleted session state for %s (kept frame cache)", cache_key)
+        else:
+            shutil.rmtree(d)
+            logger.info("Deleted cache %s", cache_key)
 
     if project_id is not None:
         _remove_from_project_index(project_id, cache_key)

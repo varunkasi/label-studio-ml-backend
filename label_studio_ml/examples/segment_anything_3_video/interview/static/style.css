@@ -817,7 +817,7 @@ body {
 /* -- ReID Cluster Gallery ------------------------------------------------- */
 .reid-cluster-gallery {
   margin-bottom: 20px;
-  max-height: 55vh;
+  max-height: 70vh;
   overflow-y: auto;
 }
 
@@ -830,6 +830,9 @@ body {
   font-weight: 600;
   color: var(--text-secondary);
   margin-bottom: 8px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .reid-cluster-row {
@@ -1045,6 +1048,43 @@ body {
   justify-content: center;
   padding-top: 8px;
   border-top: 1px solid var(--border-default);
+}
+
+/* -- Diagnostics ---------------------------------------------------------- */
+.reid-diagnostics-panel {
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  padding: 12px;
+  background: var(--bg-surface);
+}
+
+.reid-advisories {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.reid-advisory {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  font-size: 0.78rem;
+  line-height: 1.4;
+}
+
+.reid-advisory-success { background: rgba(34,197,94,.12); border-left: 3px solid #22c55e; }
+.reid-advisory-info    { background: rgba(59,130,246,.10); border-left: 3px solid #3b82f6; }
+.reid-advisory-warning { background: rgba(234,179,8,.12);  border-left: 3px solid #eab308; }
+.reid-advisory-error   { background: rgba(239,68,68,.12);  border-left: 3px solid #ef4444; }
+
+.reid-advisory-icon { flex-shrink: 0; }
+.reid-advisory-msg  { color: var(--text-primary); }
+.reid-advisory-action {
+  color: var(--text-muted);
+  font-style: italic;
+  margin-left: 4px;
 }
 
 /* -- Utility -------------------------------------------------------------- */

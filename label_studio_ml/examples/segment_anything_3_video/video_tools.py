@@ -251,8 +251,8 @@ def _sparsify_sequence(
     end_frame: int,
     ratio: float,
 ) -> Tuple[List[Dict[str, Any]], int, int]:
-    if ratio <= 0 or ratio > 1:
-        raise VideoToolsError("--ratio must be in (0, 1]")
+    if ratio < 0 or ratio > 1:
+        raise VideoToolsError("--ratio must be in [0, 1]")
 
     in_range: List[Tuple[int, Dict[str, Any]]] = []
     for item in sequence:
@@ -268,10 +268,16 @@ def _sparsify_sequence(
         return list(sequence), 0, 0
 
     keep_count = int(round(float(total_in_range) * float(ratio)))
-    keep_count = max(1, min(keep_count, total_in_range))
+    if ratio == 0:
+        keep_count = 0
+    else:
+        keep_count = max(1, min(keep_count, total_in_range))
 
-    keep_indices = _uniform_keep_indices(total_in_range, keep_count)
-    keep_frames = {in_range[idx][0] for idx in keep_indices}
+    if keep_count == 0:
+        keep_frames: set = set()
+    else:
+        keep_indices = _uniform_keep_indices(total_in_range, keep_count)
+        keep_frames = {in_range[idx][0] for idx in keep_indices}
 
     new_sequence: List[Dict[str, Any]] = []
     removed = 0
@@ -684,7 +690,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     sparsify.add_argument("--start-frame", type=int, required=True)
     sparsify.add_argument("--end-frame", type=int, required=True)
-    sparsify.add_argument("--ratio", type=float, required=True, help="Fraction of frames to keep (0,1]")
+    sparsify.add_argument("--ratio", type=float, required=True, help="Fraction of frames to keep [0,1]. Use 0 to remove ALL keyframes in range.")
 
     swap_ids = subparsers.add_parser(
         "swap-ids",

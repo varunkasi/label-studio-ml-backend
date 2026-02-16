@@ -22,6 +22,8 @@ services:
       - LABEL_STUDIO_HOST=https://app.heartex.com
       - LABEL_STUDIO_URL=https://app.heartex.com
       - LABEL_STUDIO_API_KEY=${LABEL_STUDIO_API_KEY}
+      - UFM_MODEL=infinity1096/UFM-Base
+      - UFM_BATCH_SIZE=16
       - LOG_LEVEL=DEBUG
       - WORKERS=1
       - THREADS=8

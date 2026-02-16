@@ -210,43 +210,73 @@ def _refine_candidates_sam3(
             else:
                 target_sizes = [[h, w]]
 
-            results = processor.post_process_instance_segmentation(
-                outputs,
-                threshold=0.5,
-                mask_threshold=0.5,
-                target_sizes=target_sizes,
-            )[0]
+            # Try the high-level post-processor first; fall back to raw
+            # outputs if it hits the "Boolean value of Tensor" bug in
+            # some SAM3 processor versions.
+            tight = None
+            try:
+                results = processor.post_process_instance_segmentation(
+                    outputs,
+                    threshold=0.5,
+                    mask_threshold=0.5,
+                    target_sizes=target_sizes,
+                )[0]
 
-            masks = results.get("masks", [])
-            scores = results.get("scores", [])
-            boxes_out = results.get("boxes", [])
+                masks = results.get("masks", [])
+                scores = results.get("scores", [])
+                boxes_out = results.get("boxes", [])
 
-            if not masks and not boxes_out:
-                continue
+                n_masks = len(masks) if hasattr(masks, "__len__") else 0
+                n_boxes = len(boxes_out) if hasattr(boxes_out, "__len__") else 0
+                n_scores = len(scores) if hasattr(scores, "__len__") else 0
 
-            n_results = max(len(masks), len(boxes_out))
-            if n_results == 0:
-                continue
+                n_results = max(n_masks, n_boxes)
+                if n_results > 0:
+                    best_idx = int(np.argmax([
+                        s.item() if hasattr(s, "item") else float(s) for s in scores
+                    ])) if n_scores > 0 else 0
 
-            best_idx = int(np.argmax([
-                s.item() if hasattr(s, "item") else float(s) for s in scores
-            ])) if scores else 0
+                    if best_idx < n_boxes:
+                        b = boxes_out[best_idx]
+                        tight = np.array(b.tolist() if hasattr(b, "tolist") else list(b), dtype=np.float32)
+                    elif best_idx < n_masks:
+                        mask = masks[best_idx]
+                        if hasattr(mask, "cpu"):
+                            mask = mask.cpu().numpy()
+                        ys, xs = np.where(mask > 0)
+                        if xs.size > 0:
+                            tight = np.array([xs.min(), ys.min(), xs.max() + 1, ys.max() + 1], dtype=np.float32)
 
-            if best_idx < len(boxes_out):
-                b = boxes_out[best_idx]
-                tight = np.array(b.tolist() if hasattr(b, "tolist") else list(b), dtype=np.float32)
-            elif best_idx < len(masks):
-                mask = masks[best_idx]
-                if hasattr(mask, "cpu"):
-                    mask = mask.cpu().numpy()
-                ys, xs = np.where(mask > 0)
-                if xs.size == 0:
-                    continue
-                tight = np.array([xs.min(), ys.min(), xs.max() + 1, ys.max() + 1], dtype=np.float32)
-            else:
-                continue
+            except (RuntimeError, ValueError):
+                # Fallback: process raw pred_masks + iou_scores directly
+                pred_masks = getattr(outputs, "pred_masks", None)
+                iou_scores = getattr(outputs, "iou_scores", None)
+                if pred_masks is not None:
+                    # pred_masks: (batch, n_masks, H_pred, W_pred) — logits
+                    pm = pred_masks[0]  # first (only) batch item
+                    if iou_scores is not None:
+                        best_idx = int(iou_scores[0].argmax().item())
+                    else:
+                        best_idx = 0
+                    if best_idx < pm.shape[0]:
+                        mask_logits = pm[best_idx]  # (H_pred, W_pred)
+                        # Resize to original and threshold
+                        mask_bool = (mask_logits > 0).float()
+                        # Resize to original image dimensions
+                        th, tw = target_sizes[0]
+                        mask_resized = torch.nn.functional.interpolate(
+                            mask_bool.unsqueeze(0).unsqueeze(0),
+                            size=(th, tw),
+                            mode="nearest",
+                        )[0, 0]
+                        mask_np = mask_resized.cpu().numpy().astype(bool)
+                        ys, xs = np.where(mask_np)
+                        if xs.size > 0:
+                            tight = np.array([xs.min(), ys.min(), xs.max() + 1, ys.max() + 1], dtype=np.float32)
+                            logger.debug("Fallback raw mask extraction succeeded for frame %d", frame_idx)
 
-            refined.append((frame_idx, tight, det_score))
+            if tight is not None:
+                refined.append((frame_idx, tight, det_score))
 
         except Exception as exc:
             logger.warning("Refinement failed for frame %d: %s", frame_idx, exc)
@@ -395,10 +425,35 @@ def generate_seeds(
     prompts = session.prompts if session.prompts else ["person"]
 
     # ---- Determine target frames ----
-    interval = max(1, session.seed_config.frame_interval)
-    uniform = set(range(0, session.frames_count, interval))
     change = set(session.change_keyframes) if session.embedding_complete else set()
-    all_targets = sorted(uniform | change)
+
+    # Determine candidate frame pool from disk cache
+    _disk_cache_meta = None
+    try:
+        from .disk_frame_cache import frame_cache_exists as _fce, get_frame_cache_meta as _gfcm
+        if _fce(session.cache_key):
+            _disk_cache_meta = _gfcm(session.cache_key)
+    except ImportError:
+        pass
+
+    if _disk_cache_meta and "sampled_indices" in _disk_cache_meta:
+        cached_indices = _disk_cache_meta["sampled_indices"]
+    else:
+        # Fallback: generate uniform indices from video frame count (~10fps from 30fps)
+        cached_indices = list(range(0, session.frames_count, 3))
+
+    pct = max(1, min(100, session.seed_config.frame_pct))
+
+    if pct >= 100:
+        sampled = set(cached_indices)
+    else:
+        # Uniformly subsample cached frames to desired %
+        n_target = max(1, int(len(cached_indices) * pct / 100))
+        step = max(1, len(cached_indices) // n_target)
+        sampled = set(cached_indices[::step])
+
+    # Always include change keyframes (they're guaranteed in the cache)
+    all_targets = sorted(sampled | change)
     total_frames = len(all_targets)
 
     progress.step = "Generating seeds..."
@@ -421,9 +476,9 @@ def generate_seeds(
         logger.info("Pre-computed text tokens for %d prompts", len(precomputed_tokens))
 
     logger.info(
-        "Seed generation: scanning %d frames (interval=%d, threshold=%.2f, "
+        "Seed generation: scanning %d frames (pct=%d%%, threshold=%.2f, "
         "prompts=%s, refinement=%s, batch_size=%d)",
-        total_frames, interval, threshold,
+        total_frames, pct, threshold,
         prompts, _ENABLE_REFINEMENT, _SEED_DETECT_BATCH,
     )
 
@@ -456,9 +511,13 @@ def generate_seeds(
                 else:
                     missing.append(fidx)
             if missing:
-                frames.update(_decode_frames_sequential(session.video_path, missing))
+                frames.update(_decode_frames_sequential(
+                    session.video_path, missing, cache_key=session.cache_key,
+                ))
         else:
-            frames = _decode_frames_sequential(session.video_path, chunk_indices)
+            frames = _decode_frames_sequential(
+                session.video_path, chunk_indices, cache_key=session.cache_key,
+            )
 
         # --- Batched detection: run all prompts via _detect_batch ---
         # Collect detections grouped by frame_idx across all prompts

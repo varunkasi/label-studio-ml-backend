@@ -26,6 +26,7 @@ from .state import (
 )
 from .cache_manager import save_session
 from .background import JobProgress
+from .frame_cache import read_frame_cached
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +72,266 @@ def compute_fused_similarity(
     # Weighted combination
     fused = dinov3_weight * cosine_sim + color_weight * color_sim
     return max(0.0, min(1.0, fused))
+
+
+# ---------------------------------------------------------------------------
+# 1b. Identity Centroid Averaging
+# ---------------------------------------------------------------------------
+
+def _apply_centroid_averaging(
+    feature_matrix: np.ndarray,
+    hist_matrix: np.ndarray,
+    crop_ids: List[str],
+    must_links: List[Tuple[str, str]],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Replace individual crop features with group centroids for must-linked crops.
+
+    For each connected component of must-linked crops, computes the mean
+    feature vector (L2-normalized) and mean histogram, then replaces every
+    member's row with the group centroid.  Singletons and crops not in any
+    must-link are left unchanged.
+
+    This is analogous to the 15-frame track averaging in complete_reid.py,
+    but uses human-confirmed "same" verdicts instead of temporal adjacency.
+
+    Args:
+        feature_matrix: (N, D) DINOv3 feature matrix (not modified in-place).
+        hist_matrix: (N, H) histogram matrix (not modified in-place).
+        crop_ids: Ordered list of crop IDs matching matrix rows.
+        must_links: List of (crop_id_a, crop_id_b) pairs confirmed as same person.
+
+    Returns:
+        (new_feature_matrix, new_hist_matrix) with centroid-replaced rows.
+    """
+    if not must_links:
+        return feature_matrix, hist_matrix
+
+    # Build index: crop_id -> row index
+    id_to_idx = {cid: i for i, cid in enumerate(crop_ids)}
+    id_set = set(crop_ids)
+
+    # Build adjacency list for must-link connected components (simple BFS)
+    adj: Dict[str, List[str]] = {}
+    for a, b in must_links:
+        if a not in id_set or b not in id_set:
+            continue
+        adj.setdefault(a, []).append(b)
+        adj.setdefault(b, []).append(a)
+
+    if not adj:
+        return feature_matrix, hist_matrix
+
+    # Find connected components via BFS
+    visited: set = set()
+    groups: List[List[str]] = []
+    for node in adj:
+        if node in visited:
+            continue
+        component: List[str] = []
+        queue = [node]
+        visited.add(node)
+        while queue:
+            current = queue.pop(0)
+            component.append(current)
+            for neighbor in adj.get(current, []):
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    queue.append(neighbor)
+        if len(component) >= 2:
+            groups.append(component)
+
+    if not groups:
+        return feature_matrix, hist_matrix
+
+    # Copy matrices so we don't mutate inputs
+    new_feat = feature_matrix.copy()
+    new_hist = hist_matrix.copy()
+
+    for group in groups:
+        indices = [id_to_idx[cid] for cid in group]
+
+        # Feature centroid: mean then L2-normalize
+        centroid_feat = new_feat[indices].mean(axis=0)
+        norm = float(np.linalg.norm(centroid_feat))
+        if norm > 1e-8:
+            centroid_feat /= norm
+
+        # Histogram centroid: plain mean
+        centroid_hist = new_hist[indices].mean(axis=0)
+
+        # Replace all group members with centroid
+        for idx in indices:
+            new_feat[idx] = centroid_feat
+            new_hist[idx] = centroid_hist
+
+    return new_feat, new_hist
+
+
+# ---------------------------------------------------------------------------
+# 1c. Phase 1 Transition Check
+# ---------------------------------------------------------------------------
+
+def _phase1_complete(session: InterviewSession) -> bool:
+    """Check if centroid building (Phase 1) is done.
+
+    Phase 1 is complete when every non-singleton cluster has at least one
+    must-link involving its members.  Singleton clusters cannot build
+    centroids, so they don't block the transition.
+
+    Returns:
+        True if Phase 1 is complete (all non-singleton clusters covered).
+    """
+    if not session.reid_clusters:
+        return True
+
+    must_link_nodes: set = set()
+    for a, b in session.reid_must_links:
+        must_link_nodes.add(a)
+        must_link_nodes.add(b)
+
+    for members in session.reid_clusters.values():
+        if len(members) < 2:
+            continue  # singleton — can't build centroid, skip
+        if not any(m in must_link_nodes for m in members):
+            return False  # this cluster has no confirmed "same"
+
+    return True
+
+
+# ---------------------------------------------------------------------------
+# 1d. Identity Centroids + Auto-Assignment (Phase 3)
+# ---------------------------------------------------------------------------
+
+DECISIVE_MIN_TOP1 = float(os.getenv("REID_DECISIVE_MIN_TOP1", "0.6"))
+DECISIVE_MARGIN = float(os.getenv("REID_DECISIVE_MARGIN", "0.15"))
+
+
+def _compute_identity_centroids(
+    session: InterviewSession,
+) -> Dict[int, np.ndarray]:
+    """Compute L2-normalized feature centroid for each identity cluster.
+
+    Args:
+        session: Session with reid_clusters and crops with features.
+
+    Returns:
+        Dict mapping cluster_id to (D,) normalized centroid vector.
+    """
+    centroids: Dict[int, np.ndarray] = {}
+    for cluster_id, members in session.reid_clusters.items():
+        feats = []
+        for cid in members:
+            crop = session.get_crop(cid)
+            if crop is not None and crop.features is not None:
+                feats.append(crop.features)
+        if feats:
+            centroid = np.mean(np.stack(feats), axis=0)
+            norm = float(np.linalg.norm(centroid))
+            if norm > 1e-8:
+                centroid /= norm
+            centroids[cluster_id] = centroid
+    return centroids
+
+
+def compute_auto_assignments(
+    session: InterviewSession,
+    min_top1: float = DECISIVE_MIN_TOP1,
+    min_margin: float = DECISIVE_MARGIN,
+) -> Dict[str, Any]:
+    """Compute assignment confidence for all accepted crops vs identity centroids.
+
+    For each accepted crop, computes cosine similarity to each identity
+    centroid.  Crops are classified as:
+      - **auto_assigned**: best match exceeds ``min_top1`` AND margin over
+        second-best is at least ``min_margin``.  These can be confidently
+        assigned (or confirmed if already clustered).
+      - **unresolved**: too ambiguous to auto-assign — close to multiple
+        centroids.
+
+    Crops already in constraints (must-link/cannot-link) are skipped since
+    their placement is already determined by human verdicts.
+
+    Args:
+        session: Interview session with reid_clusters and crops.
+        min_top1: Minimum cosine similarity for the best centroid.
+        min_margin: Minimum gap between best and second-best similarity.
+
+    Returns:
+        Dict with keys:
+          ``auto_assigned``: {crop_id: {cluster_id, confidence, margin, already_clustered}}
+          ``unresolved``: {crop_id: {top_candidates: [(cluster_id, sim)], current_cluster}}
+    """
+    if not session.reid_clusters:
+        return {"auto_assigned": {}, "unresolved": {}}
+
+    centroids = _compute_identity_centroids(session)
+    if not centroids:
+        return {"auto_assigned": {}, "unresolved": {}}
+
+    # Build set of crops already in constraints (placement decided by human)
+    constrained: set = set()
+    for a, b in session.reid_must_links:
+        constrained.add(a)
+        constrained.add(b)
+    for a, b in session.reid_cannot_links:
+        constrained.add(a)
+        constrained.add(b)
+
+    # Map crops to their current cluster
+    crop_to_cluster: Dict[str, int] = {}
+    for cluster_id, members in session.reid_clusters.items():
+        for cid in members:
+            crop_to_cluster[cid] = cluster_id
+
+    auto_assigned: Dict[str, Dict[str, Any]] = {}
+    unresolved: Dict[str, Dict[str, Any]] = {}
+
+    accepted = session.get_crops_by_label(CropLabel.ACCEPTED)
+    for crop in accepted:
+        if crop.features is None:
+            continue
+        if crop.crop_id in constrained:
+            continue  # placement decided by human verdicts
+
+        # Compute cosine similarity to each centroid
+        feat = crop.features
+        feat_norm = float(np.linalg.norm(feat))
+        if feat_norm < 1e-8:
+            continue
+
+        sims: List[Tuple[int, float]] = []
+        for cid, centroid in centroids.items():
+            cos = float(np.dot(feat, centroid) / feat_norm)
+            # centroid is already unit-normalized
+            sim = 0.5 * (cos + 1.0)  # map [-1, 1] → [0, 1]
+            sims.append((cid, sim))
+
+        sims.sort(key=lambda x: -x[1])
+
+        if len(sims) < 1:
+            continue
+
+        top_cid, top_sim = sims[0]
+        second_sim = sims[1][1] if len(sims) > 1 else 0.0
+        margin = top_sim - second_sim
+        current = crop_to_cluster.get(crop.crop_id)
+
+        if top_sim >= min_top1 and margin >= min_margin:
+            auto_assigned[crop.crop_id] = {
+                "cluster_id": top_cid,
+                "confidence": round(top_sim, 4),
+                "margin": round(margin, 4),
+                "already_clustered": current is not None,
+                "current_cluster": current,
+            }
+        else:
+            top_candidates = [(cid, round(s, 4)) for cid, s in sims[:3]]
+            unresolved[crop.crop_id] = {
+                "top_candidates": top_candidates,
+                "current_cluster": current,
+            }
+
+    return {"auto_assigned": auto_assigned, "unresolved": unresolved}
 
 
 # ---------------------------------------------------------------------------
@@ -289,15 +550,34 @@ def extract_crop_histograms(
     Returns:
         Mapping from crop_id to its normalized histogram array.
     """
-    import seeding_common as base
+    from .frame_cache import read_frame_cached
 
     histograms: Dict[str, np.ndarray] = {}
     if not accepted_crops:
         return histograms
 
+    # Reuse cached histograms from previous runs (survives in-memory across reclusters)
+    need_compute: List[CropData] = []
+    for crop in accepted_crops:
+        if crop.histogram is not None:
+            histograms[crop.crop_id] = crop.histogram
+        else:
+            need_compute.append(crop)
+
+    if not need_compute:
+        logger.info(
+            "Reused cached histograms for all %d accepted crops", len(accepted_crops),
+        )
+        return histograms
+
+    logger.info(
+        "Histogram cache: %d cached, %d need computation",
+        len(histograms), len(need_compute),
+    )
+
     # Group crops by frame to minimize video seeks
     frame_to_crops: Dict[int, List[CropData]] = {}
-    for crop in accepted_crops:
+    for crop in need_compute:
         frame_to_crops.setdefault(crop.frame_idx, []).append(crop)
 
     total_frames = len(frame_to_crops)
@@ -309,8 +589,10 @@ def extract_crop_histograms(
     video_path = session.video_path
     img_w, img_h = session.width, session.height
 
+    cache_key = getattr(session, "cache_key", None)
+
     for frame_count, (frame_idx, crops) in enumerate(sorted(frame_to_crops.items()), 1):
-        pil_frame = base._read_frame_pyav(video_path, frame_idx)
+        pil_frame = read_frame_cached(video_path, frame_idx, cache_key=cache_key)
         if pil_frame is None:
             logger.warning("Could not read frame %d for histogram extraction", frame_idx)
             progress.current = frame_count
@@ -338,9 +620,10 @@ def extract_crop_histograms(
 
         progress.current = frame_count
 
+    computed = len(histograms) - (len(accepted_crops) - len(need_compute))
     logger.info(
-        "Extracted histograms for %d / %d accepted crops",
-        len(histograms), len(accepted_crops),
+        "Histograms: %d computed, %d cached, %d total accepted crops",
+        computed, len(accepted_crops) - len(need_compute), len(accepted_crops),
     )
     return histograms
 
@@ -381,6 +664,12 @@ def _rebuild_sim_matrix(
     hist_list = [c.histogram if c.histogram is not None else default_hist for c in featured]
     hist_matrix = np.stack(hist_list)
 
+    # Apply centroid averaging for must-linked crops (human-confirmed "same")
+    if session.reid_must_links:
+        feature_matrix, hist_matrix = _apply_centroid_averaging(
+            feature_matrix, hist_matrix, crop_ids, session.reid_must_links,
+        )
+
     sim_matrix = np.zeros((n, n), dtype=np.float32)
     for i in range(n):
         sim_matrix[i, i] = 1.0
@@ -407,18 +696,16 @@ def sample_pairs(
     max_pairs: int = 30,
     round_num: int = 1,
 ) -> List[ReIDPair]:
-    """Sample pairs with coverage-first allocation across cluster-pair relationships.
+    """Sample pairs with phase-aware allocation.
 
-    Priority order for cross-cluster pairs:
-        1. Merge candidates (sim > 0.7): most likely same-person across clusters.
-        2. Ambiguous (0.3 <= sim <= 0.7): borderline cases needing human judgment.
-        3. Separation confirmation (sim < 0.3): confirm they're different.
+    Phase 1 (centroid building, ``session.reid_phase_stage == 1``):
+        - 70% budget: intra-cluster high-similarity pairs (build centroids)
+        - 30% budget: cross-cluster merge candidates (catch obvious merges)
+        - Breadth-first across clusters, prefer different frames for diversity
 
-    Algorithm:
-        - First pass: 1 best pair per cluster-pair (highest sim), all relationships.
-        - Second pass: add 2nd pair per cluster-pair (different crops) if budget allows.
-        - Round 1 only: append up to 4 calibration pairs (2 intra-same, 2 cross-diff).
-        - Truncate to max_pairs, shuffle for presentation.
+    Phase 2+ (ambiguous resolution):
+        - 100% cross-cluster pairs with current priority order:
+          merge candidates > ambiguous > separation confirmation
 
     Args:
         session: Current interview session.
@@ -434,7 +721,91 @@ def sample_pairs(
     id_to_idx = {cid: i for i, cid in enumerate(crop_ids)}
     cluster_ids_sorted = sorted(clusters.keys())
 
-    # -- Collect ALL cross-cluster crop pairs, grouped by cluster-pair --
+    # Build set of crop pairs that already have human constraints (skip these)
+    constrained_pairs: set = set()
+    for a, b in session.reid_must_links:
+        constrained_pairs.add((a, b))
+        constrained_pairs.add((b, a))
+    for a, b in session.reid_cannot_links:
+        constrained_pairs.add((a, b))
+        constrained_pairs.add((b, a))
+
+    # ======================================================================
+    # Phase 1: Centroid Building — front-load intra-cluster pairs
+    # ======================================================================
+    centroid_building_pairs: List[ReIDPair] = []
+    if session.reid_phase_stage == 1:
+        intra_budget = int(max_pairs * 0.7)
+        # Collect intra-cluster candidates per cluster (breadth-first)
+        intra_per_cluster: Dict[int, List[Tuple[str, str, float]]] = {}
+        for ci in cluster_ids_sorted:
+            members = clusters[ci]
+            if len(members) < 2:
+                continue
+            candidates = []
+            for i in range(len(members)):
+                a = members[i]
+                if a not in id_to_idx:
+                    continue
+                for j in range(i + 1, len(members)):
+                    b = members[j]
+                    if b not in id_to_idx:
+                        continue
+                    if (a, b) in constrained_pairs:
+                        continue
+                    # Prefer different frames
+                    crop_a = session.get_crop(a)
+                    crop_b = session.get_crop(b)
+                    same_frame = (crop_a is not None and crop_b is not None
+                                  and crop_a.frame_idx == crop_b.frame_idx)
+                    if same_frame:
+                        continue
+                    sim = float(similarity_matrix[id_to_idx[a], id_to_idx[b]])
+                    if sim >= 0.6:  # only "easy same" pairs
+                        candidates.append((a, b, sim))
+            candidates.sort(key=lambda x: -x[2])
+            intra_per_cluster[ci] = candidates
+
+        # Breadth-first allocation: 1 pair per cluster, then 2nd, etc.
+        used_intra: set = set()
+        pointer_per_cluster = {ci: 0 for ci in intra_per_cluster}
+        while len(centroid_building_pairs) < intra_budget:
+            added_any = False
+            for ci in cluster_ids_sorted:
+                if ci not in intra_per_cluster:
+                    continue
+                cands = intra_per_cluster[ci]
+                ptr = pointer_per_cluster[ci]
+                while ptr < len(cands):
+                    a, b, sim = cands[ptr]
+                    ptr += 1
+                    if (a, b) not in used_intra:
+                        centroid_building_pairs.append(ReIDPair(
+                            pair_id=str(uuid.uuid4())[:12],
+                            crop_id_a=a, crop_id_b=b,
+                            cluster_a=ci, cluster_b=ci,
+                            pool="centroid_building",
+                            similarity=sim,
+                        ))
+                        used_intra.add((a, b))
+                        used_intra.add((b, a))
+                        added_any = True
+                        break
+                pointer_per_cluster[ci] = ptr
+                if len(centroid_building_pairs) >= intra_budget:
+                    break
+            if not added_any:
+                break
+
+        # Reduce cross-cluster budget to 30% for Phase 1
+        original_max_pairs = max_pairs
+        max_pairs = max_pairs - len(centroid_building_pairs)
+    else:
+        original_max_pairs = max_pairs
+
+    # ======================================================================
+    # Cross-cluster pairs (used by both Phase 1 remainder and Phase 2+)
+    # ======================================================================
     cluster_pair_candidates: Dict[Tuple[int, int], List[Tuple[str, str, float]]] = {}
 
     for i_idx, ci in enumerate(cluster_ids_sorted):
@@ -447,6 +818,8 @@ def sample_pairs(
                     continue
                 for b in clusters[cj]:
                     if b not in id_to_idx:
+                        continue
+                    if (a, b) in constrained_pairs:
                         continue
                     sim = float(similarity_matrix[id_to_idx[a], id_to_idx[b]])
                     candidates.append((a, b, sim))
@@ -554,21 +927,29 @@ def sample_pairs(
             ))
 
     # -- Assemble and truncate --
-    all_pairs = first_pass + second_pass + calibration
-    if len(all_pairs) > max_pairs:
+    cross_pairs = first_pass + second_pass + calibration
+    if len(cross_pairs) > max_pairs:
         budget_remaining = max_pairs - len(first_pass)
         extras = second_pass + calibration
         rng = random.Random(42)
         rng.shuffle(extras)
-        all_pairs = first_pass + extras[:max(0, budget_remaining)]
+        cross_pairs = first_pass + extras[:max(0, budget_remaining)]
+
+    # Combine centroid-building + cross-cluster pairs, enforce total budget
+    all_pairs = centroid_building_pairs + cross_pairs
+    if len(all_pairs) > original_max_pairs:
+        all_pairs = all_pairs[:original_max_pairs]
 
     rng = random.Random(42)
     rng.shuffle(all_pairs)
 
+    n_intra = len(centroid_building_pairs)
     logger.info(
-        "Sampled %d pairs (round %d): %d first-pass, %d second-pass, %d calibration "
+        "Sampled %d pairs (round %d, stage %d): %d centroid-building, "
+        "%d first-pass, %d second-pass, %d calibration "
         "(cluster-pairs: %d total)",
-        len(all_pairs), round_num, len(first_pass), len(second_pass),
+        len(all_pairs), round_num, session.reid_phase_stage,
+        n_intra, len(first_pass), len(second_pass),
         len(calibration), len(cluster_pair_candidates),
     )
     return all_pairs
@@ -830,6 +1211,15 @@ def run_reid_pipeline(
 
     # Step 3: Compute fused similarity matrix
     progress.step = "Computing similarity matrix"
+
+    # Apply centroid averaging: replace individual features with group centroids
+    # for must-linked crops (human-confirmed "same" verdicts).  This gives the
+    # same noise-reduction effect as complete_reid.py's 15-frame track averaging.
+    if session.reid_must_links:
+        feature_matrix, hist_matrix = _apply_centroid_averaging(
+            feature_matrix, hist_matrix, crop_ids, session.reid_must_links,
+        )
+
     sim_matrix = np.zeros((n, n), dtype=np.float32)
     for i in range(n):
         sim_matrix[i, i] = 1.0
@@ -842,7 +1232,7 @@ def run_reid_pipeline(
             sim_matrix[j, i] = sim
     progress.current = 3
 
-    # Step 4: Cluster with spherical K-Means
+    # Step 4: Cluster
     progress.step = "Clustering identities"
     if n_clusters is None or n_clusters < 2:
         bias = overcluster_bias if overcluster_bias is not None else REID_OVERCLUSTER_BIAS
@@ -852,6 +1242,7 @@ def run_reid_pipeline(
     k = max(2, k)
 
     assignments = spherical_kmeans(feature_matrix, k)
+
     progress.current = 4
 
     # Build cluster mapping: cluster_id -> [crop_ids]
@@ -874,7 +1265,7 @@ def run_reid_pipeline(
     # Step 6: Update session state
     progress.step = "Saving session"
     session.reid_clusters = clusters
-    session.reid_pairs = {p.pair_id: p for p in pairs}
+    session.reid_pairs.update({p.pair_id: p for p in pairs})
     session.n_identities = len(clusters)
     session.touch()
     save_session(session)
@@ -1028,162 +1419,657 @@ def flag_outlier(session: InterviewSession, crop_id: str) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# 8. Apply resolutions (merge/split logic)
+# 7b. Centroid-Growing Progressive Association (Phase 2)
+# ---------------------------------------------------------------------------
+
+
+def _confirmed_crop_ids(session: InterviewSession) -> set:
+    """Return set of crop IDs that appear in any must-link (human-confirmed)."""
+    confirmed: set = set()
+    for a, b in session.reid_must_links:
+        confirmed.add(a)
+        confirmed.add(b)
+    return confirmed
+
+
+def _cannot_link_set(session: InterviewSession) -> set:
+    """Return set of (a, b) AND (b, a) for all cannot-links."""
+    cl: set = set()
+    for a, b in session.reid_cannot_links:
+        cl.add((a, b))
+        cl.add((b, a))
+    return cl
+
+
+def compute_centroid_assignments(
+    session: InterviewSession,
+    min_top1: float = DECISIVE_MIN_TOP1,
+    min_margin: float = DECISIVE_MARGIN,
+    max_representatives: int = 3,
+) -> Dict[str, Any]:
+    """Compute decisive/indecisive assignment of crops to identity centroids.
+
+    For each non-confirmed crop, computes cosine similarity to every
+    identity centroid (mean of confirmed crops in that cluster).
+
+    Returns:
+        Dict with keys:
+          ``decisive``: {crop_id: {cluster_id, confidence, margin, representatives}}
+          ``indecisive``: {crop_id: {candidates: [{cluster_id, similarity, representatives}]}}
+          ``centroid_count``: number of centroids with confirmed members
+          ``unassigned_count``: crops not in any cluster
+    """
+    if not session.reid_clusters:
+        return {"decisive": {}, "indecisive": {}, "centroid_count": 0, "unassigned_count": 0}
+
+    # Build centroids from confirmed crops only (must-linked members).
+    # If a cluster has no confirmed members, use all members as centroid.
+    confirmed = _confirmed_crop_ids(session)
+    cl_set = _cannot_link_set(session)
+
+    centroids: Dict[int, np.ndarray] = {}
+    representative_crops: Dict[int, List[str]] = {}  # cluster -> top representative crop_ids
+
+    for cluster_id, members in session.reid_clusters.items():
+        confirmed_members = [cid for cid in members if cid in confirmed]
+        if not confirmed_members:
+            continue  # skip — no confirmed members, centroid would be unreliable
+        source = confirmed_members
+        feats = []
+        for cid in source:
+            crop = session.get_crop(cid)
+            if crop is not None and crop.features is not None:
+                feats.append(crop.features)
+        if feats:
+            centroid = np.mean(np.stack(feats), axis=0)
+            norm = float(np.linalg.norm(centroid))
+            if norm > 1e-8:
+                centroid /= norm
+            centroids[cluster_id] = centroid
+
+        # Pick representative crops (up to max_representatives, prefer confirmed)
+        reps = []
+        for cid in confirmed_members[:max_representatives]:
+            reps.append(cid)
+        if len(reps) < max_representatives:
+            for cid in members:
+                if cid not in reps and len(reps) < max_representatives:
+                    reps.append(cid)
+        representative_crops[cluster_id] = reps
+
+    if not centroids:
+        return {"decisive": {}, "indecisive": {}, "centroid_count": 0, "unassigned_count": 0}
+
+    # Evaluate all non-confirmed accepted crops
+    accepted = session.get_crops_by_label(CropLabel.ACCEPTED)
+    decisive: Dict[str, Dict[str, Any]] = {}
+    indecisive: Dict[str, Dict[str, Any]] = {}
+
+    for crop in accepted:
+        if crop.features is None:
+            continue
+        if crop.crop_id in confirmed:
+            continue  # already placed by human verdict
+
+        feat = crop.features
+        feat_norm = float(np.linalg.norm(feat))
+        if feat_norm < 1e-8:
+            continue
+
+        sims: List[Tuple[int, float]] = []
+        for cid, centroid in centroids.items():
+            # Check cannot-link: skip centroids whose confirmed members conflict
+            blocked = False
+            for member in session.reid_clusters.get(cid, []):
+                if (crop.crop_id, member) in cl_set:
+                    blocked = True
+                    break
+            if blocked:
+                continue
+
+            cos = float(np.dot(feat, centroid) / feat_norm)
+            sim = 0.5 * (cos + 1.0)
+            sims.append((cid, sim))
+
+        sims.sort(key=lambda x: -x[1])
+
+        if len(sims) < 1:
+            continue
+
+        top_cid, top_sim = sims[0]
+        second_sim = sims[1][1] if len(sims) > 1 else 0.0
+        margin = top_sim - second_sim
+
+        if top_sim >= min_top1 and margin >= min_margin:
+            decisive[crop.crop_id] = {
+                "cluster_id": top_cid,
+                "confidence": round(top_sim, 4),
+                "margin": round(margin, 4),
+                "representatives": representative_crops.get(top_cid, []),
+            }
+        else:
+            # Include top 2 candidates with representatives
+            candidates = []
+            for cid, sim in sims[:2]:
+                candidates.append({
+                    "cluster_id": cid,
+                    "similarity": round(sim, 4),
+                    "representatives": representative_crops.get(cid, []),
+                })
+            indecisive[crop.crop_id] = {"candidates": candidates}
+
+    return {
+        "decisive": decisive,
+        "indecisive": indecisive,
+        "centroid_count": len(centroids),
+        "unassigned_count": len(indecisive),
+    }
+
+
+def apply_association_round(
+    session: InterviewSession,
+    assignments: Dict[str, Optional[int]],
+) -> Dict[str, Any]:
+    """Apply Phase 2 human decisions: assign crops to identities.
+
+    For each crop, the human picks a cluster_id (assign to that identity)
+    or None (leave unassigned / new identity).
+
+    After applying:
+      1. Update cluster memberships and centroid.
+      2. Re-compute decisive/indecisive for remaining unassigned.
+      3. If no new decisive assignments, set ``converged = True``.
+
+    Args:
+        session: Interview session with reid_clusters.
+        assignments: {crop_id: cluster_id} or {crop_id: None} for "neither".
+
+    Returns:
+        Summary dict with: applied_count, new_decisive, new_indecisive,
+        converged, n_identities, clusters, reid_phase_stage.
+    """
+    applied_count = 0
+
+    for crop_id, cluster_id in assignments.items():
+        crop = session.get_crop(crop_id)
+        if crop is None:
+            continue
+
+        if cluster_id is not None and cluster_id in session.reid_clusters:
+            # Assign to existing cluster
+            if crop_id not in session.reid_clusters[cluster_id]:
+                session.reid_clusters[cluster_id].append(crop_id)
+            crop.reid_cluster_id = cluster_id
+
+            # Remove from any other cluster
+            for cid, members in session.reid_clusters.items():
+                if cid != cluster_id and crop_id in members:
+                    members.remove(crop_id)
+
+            # Add as must-link with a confirmed member from that cluster
+            confirmed = _confirmed_crop_ids(session)
+            for member in session.reid_clusters[cluster_id]:
+                if member in confirmed and member != crop_id:
+                    link = (crop_id, member)
+                    rev = (member, crop_id)
+                    if link not in session.reid_must_links and rev not in session.reid_must_links:
+                        session.reid_must_links.append(link)
+                    break
+
+            applied_count += 1
+        elif cluster_id is None:
+            # "Neither / New Identity" — remove from old cluster, create singleton
+
+            # Remove from any existing cluster (mirrors the assign-to-cluster path)
+            for cid, members in list(session.reid_clusters.items()):
+                if crop_id in members:
+                    members.remove(crop_id)
+
+            existing_keys = list(session.reid_clusters.keys())
+            new_id = (max(existing_keys) + 1) if existing_keys else 0
+            session.reid_clusters[new_id] = [crop_id]
+            crop.reid_cluster_id = new_id
+
+            # Self-must-link marks the crop as "confirmed" so
+            # compute_centroid_assignments won't re-evaluate it
+            link = (crop_id, crop_id)
+            if link not in session.reid_must_links:
+                session.reid_must_links.append(link)
+
+            applied_count += 1
+
+    # Clean up empty clusters
+    empty = [k for k, v in session.reid_clusters.items() if not v]
+    for k in empty:
+        del session.reid_clusters[k]
+
+    session.n_identities = len(session.reid_clusters)
+    session.touch()
+    save_session(session)
+
+    # Re-compute assignments for remaining unplaced crops
+    result = compute_centroid_assignments(session)
+
+    new_decisive_count = len(result["decisive"])
+    new_indecisive_count = len(result["indecisive"])
+    converged = new_decisive_count == 0 and new_indecisive_count == 0
+
+    # Auto-stop: if no new decisive, plateau reached
+    plateau = new_decisive_count == 0
+
+    # Phase transition: if Phase 2 and converged, move to Phase 3 (done)
+    if session.reid_phase_stage == 2 and converged:
+        session.reid_phase_stage = 3
+        logger.info("Phase transition: 2 → 3 (centroid plateau reached)")
+        save_session(session)
+
+    clusters_info = {
+        str(cid): {"crop_ids": members, "count": len(members)}
+        for cid, members in session.reid_clusters.items()
+    }
+
+    summary = {
+        "applied_count": applied_count,
+        "new_decisive": result["decisive"],
+        "new_indecisive": result["indecisive"],
+        "converged": converged,
+        "plateau": plateau,
+        "n_identities": session.n_identities,
+        "clusters": clusters_info,
+        "reid_phase_stage": session.reid_phase_stage,
+    }
+
+    logger.info(
+        "Association round: %d applied, %d new decisive, %d indecisive, converged=%s",
+        applied_count, new_decisive_count, new_indecisive_count, converged,
+    )
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# 8. Apply resolutions (centroid-growing approach)
 # ---------------------------------------------------------------------------
 
 def apply_resolutions(
     session: InterviewSession,
     resolutions: Dict[str, str],
 ) -> Dict[str, Any]:
-    """Apply human pair resolutions with burden-of-proof merge/split policy.
+    """Apply human pair resolutions using centroid-growing approach.
 
-    Merge rules:
-        - Need 2+ confirming "same" (Yes) pairs between the same two clusters
-          to trigger a merge.
-        - A single "different" (No) pair vetoes the merge entirely for that
-          cluster pair, regardless of how many "same" pairs exist.
-        - "unsure" pairs are treated as abstentions; at the end, any cluster
-          pair that only has "unsure" evidence is left separate.
+    Converts human verdicts into constraints:
+        - "same" → must-link (crops confirmed as same identity)
+        - "different" → cannot-link (crops confirmed as different identities)
+        - "unsure" → no constraint
 
-    The method tracks per-cluster-pair evidence as a dict keyed by
-    (cluster_a, cluster_b) tuples, then executes merges that meet the
-    threshold. Merged clusters are renumbered starting from 0.
+    Then re-assigns non-confirmed crops to nearest centroid (formed from
+    confirmed "same" groups).  Confirmed groups stay locked to their
+    cluster; other crops get re-evaluated by centroid proximity.
 
     Args:
         session: Current interview session with reid_pairs populated.
         resolutions: Mapping from pair_id to "same", "different", or "unsure".
 
     Returns:
-        Summary dict with keys: merges_executed, final_clusters, vetoed_pairs.
+        Summary dict with cluster info, phase transition, and
+        centroid assignment data (when transitioning to Phase 2).
     """
-    # Apply resolution labels to stored pairs
+    # 1. Store verdicts as constraints
     for pair_id, resolution in resolutions.items():
         pair = session.reid_pairs.get(pair_id)
         if pair is not None:
             pair.resolution = resolution
+            if resolution == "same":
+                link = (pair.crop_id_a, pair.crop_id_b)
+                if link not in session.reid_must_links and \
+                   (pair.crop_id_b, pair.crop_id_a) not in session.reid_must_links:
+                    session.reid_must_links.append(link)
+            elif resolution == "different":
+                link = (pair.crop_id_a, pair.crop_id_b)
+                if link not in session.reid_cannot_links and \
+                   (pair.crop_id_b, pair.crop_id_a) not in session.reid_cannot_links:
+                    session.reid_cannot_links.append(link)
 
-    # Build crop_id → current cluster_id mapping from live session state.
-    # This is critical: pair.cluster_a/cluster_b may be stale after prior
-    # merges renumbered clusters. Using crop IDs to look up CURRENT cluster
-    # membership ensures evidence is accumulated correctly.
-    crop_to_cluster: Dict[str, int] = {}
-    for cid_int, members in session.reid_clusters.items():
-        for crop_id in members:
-            crop_to_cluster[crop_id] = cid_int
+    # Build cannot-link lookup for merge blocking and re-assignment
+    cl_set = _cannot_link_set(session)
 
-    # Accumulate evidence per cluster pair
-    # Use sorted tuple keys so (a, b) and (b, a) are treated identically
-    evidence: Dict[Tuple[int, int], Dict[str, Any]] = {}
-
-    for pair in session.reid_pairs.values():
-        if pair.resolution is None:
+    # 2. Merge "same" pairs into the same cluster (respecting cannot-links)
+    for pair_id, resolution in resolutions.items():
+        if resolution != "same":
             continue
-        # Look up CURRENT cluster for each crop (not stale pair fields)
-        ca = crop_to_cluster.get(pair.crop_id_a)
-        cb = crop_to_cluster.get(pair.crop_id_b)
-        if ca is None or cb is None:
+        pair = session.reid_pairs.get(pair_id)
+        if pair is None:
             continue
-        if ca == cb:
-            # Already in the same cluster (possibly from a prior merge); skip
-            continue
-        key = (min(ca, cb), max(ca, cb))
-        if key not in evidence:
-            evidence[key] = {"yes_count": 0, "no_count": 0, "unsure_count": 0, "max_sim": 0.0}
+        # Find clusters of both crops
+        cluster_a = cluster_b = None
+        for cid, members in session.reid_clusters.items():
+            if pair.crop_id_a in members:
+                cluster_a = cid
+            if pair.crop_id_b in members:
+                cluster_b = cid
+        if cluster_a is not None and cluster_b is not None and cluster_a != cluster_b:
+            # Check cannot-links: block merge if any member of cluster_a
+            # has a cannot-link with any member of cluster_b
+            blocked = False
+            for m_a in session.reid_clusters[cluster_a]:
+                for m_b in session.reid_clusters[cluster_b]:
+                    if (m_a, m_b) in cl_set or (m_b, m_a) in cl_set:
+                        blocked = True
+                        break
+                if blocked:
+                    break
+            if blocked:
+                logger.debug(
+                    "Merge of clusters %d and %d blocked by cannot-link", cluster_a, cluster_b,
+                )
+                continue
+            # Merge cluster_b into cluster_a
+            session.reid_clusters[cluster_a].extend(session.reid_clusters[cluster_b])
+            for cid in session.reid_clusters[cluster_b]:
+                crop = session.get_crop(cid)
+                if crop is not None:
+                    crop.reid_cluster_id = cluster_a
+            del session.reid_clusters[cluster_b]
 
-        if pair.resolution == "same":
-            evidence[key]["yes_count"] += 1
-            evidence[key]["max_sim"] = max(evidence[key]["max_sim"], pair.similarity)
-        elif pair.resolution == "different":
-            evidence[key]["no_count"] += 1
-        else:  # "unsure"
-            evidence[key]["unsure_count"] += 1
+    # 2b. Split intra-cluster cannot-links: if two crops in the same cluster
+    # have a cannot-link, move the non-confirmed one to a new cluster.
+    for a, b in session.reid_cannot_links:
+        # Find which cluster each is in
+        ca = cb = None
+        for cid, members in session.reid_clusters.items():
+            if a in members:
+                ca = cid
+            if b in members:
+                cb = cid
+        if ca is None or cb is None or ca != cb:
+            continue  # not in same cluster, skip
 
-    # Decide which cluster pairs to merge
-    merges_to_execute: List[Tuple[int, int]] = []
-    vetoed: List[Tuple[int, int]] = []
+        # Decide which crop to evict: prefer evicting the non-confirmed one
+        confirmed = _confirmed_crop_ids(session)
+        a_confirmed = a in confirmed
+        b_confirmed = b in confirmed
+        if a_confirmed and not b_confirmed:
+            evict = b
+        elif b_confirmed and not a_confirmed:
+            evict = a
+        else:
+            # Both confirmed or both unconfirmed — evict the second one
+            evict = b
 
-    for (ca, cb), ev in evidence.items():
-        if ev["no_count"] > 0:
-            # Single "No" vetoes the merge
-            vetoed.append((ca, cb))
-            continue
-        if ev["yes_count"] >= 2:
-            merges_to_execute.append((ca, cb))
-        # Otherwise: insufficient evidence, leave separate
+        # Move evicted crop to new singleton cluster
+        existing_keys = list(session.reid_clusters.keys())
+        new_id = (max(existing_keys) + 1) if existing_keys else 0
+        session.reid_clusters[ca].remove(evict)
+        session.reid_clusters[new_id] = [evict]
+        crop = session.get_crop(evict)
+        if crop is not None:
+            crop.reid_cluster_id = new_id
 
-    # Execute merges using union-find for transitive closure
-    # (if A merges with B and B merges with C, then A, B, C are one cluster)
-    parent: Dict[int, int] = {}
+    # 3. Compute centroids from confirmed groups and re-assign non-confirmed crops
+    confirmed = _confirmed_crop_ids(session)
 
-    def find(x: int) -> int:
-        while parent.get(x, x) != x:
-            parent[x] = parent.get(parent[x], parent[x])
-            x = parent[x]
-        return x
+    if confirmed and len(session.reid_clusters) >= 2:
+        # Build centroids from confirmed members only
+        centroids: Dict[int, np.ndarray] = {}
+        for cluster_id, members in session.reid_clusters.items():
+            confirmed_in_cluster = [c for c in members if c in confirmed]
+            if not confirmed_in_cluster:
+                continue
+            feats = []
+            for cid in confirmed_in_cluster:
+                crop = session.get_crop(cid)
+                if crop is not None and crop.features is not None:
+                    feats.append(crop.features)
+            if feats:
+                centroid = np.mean(np.stack(feats), axis=0)
+                norm = float(np.linalg.norm(centroid))
+                if norm > 1e-8:
+                    centroid /= norm
+                centroids[cluster_id] = centroid
 
-    def union(a: int, b: int) -> None:
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[rb] = ra
+        # Re-assign non-confirmed crops to nearest centroid (hybrid approach).
+        # Need ≥2 centroids — with only 1, everything would collapse into it.
+        if len(centroids) >= 2:
+            for cluster_id, members in list(session.reid_clusters.items()):
+                for crop_id in list(members):
+                    if crop_id in confirmed:
+                        continue  # locked
+                    crop = session.get_crop(crop_id)
+                    if crop is None or crop.features is None:
+                        continue
+                    feat = crop.features
+                    feat_norm = float(np.linalg.norm(feat))
+                    if feat_norm < 1e-8:
+                        continue
+                    # Find nearest centroid (respecting cannot-links)
+                    best_cid = None
+                    best_sim = -1.0
+                    for cid, centroid in centroids.items():
+                        blocked = any(
+                            (crop_id, m) in cl_set
+                            for m in session.reid_clusters.get(cid, [])
+                        )
+                        if blocked:
+                            continue
+                        cos = float(np.dot(feat, centroid) / feat_norm)
+                        sim = 0.5 * (cos + 1.0)
+                        if sim > best_sim:
+                            best_sim = sim
+                            best_cid = cid
+                    # Move to better cluster if different
+                    if best_cid is not None and best_cid != cluster_id:
+                        members.remove(crop_id)
+                        session.reid_clusters[best_cid].append(crop_id)
+                        crop.reid_cluster_id = best_cid
 
-    # Initialize all existing cluster IDs
-    for cid in session.reid_clusters:
-        parent[cid] = cid
-
-    for ca, cb in merges_to_execute:
-        union(ca, cb)
-
-    # Rebuild clusters from union-find roots
-    new_clusters_raw: Dict[int, List[str]] = {}
-    for old_cid, members in session.reid_clusters.items():
-        root = find(old_cid)
-        if root not in new_clusters_raw:
-            new_clusters_raw[root] = []
-        new_clusters_raw[root].extend(members)
-
-    # Renumber clusters starting from 0
+    # Clean empty clusters and renumber
+    non_empty = {k: v for k, v in session.reid_clusters.items() if v}
     new_clusters: Dict[int, List[str]] = {}
-    root_to_new_id: Dict[int, int] = {}
-    for new_id, (root, members) in enumerate(sorted(new_clusters_raw.items())):
-        root_to_new_id[root] = new_id
+    for new_id, (_, members) in enumerate(sorted(non_empty.items())):
         new_clusters[new_id] = members
-
-    # Update crop reid_cluster_id to reflect new numbering
-    for new_id, members in new_clusters.items():
         for cid in members:
             crop = session.get_crop(cid)
             if crop is not None:
                 crop.reid_cluster_id = new_id
 
-    # Update session
     session.reid_clusters = new_clusters
     session.n_identities = len(new_clusters)
     session.touch()
     save_session(session)
 
-    # Build clusters response (crop_ids per cluster) for frontend display
+    # Build response
     clusters_info = {
         str(cid): {"crop_ids": members, "count": len(members)}
         for cid, members in new_clusters.items()
     }
 
-    summary = {
-        "merges_executed": len(merges_to_execute),
-        "vetoed_pairs": len(vetoed),
-        "final_clusters": len(new_clusters),
+    summary: Dict[str, Any] = {
         "n_identities": len(new_clusters),
         "cluster_sizes": {cid: len(m) for cid, m in new_clusters.items()},
         "clusters": clusters_info,
+        "reid_round": session.reid_round,
     }
 
-    # Add convergence information
-    coverage = compute_cluster_pair_coverage(session)
-    summary["needs_more_rounds"] = coverage["needs_more_rounds"]
-    summary["uncovered_count"] = coverage["uncovered_count"]
-    summary["reid_round"] = session.reid_round
+    # Phase transition: Phase 1 → 2 when centroids are established
+    if session.reid_phase_stage == 1 and _phase1_complete(session):
+        session.reid_phase_stage = 2
+        logger.info("Phase transition: 1 → 2 (centroid building complete)")
+        save_session(session)
+        # Compute initial centroid assignments for Phase 2
+        assignments = compute_centroid_assignments(session)
+        summary["centroid_assignments"] = assignments
+
+    # In Phase 1, check if more intra-cluster rounds needed
+    if session.reid_phase_stage == 1:
+        coverage = compute_cluster_pair_coverage(session)
+        summary["needs_more_rounds"] = coverage["needs_more_rounds"]
+        summary["uncovered_count"] = coverage["uncovered_count"]
+    else:
+        summary["needs_more_rounds"] = False
+
+    summary["reid_phase_stage"] = session.reid_phase_stage
 
     logger.info(
-        "Applied resolutions: %d merges, %d vetoed, %d final clusters",
-        summary["merges_executed"], summary["vetoed_pairs"], summary["final_clusters"],
+        "Applied resolutions (centroid-growing): %d must-links, %d cannot-links, "
+        "%d clusters, phase=%d",
+        len(session.reid_must_links), len(session.reid_cannot_links),
+        len(new_clusters), session.reid_phase_stage,
     )
     return summary
+
+
+# ---------------------------------------------------------------------------
+# 9. Visual ReID: Montage + Cluster Injection
+# ---------------------------------------------------------------------------
+
+def generate_montage(
+    session: InterviewSession,
+    per_row: int = 10,
+    crop_size: int = 128,
+) -> Optional[tuple]:
+    """Generate a labeled grid image of all accepted crops.
+
+    Returns (PIL.Image, list[str]) where the list contains crop IDs in grid
+    order (left-to-right, top-to-bottom), or None if no accepted crops.
+    """
+    from PIL import Image as PILImage, ImageDraw, ImageFont
+
+    accepted = session.get_crops_by_label(CropLabel.ACCEPTED)
+    if not accepted:
+        return None
+
+    # Deterministic order: by frame_idx then crop_id
+    accepted.sort(key=lambda c: (c.frame_idx, c.crop_id))
+
+    # Read frames and crop each accepted detection
+    cell_images = []
+    crop_ids = []
+    for crop in accepted:
+        frame = read_frame_cached(
+            session.video_path, crop.frame_idx, cache_key=session.cache_key,
+        )
+        if frame is None:
+            continue
+
+        x1, y1, x2, y2 = [int(round(v)) for v in crop.xyxy]
+        x1 = max(0, x1)
+        y1 = max(0, y1)
+        x2 = min(frame.width, x2)
+        y2 = min(frame.height, y2)
+        cropped = frame.crop((x1, y1, x2, y2))
+        cropped = cropped.resize((crop_size, crop_size), PILImage.LANCZOS)
+        cell_images.append(cropped)
+        crop_ids.append(crop.crop_id)
+
+    if not cell_images:
+        return None
+
+    # Layout: per_row columns, ceil(n / per_row) rows
+    n = len(cell_images)
+    n_rows = (n + per_row - 1) // per_row
+    label_h = 16  # height for text label below each crop
+    cell_h = crop_size + label_h
+
+    montage = PILImage.new("RGB", (per_row * crop_size, n_rows * cell_h), (40, 40, 40))
+    draw = ImageDraw.Draw(montage)
+
+    for idx, (img, cid) in enumerate(zip(cell_images, crop_ids)):
+        row, col = divmod(idx, per_row)
+        x = col * crop_size
+        y = row * cell_h
+        montage.paste(img, (x, y))
+        # Label below the crop
+        draw.text((x + 2, y + crop_size + 1), cid, fill=(255, 255, 255))
+
+    return montage, crop_ids
+
+
+def inject_clusters(
+    session: InterviewSession,
+    cluster_map: Dict[str, List[str]],
+) -> Dict[str, Any]:
+    """Inject visual ReID cluster assignments into the session.
+
+    Args:
+        session: The interview session to update.
+        cluster_map: Mapping of arbitrary label names to lists of crop IDs.
+            Example: {"person_A": ["c0", "c1"], "person_B": ["c2"]}
+
+    Returns:
+        Dict with summary stats: n_clusters, n_assigned, n_must_links,
+        n_cannot_links.
+
+    Raises:
+        ValueError: If any crop ID is unknown or duplicated across clusters.
+    """
+    from itertools import combinations
+
+    # --- Validate ---
+    all_ids = []
+    for label, cids in cluster_map.items():
+        all_ids.extend(cids)
+
+    # Check for unknowns
+    known_ids = set(session.crops.keys())
+    unknown = set(all_ids) - known_ids
+    if unknown:
+        raise ValueError(f"Unknown crop IDs: {sorted(unknown)}")
+
+    # Check for duplicates
+    if len(all_ids) != len(set(all_ids)):
+        from collections import Counter
+        dupes = [cid for cid, cnt in Counter(all_ids).items() if cnt > 1]
+        raise ValueError(f"Duplicate crop IDs across clusters: {sorted(dupes)}")
+
+    # --- Clear previous ReID state ---
+    session.reid_clusters = {}
+    session.reid_must_links = []
+    session.reid_cannot_links = []
+
+    # Reset all crops' reid_cluster_id
+    for crop in session.crops.values():
+        crop.reid_cluster_id = None
+
+    if not cluster_map:
+        return {
+            "n_clusters": 0,
+            "n_assigned": 0,
+            "n_must_links": 0,
+            "n_cannot_links": 0,
+        }
+
+    # --- Assign sequential integer cluster IDs ---
+    cluster_groups: List[List[str]] = []  # index = cluster_id
+    for label in cluster_map:
+        cluster_groups.append(cluster_map[label])
+
+    reid_clusters: Dict[int, List[str]] = {}
+    for cluster_id, cids in enumerate(cluster_groups):
+        reid_clusters[cluster_id] = list(cids)
+        for cid in cids:
+            crop = session.get_crop(cid)
+            if crop is not None:
+                crop.reid_cluster_id = cluster_id
+
+    session.reid_clusters = reid_clusters
+
+    # --- Generate must-links (within-cluster pairs) ---
+    must_links = []
+    for cids in cluster_groups:
+        for a, b in combinations(cids, 2):
+            must_links.append((a, b))
+    session.reid_must_links = must_links
+
+    # --- Generate cannot-links (cross-cluster pairs) ---
+    cannot_links = []
+    for i, j in combinations(range(len(cluster_groups)), 2):
+        for a in cluster_groups[i]:
+            for b in cluster_groups[j]:
+                cannot_links.append((a, b))
+    session.reid_cannot_links = cannot_links
+
+    return {
+        "n_clusters": len(cluster_groups),
+        "n_assigned": len(all_ids),
+        "n_must_links": len(must_links),
+        "n_cannot_links": len(cannot_links),
+    }

@@ -42,6 +42,16 @@ RUN pip install --no-cache-dir \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Install UFM (UniFlowMatch) for ReID pairwise covisibility.
+# UFM requires opencv-python; swap to headless (no X11) in a separate RUN
+# so the cv2 module files are properly installed.
+RUN git clone --recursive https://github.com/UniFlowMatch/UFM.git /opt/UFM \
+    && pip install --no-cache-dir -e /opt/UFM/UniCeption \
+    && pip install --no-cache-dir -e /opt/UFM
+RUN pip uninstall -y opencv-python && \
+    pip install --no-cache-dir --force-reinstall opencv-python-headless numpy==2.0.2 && \
+    python3 -c "import cv2; print('cv2 OK:', cv2.__version__)"
+
 COPY requirements-test.txt .
 RUN if [ "$TEST_ENV" = "true" ]; then pip install --no-cache-dir -r requirements-test.txt; fi
 

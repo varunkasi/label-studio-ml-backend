@@ -223,7 +223,15 @@ def session_resume():
         from .state import _sessions, _registry_lock
         with _registry_lock:
             _sessions[session.session_id] = session
-        return jsonify({"session_id": session.session_id, **session.stats()})
+        # Flag if video file was lost (e.g. container rebuild)
+        needs_video = bool(
+            session.video_path and not os.path.isfile(session.video_path)
+        )
+        return jsonify({
+            "session_id": session.session_id,
+            "needs_video_info": needs_video,
+            **session.stats(),
+        })
 
     elif mode == "build_on":
         session = load_session(cache_key)
@@ -234,7 +242,14 @@ def session_resume():
         from .state import _sessions, _registry_lock
         with _registry_lock:
             _sessions[session.session_id] = session
-        return jsonify({"session_id": session.session_id, **session.stats()})
+        needs_video = bool(
+            session.video_path and not os.path.isfile(session.video_path)
+        )
+        return jsonify({
+            "session_id": session.session_id,
+            "needs_video_info": needs_video,
+            **session.stats(),
+        })
 
     elif mode.startswith("use_from_"):
         source_task_id = int(mode.split("_")[-1])
@@ -260,8 +275,9 @@ def session_resume():
         return jsonify({"session_id": session.session_id, **session.stats()})
 
     else:
-        # Fresh start
-        delete_cache(cache_key, project_id)
+        # Fresh start — optionally preserve disk frame cache
+        keep_frames = bool(data.get("keep_frame_cache", False))
+        delete_cache(cache_key, project_id, keep_frame_cache=keep_frames)
         session = create_session(project_id, task_id, annotation_id)
         return jsonify({"session_id": session.session_id, **session.stats()})
 
@@ -595,6 +611,56 @@ def detect_crop_image(crop_id: str):
     }
 
 
+@interview_bp.route("/api/detect/crop/<crop_id>/context", methods=["GET"])
+def detect_crop_context(crop_id: str):
+    """Serve an expanded context patch around a crop as JPEG.
+
+    Expands the crop bounding box by a configurable factor (default 3.0)
+    and returns the result. Useful for seeing surrounding context when
+    making identity judgments.
+
+    Query params:
+        session_id: required
+        expand: expansion factor (default 3.0)
+    """
+    session_id = request.args.get("session_id")
+    session = get_session(session_id)
+    if session is None:
+        abort(404)
+
+    crop = session.get_crop(crop_id)
+    if crop is None:
+        abort(404)
+
+    expand = float(request.args.get("expand", 3.0))
+
+    pil_img = _read_frame_cached(session.video_path, crop.frame_idx, cache_key=session.cache_key)
+    if pil_img is None:
+        abort(404)
+
+    x1, y1, x2, y2 = [float(v) for v in crop.xyxy]
+    cx = (x1 + x2) / 2.0
+    cy = (y1 + y2) / 2.0
+    w = (x2 - x1) * expand / 2.0
+    h = (y2 - y1) * expand / 2.0
+
+    # Clamp to frame bounds
+    ctx_x1 = max(0, int(cx - w))
+    ctx_y1 = max(0, int(cy - h))
+    ctx_x2 = min(pil_img.width, int(cx + w))
+    ctx_y2 = min(pil_img.height, int(cy + h))
+
+    context_patch = pil_img.crop((ctx_x1, ctx_y1, ctx_x2, ctx_y2))
+
+    buf = io.BytesIO()
+    context_patch.save(buf, format="JPEG", quality=90)
+    buf.seek(0)
+    return buf.getvalue(), 200, {
+        "Content-Type": "image/jpeg",
+        "Cache-Control": "public, max-age=86400",
+    }
+
+
 @interview_bp.route("/api/detect/label", methods=["POST"])
 def detect_label():
     """Batch label crops (accept/reject)."""
@@ -710,60 +776,111 @@ def detect_recall_strategy():
 
 @interview_bp.route("/api/reid/start", methods=["POST"])
 def reid_start():
-    """Start clustering job."""
+    """Start UFM-based ReID clustering.
+
+    Body: {session_id, n_clusters} — n_clusters is REQUIRED (user specifies k).
+    Runs UFM pairwise similarity + HAC as a background job.
+    """
     data = request.get_json(force=True)
     session_id = data["session_id"]
-    n_clusters = data.get("n_clusters")  # optional, auto-estimated if None
+    n_clusters = data.get("n_clusters")
+
+    if not n_clusters or int(n_clusters) < 2:
+        return jsonify({"error": "n_clusters >= 2 is required"}), 400
+
+    n_clusters = int(n_clusters)
 
     session = get_session(session_id)
     if session is None:
         return jsonify({"error": "Session not found"}), 404
 
     def _cluster(progress):
-        from .reid_phase import run_reid_pipeline
-        return run_reid_pipeline(session, n_clusters, progress)
+        from .reid_ufm import run_ufm_reid_pipeline
+        return run_ufm_reid_pipeline(
+            session, n_clusters, progress, _read_frame_cached,
+        )
 
-    job_id = submit_job(_cluster, name="reid_clustering")
+    job_id = submit_job(_cluster, name="reid_ufm_clustering")
+    session.ufm_job_id = job_id
     return jsonify({"job_id": job_id}), 202
 
 
 @interview_bp.route("/api/reid/recluster", methods=["POST"])
 def reid_recluster():
-    """Re-run clustering with optional user-specified K or adjusted bias.
+    """Re-run HAC clustering with a different k.
 
-    Clears existing clusters and pairs, then re-runs the full ReID pipeline.
+    If UFM similarity matrix is already computed, re-uses it (instant).
+    Otherwise, re-computes from scratch.
+
+    Body: {session_id, n_clusters}
     """
     data = request.get_json(force=True)
     session_id = data["session_id"]
-    n_clusters = data.get("n_clusters")  # optional int
-    overcluster_bias = data.get("overcluster_bias")  # optional float
+    n_clusters = data.get("n_clusters")
+
+    if not n_clusters or int(n_clusters) < 2:
+        return jsonify({"error": "n_clusters >= 2 is required"}), 400
+
+    n_clusters = int(n_clusters)
 
     session = get_session(session_id)
     if session is None:
         return jsonify({"error": "Session not found"}), 404
 
-    # Clear existing clustering state
-    session.reid_pairs = {}
+    # Clear existing cluster assignments
     session.reid_clusters = {}
     session.n_identities = 0
+    for crop in session.crops.values():
+        crop.reid_cluster_id = None
 
-    if overcluster_bias is not None:
-        overcluster_bias = float(overcluster_bias)
+    # If we already have a UFM similarity matrix, just re-cluster (instant)
+    if session.ufm_similarity_matrix is not None and session.ufm_complete:
+        from .reid_ufm import cluster_hac, silhouette_score, compute_co_occurrence_warnings
 
+        sim = session.ufm_similarity_matrix
+        crop_ids = session.ufm_crop_ids
+        n = len(crop_ids)
+        k = max(2, min(n_clusters, n - 1))
+        labels = cluster_hac(sim, k)
+        sil = silhouette_score(sim, labels)
+
+        clusters = {}
+        for idx, cid in enumerate(crop_ids):
+            cluster_id = int(labels[idx])
+            clusters.setdefault(cluster_id, []).append(cid)
+            crop = session.get_crop(cid)
+            if crop is not None:
+                crop.reid_cluster_id = cluster_id
+
+        session.reid_clusters = clusters
+        session.n_identities = len(clusters)
+        session.touch()
+        save_session(session)
+
+        warnings = compute_co_occurrence_warnings(clusters, session.crops)
+        return jsonify({
+            "n_clusters": len(clusters),
+            "n_crops": n,
+            "cluster_sizes": {cid: len(m) for cid, m in clusters.items()},
+            "silhouette": round(sil, 4),
+            "co_occurrence_warnings": warnings,
+        })
+
+    # No matrix yet — run full pipeline as background job
     def _recluster(progress):
-        from .reid_phase import run_reid_pipeline
-        return run_reid_pipeline(
-            session, n_clusters, progress,
-            overcluster_bias=overcluster_bias,
+        from .reid_ufm import run_ufm_reid_pipeline
+        return run_ufm_reid_pipeline(
+            session, n_clusters, progress, _read_frame_cached,
         )
 
     job_id = submit_job(_recluster, name="reid_recluster")
+    session.ufm_job_id = job_id
     return jsonify({"job_id": job_id}), 202
 
 
 @interview_bp.route("/api/reid/clusters", methods=["GET"])
 def reid_clusters():
-    """Cluster list + pairs for resolution."""
+    """Cluster list with co-occurrence warnings and UFM status."""
     session_id = request.args.get("session_id")
     session = get_session(session_id)
     if session is None:
@@ -776,78 +893,73 @@ def reid_clusters():
             "count": len(crop_ids),
         }
 
-    # Get unresolved pairs
-    unresolved = [
-        p.__dict__ for p in session.reid_pairs.values()
-        if p.resolution is None
-    ]
+    # Co-occurrence warnings
+    from .reid_ufm import compute_co_occurrence_warnings
+    warnings = compute_co_occurrence_warnings(session.reid_clusters, session.crops)
 
     return jsonify({
         "clusters": clusters_info,
         "n_identities": session.n_identities,
-        "unresolved_pairs": unresolved,
-        "total_pairs": len(session.reid_pairs),
-        "reid_round": session.reid_round,
+        "cluster_sizes": {str(cid): len(m) for cid, m in session.reid_clusters.items()},
+        "ufm_complete": session.ufm_complete,
+        "co_occurrence_warnings": warnings,
     })
 
 
-@interview_bp.route("/api/reid/flag_outlier", methods=["POST"])
-def reid_flag_outlier():
-    """Flag a crop as an outlier — move it to a new singleton cluster.
+@interview_bp.route("/api/reid/assign", methods=["POST"])
+def reid_assign():
+    """Move selected crops into an existing cluster.
 
-    Generates new pairs for the flagged crop vs. representatives of
-    each existing cluster, enabling human-driven cluster splitting.
+    Body: {session_id, crop_ids: [str], target_cluster_id: int}
     """
     data = request.get_json(force=True)
     session_id = data["session_id"]
-    crop_id = data.get("crop_id")
+    crop_ids = data.get("crop_ids", [])
+    target_cluster_id = data.get("target_cluster_id")
 
-    if not crop_id:
-        return jsonify({"error": "crop_id is required"}), 400
+    if not crop_ids:
+        return jsonify({"error": "crop_ids is required"}), 400
+    if target_cluster_id is None:
+        return jsonify({"error": "target_cluster_id is required"}), 400
 
-    session = get_session(session_id)
-    if session is None:
-        return jsonify({"error": "Session not found"}), 404
-
-    from .reid_phase import flag_outlier
-    try:
-        result = flag_outlier(session, crop_id)
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
-
-    # Return updated cluster info for the frontend to re-render
-    clusters_info = {}
-    for cid, crop_ids_list in session.reid_clusters.items():
-        clusters_info[str(cid)] = {
-            "crop_ids": crop_ids_list,
-            "count": len(crop_ids_list),
-        }
-
-    result["clusters"] = clusters_info
-    return jsonify(result)
-
-
-@interview_bp.route("/api/reid/resolve", methods=["POST"])
-def reid_resolve():
-    """Submit pair resolutions (same/different/unsure)."""
-    data = request.get_json(force=True)
-    session_id = data["session_id"]
-    resolutions = data.get("resolutions", {})  # {pair_id: "same"|"different"|"unsure"}
+    target_cluster_id = int(target_cluster_id)
 
     session = get_session(session_id)
     if session is None:
         return jsonify({"error": "Session not found"}), 404
 
-    from .reid_phase import apply_resolutions
-    result = apply_resolutions(session, resolutions)
+    from .reid_ufm import assign_crops_to_cluster
+    result = assign_crops_to_cluster(session, crop_ids, target_cluster_id)
     save_session(session)
-
     return jsonify(result)
 
 
-@interview_bp.route("/api/reid/next_round", methods=["POST"])
-def reid_next_round():
-    """Generate next round of verification pairs for uncovered cluster-pairs."""
+@interview_bp.route("/api/reid/new_cluster", methods=["POST"])
+def reid_new_cluster():
+    """Create a new cluster from selected crops.
+
+    Body: {session_id, crop_ids: [str]}
+    """
+    data = request.get_json(force=True)
+    session_id = data["session_id"]
+    crop_ids = data.get("crop_ids", [])
+
+    if not crop_ids:
+        return jsonify({"error": "crop_ids is required"}), 400
+
+    session = get_session(session_id)
+    if session is None:
+        return jsonify({"error": "Session not found"}), 404
+
+    from .reid_ufm import create_new_cluster
+    result = create_new_cluster(session, crop_ids)
+    save_session(session)
+    return jsonify(result)
+
+
+@interview_bp.route("/api/reid/renumber", methods=["POST"])
+def reid_renumber():
+    """Renumber clusters to sequential 0-based IDs after manual edits."""
     data = request.get_json(force=True)
     session_id = data["session_id"]
 
@@ -855,37 +967,10 @@ def reid_next_round():
     if session is None:
         return jsonify({"error": "Session not found"}), 404
 
-    from .reid_phase import generate_next_round_pairs
-    new_pairs, coverage = generate_next_round_pairs(session)
-
-    return jsonify({
-        "pairs": [p.__dict__ for p in new_pairs],
-        "n_new_pairs": len(new_pairs),
-        "reid_round": session.reid_round,
-        **coverage,
-    })
-
-
-@interview_bp.route("/api/reid/pair/<pair_id>/frames", methods=["GET"])
-def reid_pair_frames(pair_id: str):
-    """Frame + crop data for a specific pair."""
-    session_id = request.args.get("session_id")
-    session = get_session(session_id)
-    if session is None:
-        return jsonify({"error": "Session not found"}), 404
-
-    pair = session.reid_pairs.get(pair_id)
-    if pair is None:
-        return jsonify({"error": "Pair not found"}), 404
-
-    crop_a = session.get_crop(pair.crop_id_a)
-    crop_b = session.get_crop(pair.crop_id_b)
-
-    return jsonify({
-        "pair": pair.__dict__,
-        "crop_a": crop_a.to_dict() if crop_a else None,
-        "crop_b": crop_b.to_dict() if crop_b else None,
-    })
+    from .reid_ufm import renumber_clusters, _build_cluster_summary
+    renumber_clusters(session)
+    save_session(session)
+    return jsonify(_build_cluster_summary(session))
 
 
 # ===========================================================================
@@ -931,10 +1016,27 @@ def seeds_list():
         "total_seeds": len(session.seeds),
         "identities": identity_summary,
         "seed_config": {
-            "frame_interval": session.seed_config.frame_interval,
+            "frame_pct": session.seed_config.frame_pct,
             "confidence_threshold": session.seed_config.confidence_threshold,
         },
     })
+
+
+@interview_bp.route("/api/frame_cache", methods=["DELETE"])
+def delete_frame_cache_endpoint():
+    """Delete just the disk frame cache for a specific task."""
+    data = request.get_json(force=True)
+    cache_key = data.get("cache_key")
+    if not cache_key:
+        return jsonify({"error": "cache_key is required"}), 400
+
+    try:
+        from .disk_frame_cache import delete_frame_cache
+        deleted = delete_frame_cache(cache_key)
+    except ImportError:
+        deleted = False
+
+    return jsonify({"deleted": deleted, "cache_key": cache_key})
 
 
 @interview_bp.route("/api/seeds/config", methods=["GET"])
@@ -945,9 +1047,23 @@ def seeds_config_get():
     if session is None:
         return jsonify({"error": "Session not found"}), 404
 
+    # Determine cached frame count from disk cache
+    cached_frame_count = 0
+    try:
+        from .disk_frame_cache import frame_cache_exists as _fce, get_frame_cache_meta as _gfcm
+        if _fce(session.cache_key):
+            meta = _gfcm(session.cache_key)
+            if meta and "sampled_indices" in meta:
+                cached_frame_count = len(meta["sampled_indices"])
+    except ImportError:
+        pass
+
     return jsonify({
-        "frame_interval": session.seed_config.frame_interval,
+        "frame_pct": session.seed_config.frame_pct,
         "confidence_threshold": session.seed_config.confidence_threshold,
+        "change_keyframes": session.change_keyframes,
+        "frames_count": session.frames_count,
+        "cached_frame_count": cached_frame_count,
     })
 
 
@@ -960,8 +1076,8 @@ def seeds_config_put():
     if session is None:
         return jsonify({"error": "Session not found"}), 404
 
-    if "frame_interval" in data:
-        session.seed_config.frame_interval = int(data["frame_interval"])
+    if "frame_pct" in data:
+        session.seed_config.frame_pct = max(1, min(100, int(data["frame_pct"])))
     if "confidence_threshold" in data:
         session.seed_config.confidence_threshold = float(data["confidence_threshold"])
 
@@ -969,7 +1085,7 @@ def seeds_config_put():
     save_session(session)
 
     return jsonify({
-        "frame_interval": session.seed_config.frame_interval,
+        "frame_pct": session.seed_config.frame_pct,
         "confidence_threshold": session.seed_config.confidence_threshold,
     })
 

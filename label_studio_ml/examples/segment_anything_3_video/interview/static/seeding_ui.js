@@ -18,7 +18,10 @@ class SeedingUI {
         this.sessionId = null;
         this.seeds = [];
         this.identities = {};
-        this.seedConfig = { frame_interval: 5, confidence_threshold: 0.8 };
+        this.seedConfig = { frame_pct: 100, confidence_threshold: 0.8 };
+        this.changeKeyframes = [];
+        this.framesCount = 0;
+        this.cachedFrameCount = 0;
         this.isGenerating = false;
         this.isUploading = false;
     }
@@ -43,13 +46,16 @@ class SeedingUI {
             // If we can't check, proceed and let server-side catch it
         }
 
-        // Load existing config
+        // Load existing config + cache stats
         try {
             var cfg = await API.get('/seeds/config', {
                 session_id: sessionId,
             });
-            this.seedConfig.frame_interval = cfg.frame_interval || 5;
+            this.seedConfig.frame_pct = cfg.frame_pct || 100;
             this.seedConfig.confidence_threshold = cfg.confidence_threshold || 0.8;
+            this.changeKeyframes = cfg.change_keyframes || [];
+            this.framesCount = cfg.frames_count || 0;
+            this.cachedFrameCount = cfg.cached_frame_count || 0;
         } catch (_) {
             // Use defaults
         }
@@ -61,8 +67,8 @@ class SeedingUI {
             });
             if (existing.total_seeds > 0) {
                 this.identities = existing.identities || {};
-                this.seedConfig.frame_interval = existing.seed_config
-                    ? existing.seed_config.frame_interval : this.seedConfig.frame_interval;
+                this.seedConfig.frame_pct = existing.seed_config
+                    ? (existing.seed_config.frame_pct || 100) : this.seedConfig.frame_pct;
                 this.seedConfig.confidence_threshold = existing.seed_config
                     ? existing.seed_config.confidence_threshold : this.seedConfig.confidence_threshold;
                 this._renderPreview(existing);
@@ -129,6 +135,7 @@ class SeedingUI {
 
     _renderConfig() {
         this.container.innerHTML = '';
+        var self = this;
 
         var panel = document.createElement('div');
         panel.className = 'seeding-panel';
@@ -145,39 +152,142 @@ class SeedingUI {
         explanation.style.fontSize = '0.85rem';
         explanation.style.marginBottom = '20px';
         explanation.textContent =
-            'Seeds will be generated every N frames across the video. ' +
+            'Seeds are generated from cached video frames. ' +
             'Only detections with confidence above the threshold will be kept. ' +
             'Each seed is a bounding box keyframe tied to an identity.';
         panel.appendChild(explanation);
+
+        // -- Change keyframe coverage visualization --
+        var nChange = this.changeKeyframes.length;
+        var totalFrames = this.framesCount;
+        var fps = (AppState.stats && AppState.stats.fps) || 25;
+
+        if (nChange > 0 && totalFrames > 0) {
+            // Compute gap statistics
+            var sorted = this.changeKeyframes.slice().sort(function (a, b) { return a - b; });
+            var gaps = [];
+            for (var gi = 1; gi < sorted.length; gi++) {
+                gaps.push(sorted[gi] - sorted[gi - 1]);
+            }
+            var maxGap = gaps.length > 0 ? Math.max.apply(null, gaps) : 0;
+            var avgGap = gaps.length > 0 ? Math.round(gaps.reduce(function (s, v) { return s + v; }, 0) / gaps.length) : 0;
+
+            // Stats line
+            var statsBar = document.createElement('div');
+            statsBar.style.padding = '10px 14px';
+            statsBar.style.background = 'var(--bg-accent)';
+            statsBar.style.borderRadius = 'var(--radius-sm)';
+            statsBar.style.fontSize = '0.8rem';
+            statsBar.style.color = 'var(--text-secondary)';
+            statsBar.style.marginBottom = '12px';
+            statsBar.style.display = 'flex';
+            statsBar.style.flexWrap = 'wrap';
+            statsBar.style.gap = '16px';
+            var items = [
+                nChange.toLocaleString() + ' change keyframes',
+                'avg spacing: ' + avgGap + ' frames (' + (avgGap / fps).toFixed(1) + 's)',
+                'largest gap: ' + maxGap + ' frames (' + (maxGap / fps).toFixed(1) + 's)',
+            ];
+            items.forEach(function (text) {
+                var span = document.createElement('span');
+                span.textContent = text;
+                statsBar.appendChild(span);
+            });
+            panel.appendChild(statsBar);
+
+            // Coverage strip label
+            var timelineLabel = document.createElement('div');
+            timelineLabel.style.fontSize = '0.7rem';
+            timelineLabel.style.color = 'var(--text-muted)';
+            timelineLabel.style.marginBottom = '4px';
+            timelineLabel.textContent = 'Coverage across video (bright = dense keyframes, dark = gaps)';
+            panel.appendChild(timelineLabel);
+
+            // Canvas: tick row (8px) + coverage strip (24px)
+            var canvas = document.createElement('canvas');
+            canvas.width = 800;
+            canvas.height = 32;
+            canvas.style.width = '100%';
+            canvas.style.height = '32px';
+            canvas.style.borderRadius = 'var(--radius-sm)';
+            canvas.style.marginBottom = '20px';
+            panel.appendChild(canvas);
+
+            setTimeout(function () { self._renderTimeline(canvas); }, 0);
+        } else {
+            var statsBar = document.createElement('div');
+            statsBar.style.padding = '10px 14px';
+            statsBar.style.background = 'var(--bg-accent)';
+            statsBar.style.borderRadius = 'var(--radius-sm)';
+            statsBar.style.fontSize = '0.8rem';
+            statsBar.style.color = 'var(--text-secondary)';
+            statsBar.style.marginBottom = '12px';
+            statsBar.textContent = 'No change keyframes detected.';
+            panel.appendChild(statsBar);
+        }
 
         // -- Config form --
         var configBox = document.createElement('div');
         configBox.className = 'seeding-config';
 
-        // Frame interval
-        var intervalGroup = document.createElement('div');
-        intervalGroup.className = 'form-group';
+        // Frame coverage (% slider)
+        var pctGroup = document.createElement('div');
+        pctGroup.className = 'form-group';
 
-        var intervalLabel = document.createElement('label');
-        intervalLabel.setAttribute('for', 'seed-frame-interval');
-        intervalLabel.textContent = 'Frame Interval';
+        var pctLabel = document.createElement('label');
+        pctLabel.setAttribute('for', 'seed-frame-pct');
+        pctLabel.textContent = 'Frame Coverage';
 
-        var intervalInput = document.createElement('input');
-        intervalInput.type = 'number';
-        intervalInput.id = 'seed-frame-interval';
-        intervalInput.min = '1';
-        intervalInput.max = '100';
-        intervalInput.value = String(this.seedConfig.frame_interval);
+        var pctRow = document.createElement('div');
+        pctRow.style.display = 'flex';
+        pctRow.style.alignItems = 'center';
+        pctRow.style.gap = '10px';
 
-        var intervalHint = document.createElement('div');
-        intervalHint.style.fontSize = '0.7rem';
-        intervalHint.style.color = 'var(--text-muted)';
-        intervalHint.style.marginTop = '4px';
-        intervalHint.textContent = 'Generate a seed every N frames (default: 5)';
+        var pctSlider = document.createElement('input');
+        pctSlider.type = 'range';
+        pctSlider.id = 'seed-frame-pct';
+        pctSlider.min = '1';
+        pctSlider.max = '100';
+        pctSlider.step = '1';
+        pctSlider.value = String(this.seedConfig.frame_pct);
+        pctSlider.style.flex = '1';
 
-        intervalGroup.appendChild(intervalLabel);
-        intervalGroup.appendChild(intervalInput);
-        intervalGroup.appendChild(intervalHint);
+        var pctValue = document.createElement('span');
+        pctValue.style.fontSize = '0.85rem';
+        pctValue.style.color = 'var(--text-primary)';
+        pctValue.style.minWidth = '40px';
+        pctValue.style.textAlign = 'right';
+        pctValue.textContent = this.seedConfig.frame_pct + '%';
+
+        var pctHint = document.createElement('div');
+        pctHint.style.fontSize = '0.7rem';
+        pctHint.style.color = 'var(--text-muted)';
+        pctHint.style.marginTop = '4px';
+
+        // Compute initial hint text
+        var initPct = this.seedConfig.frame_pct;
+        var initFrames = Math.max(1, Math.round(this.cachedFrameCount * initPct / 100));
+        var initEffective = Math.max(initFrames, nChange);
+        pctHint.textContent = 'Scan ~' + initEffective.toLocaleString() + ' of ' +
+            this.cachedFrameCount.toLocaleString() + ' cached frames (' +
+            nChange + ' change keyframes always included)';
+
+        pctSlider.addEventListener('input', function () {
+            var pct = parseInt(pctSlider.value, 10);
+            var nFrames = Math.max(1, Math.round(self.cachedFrameCount * pct / 100));
+            var effective = Math.max(nFrames, nChange);
+            pctValue.textContent = pct + '%';
+            pctHint.textContent = 'Scan ~' + effective.toLocaleString() + ' of ' +
+                self.cachedFrameCount.toLocaleString() + ' cached frames (' +
+                nChange + ' change keyframes always included)';
+        });
+
+        pctRow.appendChild(pctSlider);
+        pctRow.appendChild(pctValue);
+
+        pctGroup.appendChild(pctLabel);
+        pctGroup.appendChild(pctRow);
+        pctGroup.appendChild(pctHint);
 
         // Confidence threshold
         var threshGroup = document.createElement('div');
@@ -226,7 +336,7 @@ class SeedingUI {
         threshGroup.appendChild(threshRow);
         threshGroup.appendChild(threshHint);
 
-        configBox.appendChild(intervalGroup);
+        configBox.appendChild(pctGroup);
         configBox.appendChild(threshGroup);
         panel.appendChild(configBox);
 
@@ -240,10 +350,10 @@ class SeedingUI {
         btnGenerate.id = 'btn-generate-seeds';
         btnGenerate.textContent = 'Generate Seeds';
         btnGenerate.addEventListener('click', function () {
-            var interval = parseInt(intervalInput.value, 10);
+            var framePct = parseInt(pctSlider.value, 10);
             var threshold = parseFloat(threshSlider.value);
-            this._generateSeeds(interval, threshold);
-        }.bind(this));
+            self._generateSeeds(framePct, threshold);
+        });
 
         actions.appendChild(btnGenerate);
         panel.appendChild(actions);
@@ -259,10 +369,42 @@ class SeedingUI {
     }
 
     // ------------------------------------------------------------------
+    // Timeline sparkline
+    // ------------------------------------------------------------------
+
+    _renderTimeline(canvas) {
+        var ctx = canvas.getContext('2d');
+        var W = canvas.width;
+        var H = canvas.height;
+        var total = this.framesCount;
+        if (total === 0) return;
+
+        // Dark background
+        ctx.fillStyle = '#0d0d1a';
+        ctx.fillRect(0, 0, W, H);
+
+        // Draw each keyframe as a full-height tick mark.
+        // Clusters of ticks overlap visually → brighter regions.
+        ctx.fillStyle = 'rgba(233, 69, 96, 0.35)';
+        var kfs = this.changeKeyframes;
+        for (var i = 0; i < kfs.length; i++) {
+            var x = Math.round(kfs[i] / total * W);
+            ctx.fillRect(x, 0, 2, H);
+        }
+
+        // Crisp white tick on top for exact positions
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.6)';
+        for (var i = 0; i < kfs.length; i++) {
+            var x = Math.round(kfs[i] / total * W);
+            ctx.fillRect(x, 0, 1, H);
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Generate seeds
     // ------------------------------------------------------------------
 
-    async _generateSeeds(frameInterval, confidenceThreshold) {
+    async _generateSeeds(framePct, confidenceThreshold) {
         if (this.isGenerating) return;
         this.isGenerating = true;
 
@@ -276,7 +418,7 @@ class SeedingUI {
         try {
             await API.put('/seeds/config', {
                 session_id: this.sessionId,
-                frame_interval: frameInterval,
+                frame_pct: framePct,
                 confidence_threshold: confidenceThreshold,
             });
         } catch (err) {
@@ -304,7 +446,14 @@ class SeedingUI {
         this._showProgress('Generating seeds...');
 
         // Poll for completion
-        await this._pollJob(jobId);
+        var pollResult = await this._pollJob(jobId);
+
+        if (!pollResult || pollResult.status === 'failed') {
+            this.isGenerating = false;
+            if (btn) { btn.disabled = false; btn.textContent = 'Generate Seeds'; }
+            this._renderConfig();
+            return;
+        }
 
         // Fetch seed list
         try {
@@ -354,9 +503,9 @@ class SeedingUI {
             '<strong>' + seedData.total_seeds + '</strong></div>' +
             '<div><span style="color:var(--text-secondary)">Identities:</span> ' +
             '<strong>' + identityKeys.length + '</strong></div>' +
-            '<div><span style="color:var(--text-secondary)">Interval:</span> ' +
-            '<strong>' + (seedData.seed_config ? seedData.seed_config.frame_interval : '?') +
-            ' frames</strong></div>' +
+            '<div><span style="color:var(--text-secondary)">Coverage:</span> ' +
+            '<strong>' + (seedData.seed_config ? (seedData.seed_config.frame_pct || 100) : '?') +
+            '%</strong></div>' +
             '<div><span style="color:var(--text-secondary)">Threshold:</span> ' +
             '<strong>' + (seedData.seed_config ? seedData.seed_config.confidence_threshold : '?') +
             '</strong></div>';
@@ -689,7 +838,7 @@ class SeedingUI {
     }
 
     async _pollJob(jobId) {
-        var maxAttempts = 600;  // 10 minutes at 1s interval
+        var maxAttempts = 3600;  // 60 minutes at 1s interval
         var attempt = 0;
 
         while (attempt < maxAttempts) {
@@ -715,7 +864,7 @@ class SeedingUI {
             }
         }
 
-        showToast('Job timed out after 10 minutes.', 'error');
+        showToast('Job timed out after 60 minutes.', 'error');
         return null;
     }
 

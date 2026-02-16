@@ -18,6 +18,8 @@ import sys
 from collections import Counter, defaultdict
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
+import time
+
 import av
 import numpy as np
 import torch
@@ -582,6 +584,349 @@ def _generate_batched_backward_tracklets_sam3(
 
 
 # ---------------------------------------------------------------------------
+# Streaming tracking: constant-memory forward-only, frame-by-frame via PyAV
+# ---------------------------------------------------------------------------
+
+def _generate_streaming_forward_tracklets_sam3(
+    *,
+    video_path: str,
+    kf_global: int,
+    end_global: int,
+    seed_boxes: List[np.ndarray],
+    correction_keyframes: Optional[Dict[int, np.ndarray]] = None,
+    score_threshold: float = 0.1,
+    frame_stride: int = 1,
+    chunk_size: int = 2000,
+) -> List[Tuple[Dict[int, np.ndarray], Dict[int, float]]]:
+    """Generate forward tracklets using streaming (frame-by-frame) decode.
+
+    Unlike the batched version, this does NOT load all frames into memory.
+    Frames are decoded one-at-a-time via PyAV, fed to the SAM3 tracker model
+    directly.  CPU memory stays constant regardless of window length.
+
+    GPU memory is bounded by *chunk_size*: after processing that many frames
+    the SAM3 session is discarded (freeing the temporal memory bank), a fresh
+    session is created, and each non-terminated object is re-seeded with its
+    last tracked box.
+
+    Drift correction: if *correction_keyframes* is provided, human-annotated
+    boxes are injected via ``add_inputs_to_inference_session`` when the stream
+    reaches those frames.  This re-anchors the tracker and prevents drift over
+    long sequences.  The human box overrides the model output at correction
+    frames (score 1.0) and resets early-termination counters.
+
+    Args:
+        video_path: Path to the video file.
+        kf_global: Global frame index of the keyframe (seed frame).
+        end_global: Global frame index of the last frame to track (inclusive).
+        seed_boxes: List of box_xyxy arrays, one per seed.
+        correction_keyframes: Optional mapping of global_frame_idx to
+            box_xyxy arrays.  At each matching frame the human box is
+            injected into the SAM3 session for obj_id 0.
+        score_threshold: Per-object early termination threshold.
+        frame_stride: Sample one frame every N frames (default 1).
+        chunk_size: Max frames per SAM3 session before GPU-memory reset
+            (default 2000).
+
+    Returns:
+        List of (fwd_boxes, fwd_scores) tuples, one per seed, in input order.
+    """
+    n_seeds = len(seed_boxes)
+    if n_seeds == 0:
+        return []
+
+    correction_keyframes = correction_keyframes or {}
+
+    # Pre-fill seed frame with original annotation boxes (score 1.0)
+    results: List[Tuple[Dict[int, np.ndarray], Dict[int, float]]] = []
+    for i in range(n_seeds):
+        fwd_boxes: Dict[int, np.ndarray] = {kf_global: seed_boxes[i].copy()}
+        fwd_scores: Dict[int, float] = {kf_global: 1.0}
+        results.append((fwd_boxes, fwd_scores))
+
+    # Pre-fill correction keyframes with human annotation boxes (score 1.0)
+    for corr_frame, corr_box in correction_keyframes.items():
+        if kf_global < corr_frame <= end_global:
+            results[0][0][corr_frame] = corr_box.copy()
+            results[0][1][corr_frame] = 1.0
+
+    # Correction frame indices that must not be skipped by stride
+    correction_frames_set = set(correction_keyframes.keys())
+
+    if correction_keyframes:
+        logger.info(
+            "Streaming with %d correction keyframes (first=%d, last=%d)",
+            len(correction_keyframes),
+            min(correction_keyframes.keys()),
+            max(correction_keyframes.keys()),
+        )
+
+    # Nothing to propagate if keyframe IS the end frame
+    if kf_global >= end_global:
+        return results
+
+    sam3_model, sam3_processor = base._get_sam3_tracker_model()
+
+    # Boxes used to (re-)seed each chunk.  Updated at chunk boundaries.
+    current_boxes = [box.copy() for box in seed_boxes]
+
+    # Per-object early termination state
+    consecutive_below = [0] * n_seeds
+    terminated = [False] * n_seeds
+
+    # ── helper: create a fresh session and register seeds ──────────────
+    def _init_chunk_session(pil_img):
+        """Create a new streaming session and register non-terminated seeds."""
+        sess = sam3_processor.init_video_session(
+            inference_device=base.DEVICE,
+            dtype=base.DTYPE,
+        )
+        inp = sam3_processor(
+            images=pil_img, device=base.DEVICE, return_tensors="pt"
+        )
+        for i in range(n_seeds):
+            if terminated[i]:
+                continue
+            sam3_processor.add_inputs_to_inference_session(
+                sess,
+                frame_idx=0,
+                obj_ids=[i],
+                input_boxes=[[current_boxes[i].tolist()]],
+                original_size=inp.original_sizes[0],
+            )
+        sam3_model(inference_session=sess, frame=inp.pixel_values[0])
+        return sess
+
+    # ── open video ─────────────────────────────────────────────────────
+    container = av.open(video_path)
+    stream = container.streams.video[0]
+
+    need_pts_sync = False
+    if kf_global > 0 and stream.average_rate and stream.time_base:
+        avg_fps = float(stream.average_rate)
+        target_ts = int(kf_global / avg_fps / stream.time_base)
+        container.seek(target_ts, stream=stream)
+        need_pts_sync = True
+
+    total_frames = (end_global - kf_global + frame_stride) // frame_stride
+    pbar = tqdm(
+        total=total_frames,
+        desc="Streaming forward tracking",
+        unit="frame",
+    )
+
+    last_heartbeat = time.time()
+    propagation_start = time.time()
+    session: Any = None          # created on first decoded frame
+    session_frame_idx = 0
+    chunk_frame_count = 0        # frames processed in current chunk
+    n_chunks = 0
+    frame_idx = 0
+
+    try:
+        with torch.inference_mode():
+            for packet in container.demux(stream):
+                for frame in packet.decode():
+                    # After seeking, sync frame_idx from PTS
+                    if need_pts_sync and frame.pts is not None:
+                        avg_fps = float(stream.average_rate)
+                        tb = float(stream.time_base)
+                        frame_idx = int(round(frame.pts * tb * avg_fps))
+                        need_pts_sync = False
+
+                    if frame_idx < kf_global:
+                        frame_idx += 1
+                        continue
+                    if frame_idx > end_global:
+                        break
+
+                    # Apply stride (keyframe and correction frames always
+                    # included so drift-correction prompts are never skipped)
+                    if frame_idx != kf_global and frame_idx not in correction_frames_set:
+                        offset = frame_idx - kf_global
+                        if frame_stride > 1 and offset % frame_stride != 0:
+                            frame_idx += 1
+                            continue
+
+                    real_idx = frame_idx
+                    pil_img = frame.to_image()
+                    frame_idx += 1
+
+                    # Heartbeat logging
+                    now = time.time()
+                    if now - last_heartbeat > 30:
+                        elapsed = now - propagation_start
+                        mem_cur = torch.cuda.memory_allocated() / 1024**3
+                        mem_peak = torch.cuda.max_memory_allocated() / 1024**3
+                        logger.info(
+                            "Streaming heartbeat: frame %d, session_idx %d, "
+                            "chunk %d (%d frames in chunk), elapsed %.1fs, "
+                            "GPU mem: %.2f GB (peak: %.2f GB)",
+                            real_idx, session_frame_idx, n_chunks + 1,
+                            chunk_frame_count, elapsed, mem_cur, mem_peak,
+                        )
+                        last_heartbeat = now
+
+                    # ── chunk boundary: reset GPU session ──────────────
+                    if session is not None and chunk_frame_count >= chunk_size:
+                        # Update current_boxes with last tracked position
+                        for i in range(n_seeds):
+                            if not terminated[i] and results[i][0]:
+                                latest_frame = max(results[i][0].keys())
+                                current_boxes[i] = results[i][0][latest_frame]
+                                # Reset early-termination counter across chunks
+                                consecutive_below[i] = 0
+                        # Free GPU memory
+                        del session
+                        torch.cuda.empty_cache()
+                        session = None
+                        mem_after_free = torch.cuda.memory_allocated() / 1024**3
+                        logger.info(
+                            "Chunk %d done (%d frames). Resetting SAM3 session "
+                            "at frame %d (GPU mem after free: %.2f GB).",
+                            n_chunks + 1, chunk_frame_count, real_idx,
+                            mem_after_free,
+                        )
+
+                    # ── (re-)seed: first frame or after chunk reset ────
+                    if session is None:
+                        # If this frame is a correction keyframe, use the
+                        # human box as the re-seed instead of last tracked box
+                        if real_idx in correction_keyframes:
+                            current_boxes[0] = correction_keyframes[real_idx].copy()
+                            logger.info(
+                                "Using correction keyframe box at frame %d "
+                                "for chunk re-seed",
+                                real_idx,
+                            )
+                        inputs = sam3_processor(
+                            images=pil_img, device=base.DEVICE, return_tensors="pt"
+                        )
+                        session = _init_chunk_session(pil_img)
+                        mem_after_init = torch.cuda.memory_allocated() / 1024**3
+                        logger.info(
+                            "Chunk %d session initialized at frame %d "
+                            "(GPU mem: %.2f GB).",
+                            n_chunks + 1, real_idx, mem_after_init,
+                        )
+                        session_frame_idx += 1
+                        chunk_frame_count = 1
+                        n_chunks += 1
+                        pbar.update(1)
+                        continue
+
+                    # ── normal frame: run model, extract masks ─────────
+                    inputs = sam3_processor(
+                        images=pil_img, device=base.DEVICE, return_tensors="pt"
+                    )
+
+                    # Inject drift-correction prompt if this is a
+                    # correction keyframe (human re-annotated box).
+                    # Must happen BEFORE model() so the tracker absorbs
+                    # the correction for this frame and all future frames.
+                    if real_idx in correction_keyframes:
+                        corr_box = correction_keyframes[real_idx]
+                        sam3_processor.add_inputs_to_inference_session(
+                            session,
+                            frame_idx=chunk_frame_count,
+                            obj_ids=[0],
+                            input_boxes=[[corr_box.tolist()]],
+                            original_size=inputs.original_sizes[0],
+                        )
+                        # Reset early-termination — human says object is here
+                        consecutive_below[0] = 0
+                        if terminated[0]:
+                            terminated[0] = False
+                        logger.debug(
+                            "Injected correction at frame %d "
+                            "(session-local %d, chunk %d)",
+                            real_idx, chunk_frame_count, n_chunks,
+                        )
+
+                    output = sam3_model(
+                        inference_session=session,
+                        frame=inputs.pixel_values[0],
+                    )
+
+                    masks = sam3_processor.post_process_masks(
+                        [output.pred_masks],
+                        original_sizes=inputs.original_sizes,
+                        binarize=True,
+                    )[0]
+
+                    if output.object_ids is not None and len(output.object_ids) > 0:
+                        obj_logits = getattr(output, "object_score_logits", None)
+                        for i, obj_id in enumerate(output.object_ids):
+                            oid = int(obj_id)
+                            if oid >= n_seeds or terminated[oid]:
+                                continue
+
+                            per_obj_logits = (
+                                obj_logits[i] if obj_logits is not None else None
+                            )
+                            box, score = _mask_to_xyxy(
+                                masks[i], object_score_logits=per_obj_logits
+                            )
+
+                            # At correction frames, the human box
+                            # (pre-filled with score 1.0) takes precedence
+                            is_correction = real_idx in correction_keyframes
+                            if is_correction:
+                                consecutive_below[oid] = 0
+                            elif score is not None and score < score_threshold:
+                                consecutive_below[oid] += 1
+                                if consecutive_below[oid] >= 3:
+                                    terminated[oid] = True
+                                continue
+                            else:
+                                consecutive_below[oid] = 0
+
+                            if box is not None and not is_correction:
+                                results[oid][0][real_idx] = box
+                                if score is not None:
+                                    results[oid][1][real_idx] = score
+
+                    session_frame_idx += 1
+                    chunk_frame_count += 1
+                    pbar.update(1)
+
+                    # Don't exit early if correction keyframes remain
+                    # — they may un-terminate objects
+                    if all(terminated):
+                        has_future_corrections = any(
+                            cf > real_idx for cf in correction_keyframes
+                        )
+                        if not has_future_corrections:
+                            break
+
+                # Break outer loop if done
+                if frame_idx > end_global:
+                    break
+                if all(terminated):
+                    has_future_corrections = any(
+                        cf > real_idx for cf in correction_keyframes
+                    )
+                    if not has_future_corrections:
+                        break
+
+    finally:
+        pbar.close()
+        container.close()
+        if session is not None:
+            del session
+            torch.cuda.empty_cache()
+
+    elapsed = time.time() - propagation_start
+    logger.info(
+        "Streaming forward complete: %d session frames across %d chunks "
+        "in %.2fs",
+        session_frame_idx, n_chunks, elapsed,
+    )
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Detection oracle (Layer 2: cross-check tracker output against Sam3VideoModel)
 # ---------------------------------------------------------------------------
 
@@ -842,6 +1187,91 @@ def _run_sam3_tracking(
         unit="seed",
         disable=args.no_progress,
     ) as pbar:
+      if getattr(args, "streaming", False):
+        # ==============================================================
+        # Streaming path: per-REGION with drift-correction keyframes.
+        # Each region is tracked once; subsequent keyframes for the same
+        # region are injected as corrections via add_inputs_to_inference_session.
+        # ==============================================================
+        seeds_by_region: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for box in manual_boxes:
+            seeds_by_region[box["region_id"]].append(box)
+
+        for region_id, region_seeds in seeds_by_region.items():
+            region_seeds.sort(key=lambda s: s["global_frame"])
+            first_seed = region_seeds[0]
+            first_kf = first_seed["global_frame"]
+
+            # Refine the first keyframe box (corrections are used as-is)
+            if args.refine_seeds:
+                kf_decoded = _decode_segment_pyav(
+                    video_path, first_kf, first_kf, stride=1,
+                )
+                if kf_decoded:
+                    kf_pil = kf_decoded[0][1]
+                    original_box = first_seed["box_xyxy"]
+                    text_label = (
+                        first_seed["labels"][0]
+                        if first_seed["labels"]
+                        else "object"
+                    )
+                    refined_box, rscore = base.refine_box_with_text_prompt(
+                        image=kf_pil,
+                        box_xyxy=original_box,
+                        text_label=text_label,
+                        search_scale=args.refine_search_scale,
+                    )
+                    if rscore > 0:
+                        first_seed["box_xyxy"] = refined_box
+                        logger.debug(
+                            "Refined seed %s: [%.1f,%.1f,%.1f,%.1f] "
+                            "-> [%.1f,%.1f,%.1f,%.1f]",
+                            first_seed["temp_id"],
+                            *original_box[:4],
+                            *refined_box[:4],
+                        )
+                    del kf_decoded
+
+            # Build correction keyframes from subsequent keyframes
+            correction_kfs: Dict[int, np.ndarray] = {}
+            for seed in region_seeds[1:]:
+                correction_kfs[seed["global_frame"]] = seed["box_xyxy"]
+
+            stream_end = min(global_end, first_kf + max_ftk)
+            logger.info(
+                "Streaming region %s: seed at frame %d, %d correction "
+                "keyframes, end at frame %d (%d frames)",
+                region_id,
+                first_kf,
+                len(correction_kfs),
+                stream_end,
+                stream_end - first_kf + 1,
+            )
+
+            fwd_results = _generate_streaming_forward_tracklets_sam3(
+                video_path=video_path,
+                kf_global=first_kf,
+                end_global=stream_end,
+                seed_boxes=[first_seed["box_xyxy"]],
+                correction_keyframes=correction_kfs or None,
+                score_threshold=getattr(args, "score_threshold", 0.1),
+                frame_stride=frame_stride,
+                chunk_size=getattr(args, "streaming_chunk_size", 2000),
+            )
+
+            fwd_boxes, fwd_scores = fwd_results[0]
+            tracklets[first_seed["temp_id"]] = {
+                "fwd": fwd_boxes,
+                "bwd": {},
+                "fwd_scores": fwd_scores,
+                "bwd_scores": {},
+            }
+            pbar.update(len(region_seeds))
+
+      else:
+        # ==============================================================
+        # Batched path: per-KEYFRAME iteration (existing behavior).
+        # ==============================================================
         for kf_global in unique_keyframes:
             seeds = seeds_by_kf[kf_global]
 
@@ -973,13 +1403,16 @@ def _run_sam3_tracking(
                 score_threshold=score_threshold,
             )
 
-            bwd_results = _generate_batched_backward_tracklets_sam3(
-                frames_list=win_frames,
-                frame_idx_map=win_idx_map,
-                seed_session_idx=kf_session,
-                seed_boxes=all_seed_boxes,
-                score_threshold=score_threshold,
-            )
+            if getattr(args, "forward_only", False):
+                bwd_results = [({}, {}) for _ in all_seed_boxes]
+            else:
+                bwd_results = _generate_batched_backward_tracklets_sam3(
+                    frames_list=win_frames,
+                    frame_idx_map=win_idx_map,
+                    seed_session_idx=kf_session,
+                    seed_boxes=all_seed_boxes,
+                    score_threshold=score_threshold,
+                )
 
             for si, seed in enumerate(seeds):
                 fwd_boxes, fwd_scores = fwd_results[si]
@@ -1155,6 +1588,24 @@ def main() -> None:
         help="Maximum frames to track in each direction from a keyframe",
     )
     parser.add_argument(
+        "--forward-only",
+        action="store_true",
+        default=False,
+        help="Only propagate forward from each keyframe (skip backward tracking)",
+    )
+    parser.add_argument(
+        "--streaming",
+        action="store_true",
+        default=False,
+        help="Use streaming (frame-by-frame) tracking for constant memory. Implies --forward-only.",
+    )
+    parser.add_argument(
+        "--streaming-chunk-size",
+        type=int,
+        default=2000,
+        help="Max frames per SAM3 session in streaming mode before GPU memory reset (default: 2000)",
+    )
+    parser.add_argument(
         "--frame-stride",
         type=int,
         default=1,
@@ -1204,6 +1655,10 @@ def main() -> None:
         help="object_score_logits threshold for early termination (sigmoid; default: 0.1)",
     )
     args = parser.parse_args()
+
+    # --streaming implies --forward-only (no backward pass in streaming mode)
+    if getattr(args, "streaming", False):
+        args.forward_only = True
 
     logging.getLogger().setLevel(getattr(logging, args.log_level))
 

@@ -383,7 +383,8 @@ def _rgb_to_hsv(rgb: np.ndarray) -> np.ndarray:
     v = maxc
 
     diff = maxc - minc
-    s = np.where(maxc != 0, diff / maxc, 0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        s = np.where(maxc != 0, diff / maxc, 0)
 
     # Compute hue
     h = np.zeros_like(maxc)
