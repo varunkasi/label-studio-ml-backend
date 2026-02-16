@@ -116,11 +116,6 @@ EMBEDDING_TARGET_FPS = float(os.getenv("INTERVIEW_EMBEDDING_FPS", "10"))
 EMBEDDING_MODE = os.getenv("INTERVIEW_EMBEDDING_MODE", "lightweight")
 
 
-def _get_embedding_mode() -> str:
-    """Return the current embedding mode for testability."""
-    return EMBEDDING_MODE
-
-
 # ===========================================================================
 # NMS (pure numpy)
 # ===========================================================================
@@ -259,20 +254,6 @@ def pad_boxes(
 # ===========================================================================
 # Batch decode + detect helpers
 # ===========================================================================
-
-def uniform_indices(total: int, k: int) -> List[int]:
-    """Return *k* uniformly-spaced frame indices in [0, total).
-
-    Always includes the first and last frame when k >= 2.
-    """
-    if total <= 0 or k <= 0:
-        return []
-    if k >= total:
-        return list(range(total))
-    if k == 1:
-        return [total // 2]
-    return [int(round(i * (total - 1) / (k - 1))) for i in range(k)]
-
 
 FRAMES_PER_ROUND = int(os.getenv("INTERVIEW_FRAMES_PER_ROUND", "40"))
 VALIDATION_FRAMES_COUNT = int(os.getenv("INTERVIEW_VALIDATION_FRAMES", "20"))

@@ -611,56 +611,6 @@ def detect_crop_image(crop_id: str):
     }
 
 
-@interview_bp.route("/api/detect/crop/<crop_id>/context", methods=["GET"])
-def detect_crop_context(crop_id: str):
-    """Serve an expanded context patch around a crop as JPEG.
-
-    Expands the crop bounding box by a configurable factor (default 3.0)
-    and returns the result. Useful for seeing surrounding context when
-    making identity judgments.
-
-    Query params:
-        session_id: required
-        expand: expansion factor (default 3.0)
-    """
-    session_id = request.args.get("session_id")
-    session = get_session(session_id)
-    if session is None:
-        abort(404)
-
-    crop = session.get_crop(crop_id)
-    if crop is None:
-        abort(404)
-
-    expand = float(request.args.get("expand", 3.0))
-
-    pil_img = _read_frame_cached(session.video_path, crop.frame_idx, cache_key=session.cache_key)
-    if pil_img is None:
-        abort(404)
-
-    x1, y1, x2, y2 = [float(v) for v in crop.xyxy]
-    cx = (x1 + x2) / 2.0
-    cy = (y1 + y2) / 2.0
-    w = (x2 - x1) * expand / 2.0
-    h = (y2 - y1) * expand / 2.0
-
-    # Clamp to frame bounds
-    ctx_x1 = max(0, int(cx - w))
-    ctx_y1 = max(0, int(cy - h))
-    ctx_x2 = min(pil_img.width, int(cx + w))
-    ctx_y2 = min(pil_img.height, int(cy + h))
-
-    context_patch = pil_img.crop((ctx_x1, ctx_y1, ctx_x2, ctx_y2))
-
-    buf = io.BytesIO()
-    context_patch.save(buf, format="JPEG", quality=90)
-    buf.seek(0)
-    return buf.getvalue(), 200, {
-        "Content-Type": "image/jpeg",
-        "Cache-Control": "public, max-age=86400",
-    }
-
-
 @interview_bp.route("/api/detect/label", methods=["POST"])
 def detect_label():
     """Batch label crops (accept/reject)."""
@@ -730,43 +680,6 @@ def detect_train():
         return train_classifier(session, progress)
 
     job_id = submit_job(_train, name="train_classifier")
-    return jsonify({"job_id": job_id}), 202
-
-
-@interview_bp.route("/api/detect/training_status", methods=["GET"])
-def detect_training_status():
-    """Training progress, accuracy, next batch."""
-    session_id = request.args.get("session_id")
-    session = get_session(session_id)
-    if session is None:
-        return jsonify({"error": "Session not found"}), 404
-
-    return jsonify({
-        "model_trained": session.model_trained,
-        "training_epochs": session.training_epochs,
-        "training_accuracy": session.training_accuracy,
-        "pending_crops": len(session.get_crops_by_label(CropLabel.PENDING)),
-        "validation_history": session.validation_history,
-    })
-
-
-@interview_bp.route("/api/detect/recall_strategy", methods=["POST"])
-def detect_recall_strategy():
-    """Start recall gap job: multi_prompt strategy."""
-    data = request.get_json(force=True)
-    session_id = data["session_id"]
-    strategy = data.get("strategy")  # "multi_prompt"
-    extra_prompts = data.get("prompts", [])
-
-    session = get_session(session_id)
-    if session is None:
-        return jsonify({"error": "Session not found"}), 404
-
-    def _recall(progress):
-        from .detection import run_recall_strategy
-        return run_recall_strategy(session, strategy, extra_prompts, progress)
-
-    job_id = submit_job(_recall, name=f"recall_{strategy}")
     return jsonify({"job_id": job_id}), 202
 
 
@@ -955,22 +868,6 @@ def reid_new_cluster():
     result = create_new_cluster(session, crop_ids)
     save_session(session)
     return jsonify(result)
-
-
-@interview_bp.route("/api/reid/renumber", methods=["POST"])
-def reid_renumber():
-    """Renumber clusters to sequential 0-based IDs after manual edits."""
-    data = request.get_json(force=True)
-    session_id = data["session_id"]
-
-    session = get_session(session_id)
-    if session is None:
-        return jsonify({"error": "Session not found"}), 404
-
-    from .reid_ufm import renumber_clusters, _build_cluster_summary
-    renumber_clusters(session)
-    save_session(session)
-    return jsonify(_build_cluster_summary(session))
 
 
 # ===========================================================================

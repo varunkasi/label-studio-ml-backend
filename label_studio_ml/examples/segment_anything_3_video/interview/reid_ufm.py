@@ -225,21 +225,6 @@ def create_new_cluster(
     return result
 
 
-def renumber_clusters(session) -> None:
-    """Renumber clusters to sequential 0-based IDs."""
-    old = dict(session.reid_clusters)
-    new_clusters: Dict[int, List[str]] = {}
-    for new_id, (_, members) in enumerate(sorted(old.items())):
-        new_clusters[new_id] = members
-        for cid in members:
-            crop = session.get_crop(cid)
-            if crop is not None:
-                crop.reid_cluster_id = new_id
-
-    session.reid_clusters = new_clusters
-    session.n_identities = len(new_clusters)
-
-
 # ---------------------------------------------------------------------------
 # 4. Full pipeline
 # ---------------------------------------------------------------------------
