@@ -742,9 +742,6 @@ class Toolbar {
      * @param {Object} options
      * @param {boolean} options.drawMode - Whether draw mode is active.
      * @param {Function} options.onDrawToggle - Callback when draw toggle is clicked.
-     * @param {Function} options.onTrain - Callback for the Train button.
-     * @param {Function} options.onRecall - Callback when a recall strategy is chosen. Receives strategy name.
-     * @param {Array<string>} [options.recallStrategies] - Available recall strategy names.
      * @param {Function} [options.onPrevFrame] - Navigate to previous sampled frame.
      * @param {Function} [options.onNextFrame] - Navigate to next sampled frame.
      * @param {Function} [options.onAdvancePhase] - Advance to next workflow phase.
@@ -810,42 +807,6 @@ class Toolbar {
             if (options.onNextRound) options.onNextRound();
         });
         this.el.appendChild(nextRoundBtn);
-
-        // Recall strategies dropdown
-        const strategies = options.recallStrategies || ['multi_prompt'];
-        const dropdown = document.createElement('div');
-        dropdown.className = 'dropdown';
-        dropdown.style.position = 'relative';
-
-        const dropBtn = document.createElement('button');
-        dropBtn.className = 'btn btn-secondary btn-small';
-        dropBtn.textContent = 'Recall Strategies';
-        dropdown.appendChild(dropBtn);
-
-        const menu = document.createElement('ul');
-        menu.className = 'dropdown-menu';
-
-        strategies.forEach((strategy) => {
-            const li = document.createElement('li');
-            li.textContent = strategy.replace(/_/g, ' ');
-            li.addEventListener('click', () => {
-                menu.classList.remove('open');
-                if (options.onRecall) options.onRecall(strategy);
-            });
-            menu.appendChild(li);
-        });
-        dropdown.appendChild(menu);
-
-        dropBtn.addEventListener('click', (e) => {
-            e.stopPropagation();
-            menu.classList.toggle('open');
-        });
-        // Close dropdown on outside click
-        document.addEventListener('click', () => {
-            menu.classList.remove('open');
-        }, { once: false });
-
-        this.el.appendChild(dropdown);
 
         // Separator
         this.el.appendChild(this._separator());

@@ -866,8 +866,6 @@ function _renderToolbar() {
         sortBy: AppState.sortBy,
         filterLabel: AppState.filterLabel,
         stats: AppState.stats,
-        recallStrategies: ['multi_prompt'],
-
         onDrawToggle: () => {
             AppState.drawMode = !AppState.drawMode;
             const fv = AppState._components.frameViewer;
@@ -884,7 +882,6 @@ function _renderToolbar() {
         onNextRound: _onNextRound,
         currentRound: AppState.stats.current_round || 1,
         roundsCompleted: AppState.stats.rounds_completed || 0,
-        onRecall: _onRecall,
 
         onPrevFrame: () => _navigateFrame(-1),
         onNextFrame: () => _navigateFrame(1),
@@ -1091,41 +1088,6 @@ function _navigateFrame(direction) {
     fv.loadFrame(nextFrame, AppState.sessionId);
 }
 
-/** Handle the Train Classifier button. */
-async function _onTrain() {
-    const progress = AppState._components.progressOverlay;
-
-    try {
-        progress.show('Starting classifier training...', -1);
-
-        const job = await API.post('/detect/train', {
-            session_id: AppState.sessionId,
-        });
-
-        pollJob(
-            job.job_id,
-            (p) => {
-                progress.show(p.step || 'Training...', p.percent || -1);
-            },
-            async (p) => {
-                progress.hide();
-                if (p.status === 'completed') {
-                    await _refreshCrops();
-                    const vh = (AppState.stats && AppState.stats.validation_history) || [];
-                    const valStr = vh.length > 0
-                        ? ` — Val: ${Math.round(vh[vh.length - 1].val_accuracy * 100)}%`
-                        : '';
-                    showToast('Classifier trained' + valStr, 'success');
-                } else {
-                    showToast(`Training failed: ${p.error}`, 'error');
-                }
-            }
-        );
-    } catch (err) {
-        progress.hide();
-    }
-}
-
 /** Handle Next Round: train MLP on all labels, then detect on new frames. */
 async function _onNextRound() {
     const progress = AppState._components.progressOverlay;
@@ -1153,99 +1115,6 @@ async function _onNextRound() {
                     showToast(`Round ${job.round} ready` + valStr, 'success');
                 } else {
                     showToast(`Round failed: ${p.error}`, 'error');
-                }
-            }
-        );
-    } catch (err) {
-        progress.hide();
-    }
-}
-
-/**
- * Handle a recall strategy selection.
- * @param {string} strategy - 'multi_prompt'.
- */
-async function _onRecall(strategy) {
-    const progress = AppState._components.progressOverlay;
-
-    let extraPrompts = [];
-    if (strategy === 'multi_prompt') {
-        const closeModal = Modal.show(
-            'Multi-Prompt Recall',
-            '<p style="color:var(--text-secondary);font-size:0.85rem;margin-bottom:12px;">' +
-            'Enter additional detection prompts (one per line):</p>' +
-            '<textarea id="recall-prompts" rows="4" style="width:100%;padding:8px;' +
-            'background:var(--bg-body);border:1px solid var(--border-default);' +
-            'color:var(--text-primary);border-radius:var(--radius-sm);' +
-            'font-family:var(--font-stack);font-size:0.85rem;"' +
-            ' placeholder="e.g. human\nwalking person\nstanding figure"></textarea>' +
-            '<div style="margin-top:12px;display:flex;gap:8px;justify-content:flex-end;">' +
-            '<button id="recall-cancel-btn" class="btn btn-ghost">Cancel</button>' +
-            '<button id="recall-go-btn" class="btn btn-primary">Run</button></div>'
-        );
-
-        return new Promise((resolve) => {
-            // Wait for the modal DOM to be ready
-            requestAnimationFrame(() => {
-                const goBtn = document.getElementById('recall-go-btn');
-                const cancelBtn = document.getElementById('recall-cancel-btn');
-                const textarea = document.getElementById('recall-prompts');
-
-                if (cancelBtn) {
-                    cancelBtn.addEventListener('click', () => {
-                        closeModal();
-                        resolve();
-                    });
-                }
-
-                if (goBtn) {
-                    goBtn.addEventListener('click', async () => {
-                        extraPrompts = (textarea.value || '')
-                            .split('\n')
-                            .map((s) => s.trim())
-                            .filter(Boolean);
-                        closeModal();
-                        await _runRecallJob(strategy, extraPrompts);
-                        resolve();
-                    });
-                }
-            });
-        });
-    }
-}
-
-/**
- * Execute a recall strategy background job.
- * @param {string} strategy
- * @param {Array<string>} extraPrompts
- */
-async function _runRecallJob(strategy, extraPrompts) {
-    const progress = AppState._components.progressOverlay;
-
-    try {
-        progress.show(`Running ${strategy.replace(/_/g, ' ')}...`, -1);
-
-        const job = await API.post('/detect/recall_strategy', {
-            session_id: AppState.sessionId,
-            strategy,
-            prompts: extraPrompts,
-        });
-
-        pollJob(
-            job.job_id,
-            (p) => {
-                progress.show(p.step || 'Recall...', p.percent || -1);
-            },
-            async (p) => {
-                progress.hide();
-                if (p.status === 'completed') {
-                    const newCount = p.result?.new_crops || 0;
-                    showToast(`Recall (${strategy}) complete: ${newCount} new crops`, 'success');
-                    // Reset filter to 'all' so newly-added pending crops are visible
-                    AppState.filterLabel = 'all';
-                    await _refreshCrops();
-                } else {
-                    showToast(`Recall failed: ${p.error}`, 'error');
                 }
             }
         );
@@ -1292,7 +1161,7 @@ function renderReID(app) {
 
 /**
  * Render the seeding configuration and upload interface.
- * Delegates to renderSeedingPhase (defined in seeding_ui.js) if available.
+ * Delegates to renderSeedingPhase (defined in seeding_ui.js).
  * @param {HTMLElement} app
  */
 function renderSeeding(app) {
@@ -1302,218 +1171,18 @@ function renderSeeding(app) {
         return;
     }
 
-    // If seeding_ui.js provides an extended renderer, use it
     if (typeof renderSeedingPhase === 'function') {
         renderSeedingPhase(app);
         return;
     }
 
-    // Fallback: basic seeding interface
-    _renderSeedingFallback(app);
-}
-
-/** Basic seeding interface when seeding_ui.js is not loaded. */
-function _renderSeedingFallback(app) {
+    // seeding_ui.js not loaded
     const panel = document.createElement('div');
-    panel.className = 'seeding-panel';
-
-    // Config form
-    const configEl = document.createElement('div');
-    configEl.className = 'seeding-config';
-    configEl.innerHTML = `
-        <div class="form-group">
-            <label for="seed-frame-interval">Frame Interval</label>
-            <input type="number" id="seed-frame-interval" value="5" min="1" max="100">
-        </div>
-        <div class="form-group">
-            <label for="seed-confidence">Confidence Threshold</label>
-            <input type="number" id="seed-confidence" value="0.8" min="0" max="1" step="0.05">
-        </div>
-    `;
-    panel.appendChild(configEl);
-
-    // Action buttons
-    const actions = document.createElement('div');
-    actions.className = 'seeding-actions';
-
-    const saveConfigBtn = document.createElement('button');
-    saveConfigBtn.className = 'btn btn-secondary';
-    saveConfigBtn.textContent = 'Save Config';
-    saveConfigBtn.addEventListener('click', async () => {
-        const interval = parseInt(document.getElementById('seed-frame-interval').value, 10);
-        const threshold = parseFloat(document.getElementById('seed-confidence').value);
-        try {
-            await API.put('/seeds/config', {
-                session_id: AppState.sessionId,
-                frame_interval: interval,
-                confidence_threshold: threshold,
-            });
-            showToast('Config saved', 'success');
-        } catch (err) {
-            // Already toasted
-        }
-    });
-    actions.appendChild(saveConfigBtn);
-
-    const generateBtn = document.createElement('button');
-    generateBtn.className = 'btn btn-primary';
-    generateBtn.textContent = 'Generate Seeds';
-    generateBtn.addEventListener('click', () => _generateSeeds(panel));
-    actions.appendChild(generateBtn);
-
-    const uploadBtn = document.createElement('button');
-    uploadBtn.className = 'btn btn-primary';
-    uploadBtn.textContent = 'Upload to Label Studio';
-    uploadBtn.disabled = true;
-    uploadBtn.id = 'seed-upload-btn';
-    uploadBtn.addEventListener('click', () => _uploadSeeds());
-    actions.appendChild(uploadBtn);
-
-    panel.appendChild(actions);
-
-    // Seed preview area
-    const preview = document.createElement('div');
-    preview.id = 'seed-preview';
-    preview.style.marginTop = '20px';
-    panel.appendChild(preview);
-
+    panel.style.cssText = 'padding:40px;text-align:center;';
+    panel.innerHTML =
+        '<h2>Seeding</h2>' +
+        '<p style="color:var(--text-secondary);">seeding_ui.js is required but was not loaded.</p>';
     app.appendChild(panel);
-
-    // Load current config
-    _loadSeedConfig();
-}
-
-/** Load existing seed config from backend. */
-async function _loadSeedConfig() {
-    try {
-        const config = await API.get('/seeds/config', {
-            session_id: AppState.sessionId,
-        });
-        const intervalInput = document.getElementById('seed-frame-interval');
-        const confidenceInput = document.getElementById('seed-confidence');
-        if (intervalInput) intervalInput.value = config.frame_interval;
-        if (confidenceInput) confidenceInput.value = config.confidence_threshold;
-    } catch (err) {
-        // Use defaults
-    }
-}
-
-/** Run seed generation and show preview. */
-async function _generateSeeds(panel) {
-    try {
-        showToast('Generating seeds...', 'info');
-
-        const job = await API.post('/seeds/generate', {
-            session_id: AppState.sessionId,
-        });
-
-        pollJob(
-            job.job_id,
-            (p) => {
-                // Inline progress
-            },
-            async (p) => {
-                if (p.status === 'completed') {
-                    showToast('Seeds generated', 'success');
-                    await _loadSeedPreview();
-                } else {
-                    showToast(`Seed generation failed: ${p.error}`, 'error');
-                }
-            }
-        );
-    } catch (err) {
-        // Already toasted
-    }
-}
-
-/** Load and display seed summary. */
-async function _loadSeedPreview() {
-    try {
-        const data = await API.get('/seeds/list', { session_id: AppState.sessionId });
-        const preview = document.getElementById('seed-preview');
-        if (!preview) return;
-
-        preview.innerHTML = '';
-
-        // Summary
-        const summary = document.createElement('div');
-        summary.style.cssText =
-            'font-size:0.85rem;color:var(--text-secondary);margin-bottom:16px;';
-        summary.textContent = `Total seeds: ${data.total_seeds}`;
-        preview.appendChild(summary);
-
-        // Identity table
-        if (data.identities && Object.keys(data.identities).length > 0) {
-            const wrapper = document.createElement('div');
-            wrapper.className = 'seed-table-wrapper';
-
-            const table = document.createElement('table');
-            table.className = 'seed-table';
-            table.innerHTML = `
-                <thead>
-                    <tr>
-                        <th>Identity</th>
-                        <th>Seed Count</th>
-                        <th>Frames</th>
-                    </tr>
-                </thead>
-                <tbody></tbody>
-            `;
-
-            const tbody = table.querySelector('tbody');
-            for (const [identity, info] of Object.entries(data.identities)) {
-                const tr = document.createElement('tr');
-                const frames = info.frames.slice(0, 10).join(', ');
-                const more = info.frames.length > 10 ? ` (+${info.frames.length - 10} more)` : '';
-                tr.innerHTML = `
-                    <td>${identity}</td>
-                    <td>${info.count}</td>
-                    <td style="font-size:0.75rem;color:var(--text-muted)">${frames}${more}</td>
-                `;
-                tbody.appendChild(tr);
-            }
-
-            wrapper.appendChild(table);
-            preview.appendChild(wrapper);
-        }
-
-        // Enable upload button
-        const uploadBtn = document.getElementById('seed-upload-btn');
-        if (uploadBtn) uploadBtn.disabled = data.total_seeds === 0;
-    } catch (err) {
-        // Already toasted
-    }
-}
-
-/** Upload seeds to Label Studio. */
-async function _uploadSeeds() {
-    const confirmed = await Modal.confirm(
-        'Upload Seeds',
-        'Upload seed annotations to Label Studio? This will create/modify annotations.'
-    );
-    if (!confirmed) return;
-
-    try {
-        showToast('Uploading seeds...', 'info');
-
-        const job = await API.post('/seeds/upload', {
-            session_id: AppState.sessionId,
-        });
-
-        pollJob(
-            job.job_id,
-            (p) => { /* progress */ },
-            (p) => {
-                if (p.status === 'completed') {
-                    showToast('Seeds uploaded successfully!', 'success');
-                } else {
-                    showToast(`Upload failed: ${p.error}`, 'error');
-                }
-            }
-        );
-    } catch (err) {
-        // Already toasted
-    }
 }
 
 // ---------------------------------------------------------------------------
