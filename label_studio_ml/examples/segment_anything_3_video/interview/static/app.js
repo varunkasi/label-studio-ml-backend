@@ -1260,10 +1260,13 @@ function _showRejectReviewCrop(index) {
     if (index < 0 || index >= crops.length) return;
 
     AppState.rejectReviewIndex = index;
-    AppState.rejectReviewSubcategory = 'not_person';
     AppState.rejectReviewBoxAdjusted = false;
 
     var crop = crops[index];
+
+    // Restore previously-chosen subcategory, or default to 'not_person'
+    var initialSubcat = crop.reject_reason || 'not_person';
+    AppState.rejectReviewSubcategory = initialSubcat;
 
     // Update counter
     var counter = document.getElementById('reject-review-counter');
@@ -1281,8 +1284,8 @@ function _showRejectReviewCrop(index) {
         fv.loadFrame(crop.frame_idx, AppState.sessionId, true, crop.crop_id);
     }
 
-    // Reset subcategory buttons
-    _setSubcategory('not_person');
+    // Restore subcategory buttons to match
+    _setSubcategory(initialSubcat);
 
     // Deactivate box adjuster (will be activated if user selects partial/oversized)
     var ba = AppState._components.boxAdjuster;
@@ -1372,16 +1375,38 @@ async function _saveAndAdvanceRejectReview() {
     }
 }
 
-/** Go back to the previous rejected crop (no save). */
-function _prevRejectReviewCrop() {
+/** Go back to the previous rejected crop (saves current first). */
+async function _prevRejectReviewCrop() {
     var index = AppState.rejectReviewIndex;
-    if (index > 0) {
-        // Deactivate adjuster
-        var ba = AppState._components.boxAdjuster;
-        if (ba && ba.isActive()) ba.deactivate();
+    if (index <= 0) return;
 
-        _showRejectReviewCrop(index - 1);
+    // Save current crop's subcategory before going back
+    var crop = AppState.rejectReviewCrops[index];
+    if (crop && !crop.reject_reason) {
+        var ba = AppState._components.boxAdjuster;
+        var adjustedBox = (ba && ba.isActive()) ? ba.getBox() : null;
+        var adjusted_xyxy = adjustedBox
+            ? [adjustedBox.x1, adjustedBox.y1, adjustedBox.x2, adjustedBox.y2]
+            : null;
+
+        try {
+            await API.post('/detect/subcategorize', {
+                session_id: AppState.sessionId,
+                crop_id: crop.crop_id,
+                reject_reason: AppState.rejectReviewSubcategory,
+                adjusted_xyxy: adjusted_xyxy,
+            });
+            crop.reject_reason = AppState.rejectReviewSubcategory;
+        } catch (err) {
+            // Continue navigation even if save fails
+        }
     }
+
+    // Deactivate adjuster
+    var ba2 = AppState._components.boxAdjuster;
+    if (ba2 && ba2.isActive()) ba2.deactivate();
+
+    _showRejectReviewCrop(index - 1);
 }
 
 /** Exit reject review mode, restoring normal detection UI. */

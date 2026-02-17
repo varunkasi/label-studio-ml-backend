@@ -687,6 +687,10 @@ def detect_subcategorize():
     if not session_id or not crop_id or not reject_reason:
         return jsonify({"error": "session_id, crop_id, and reject_reason are required"}), 400
 
+    valid_reasons = {"not_person", "partial_box", "oversized_box"}
+    if reject_reason not in valid_reasons:
+        return jsonify({"error": f"Invalid reject_reason. Must be one of: {sorted(valid_reasons)}"}), 400
+
     session = get_session(session_id)
     if session is None:
         return jsonify({"error": "Session not found"}), 404
@@ -695,12 +699,17 @@ def detect_subcategorize():
     if crop is None:
         return jsonify({"error": "Crop not found"}), 404
 
+    if crop.label != CropLabel.REJECTED:
+        return jsonify({"error": f"Crop {crop_id} is not rejected (label={crop.label.value})"}), 400
+
     # Set reject_reason on the original crop
     crop.reject_reason = reject_reason
 
     new_crop_id = None
 
-    # If an adjusted box was provided, create a corrected crop
+    # If an adjusted box was provided, create a corrected crop.
+    # Features for the corrected crop are extracted lazily during
+    # the next round's _ensure_crop_features() call, not here.
     if adjusted_xyxy is not None:
         import numpy as np
         import uuid

@@ -166,4 +166,5 @@ label_studio_ml/examples/segment_anything_3_video/snippets_proj225664_task245750
 *scores.json
 *test_*.py
 
-*project*_task*.json.worktrees/
+*project*_task*.json
+.worktrees/
