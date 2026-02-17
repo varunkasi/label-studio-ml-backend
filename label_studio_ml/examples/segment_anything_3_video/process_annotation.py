@@ -864,8 +864,12 @@ def _cut_all_snippets(
                 continue
 
             base = f"casualty_{cid}_f{sf}-{ef}_fps{fps_name}"
-            video_out = os.path.join(snippets_dir, f"{base}.mp4")
-            json_out = os.path.join(snippets_dir, f"{base}_frame_bbox.json")
+            snippet_subdir = os.path.join(
+                snippets_dir, f"casualty_{cid}", f"casualty_{cid}_f{sf}-{ef}",
+            )
+            os.makedirs(snippet_subdir, exist_ok=True)
+            video_out = os.path.join(snippet_subdir, f"{base}.mp4")
+            json_out = os.path.join(snippet_subdir, f"{base}_frame_bbox.json")
 
             keep_frames = compute_keep_frames(
                 sf, ef, st, et, source_fps, target_fps,
