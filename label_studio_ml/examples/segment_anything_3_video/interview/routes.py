@@ -270,6 +270,11 @@ def session_resume():
                 import copy
                 transferred = copy.deepcopy(crop)
                 session.crops[cid] = transferred
+        # Build-from starts a fresh detection round timeline while preserving
+        # transferred support knowledge.
+        session.current_round = 0
+        session.round_history = []
+        session.round_frames = {}
         session.phase = Phase.DETECTION
 
         return jsonify({"session_id": session.session_id, **session.stats()})
@@ -492,11 +497,14 @@ def detect_crops():
 
     # Filter
     if filter_label != "all":
-        try:
-            label = CropLabel(filter_label)
-            crops = [c for c in crops if c.label == label]
-        except ValueError:
-            pass
+        if filter_label == "corrected":
+            crops = [c for c in crops if c.source == CropSource.BOX_CORRECTED]
+        else:
+            try:
+                label = CropLabel(filter_label)
+                crops = [c for c in crops if c.label == label]
+            except ValueError:
+                pass
 
     # Sort
     if sort_by == "uncertainty":
@@ -702,10 +710,24 @@ def detect_subcategorize():
     if crop.label != CropLabel.REJECTED:
         return jsonify({"error": f"Crop {crop_id} is not rejected (label={crop.label.value})"}), 400
 
+    # Contradictory: "not a person" should never produce a corrected box.
+    if reject_reason == "not_person" and adjusted_xyxy is not None:
+        return jsonify({"error": "Cannot provide adjusted_xyxy with not_person reason"}), 400
+
     # Set reject_reason on the original crop
     crop.reject_reason = reject_reason
 
     new_crop_id = None
+
+    existing_corrected = [
+        cid for cid, c in session.crops.items()
+        if getattr(c, "corrected_from", None) == crop_id
+    ]
+
+    # Saving "not_person" removes any corrected counterpart.
+    if reject_reason == "not_person":
+        for cid in existing_corrected:
+            del session.crops[cid]
 
     # If an adjusted box was provided, create a corrected crop.
     # Features for the corrected crop are extracted lazily during
@@ -725,10 +747,6 @@ def detect_subcategorize():
 
         # Remove any previously-created corrected crop for this original
         # (idempotency: re-subcategorize replaces, not duplicates)
-        existing_corrected = [
-            cid for cid, c in session.crops.items()
-            if getattr(c, "corrected_from", None) == crop_id
-        ]
         for cid in existing_corrected:
             del session.crops[cid]
 
