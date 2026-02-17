@@ -20,7 +20,7 @@ from .state import (
 )
 from .cache_manager import (
     cache_exists, list_project_caches, save_session, load_session,
-    delete_cache, save_model, load_model,
+    delete_cache,
 )
 from .background import submit_job, get_job_progress, get_job_result, pause_job, resume_job
 from .frame_cache import read_frame_cached as _read_frame_cached
@@ -258,19 +258,19 @@ def session_resume():
         if source is None:
             return jsonify({"error": f"No cache found for task {source_task_id}"}), 404
 
-        # Create new session importing features/model/labels from source
+        # Create new session importing prompts from source.
+        # Also copy labeled crops — their DINOv3 features form the k-NN
+        # support set and are video-agnostic (semantic embeddings).
+        # Frame indices/coords from the source video are irrelevant to k-NN
+        # scoring — only features + labels + reject_reason matter.
         session = create_session(project_id, task_id, annotation_id)
         session.prompts = list(source.prompts)
-        session.model_trained = source.model_trained
-        session.training_epochs = source.training_epochs
-        session.training_accuracy = source.training_accuracy
+        for cid, crop in source.crops.items():
+            if crop.label in (CropLabel.ACCEPTED, CropLabel.REJECTED) and crop.features is not None:
+                import copy
+                transferred = copy.deepcopy(crop)
+                session.crops[cid] = transferred
         session.phase = Phase.DETECTION
-
-        # Copy features if source has model.pt
-        source_model = load_model(source_key)
-        if source_model:
-            save_model(session.cache_key, source_model)
-            session.model_trained = True
 
         return jsonify({"session_id": session.session_id, **session.stats()})
 
@@ -420,10 +420,10 @@ def detect_embedding_status():
 
 @interview_bp.route("/api/detect/next_round", methods=["POST"])
 def detect_next_round():
-    """Train MLP on all labels, then start next round of detection.
+    """Score pending crops with k-NN, then start next round of detection.
 
     Two-phase job:
-      1. Train MLP on ALL accumulated labels (with LR decay)
+      1. Re-score all pending crops using k-NN (no training step)
       2. Select new frames, detect on them
     """
     data = request.get_json(force=True)
@@ -437,29 +437,36 @@ def detect_next_round():
     prompt = session.prompts[0] if session.prompts else "person"
 
     def _next_round(progress):
-        from .dinov3_classifier import train_classifier
+        from .knn_classifier import compute_uncertainties
+        from .dinov3_classifier import _ensure_crop_features
         from .detection import run_round_detection
 
-        # Pause background embedding to free GPU for MLP training + detection
+        # Pause background embedding to free GPU for detection
         embedding_paused = False
         if session.embedding_job_id:
             embedding_paused = pause_job(session.embedding_job_id)
 
         try:
-            progress.step = f"Training MLP before round {next_round}..."
-            train_result = train_classifier(session, progress, round_num=next_round)
+            # Ensure all crops have DINOv3 + context features
+            progress.step = f"Extracting features before round {next_round}..."
+            _ensure_crop_features(session, list(session.crops.keys()), progress)
+
+            # Re-score pending crops with k-NN (instant, no training)
+            progress.step = f"Scoring crops with k-NN before round {next_round}..."
+            n_scored = compute_uncertainties(session)
+            save_session(session)
 
             progress.step = f"Starting round {next_round} detection..."
             detect_result = run_round_detection(
                 session, prompt, progress, round_num=next_round,
             )
         finally:
-            # Resume embedding after training + detection completes
+            # Resume embedding after detection completes
             if embedding_paused and session.embedding_job_id:
                 resume_job(session.embedding_job_id)
 
         return {
-            "training": train_result,
+            "scoring": {"n_scored": n_scored},
             "detection": detect_result,
             "round": next_round,
         }
@@ -665,9 +672,65 @@ def detect_draw():
     return jsonify({"crop": crop.to_dict(), **session.stats()})
 
 
+@interview_bp.route("/api/detect/subcategorize", methods=["POST"])
+def detect_subcategorize():
+    """Tag a rejected crop with a subcategory and optionally create a corrected crop.
+
+    Body: {session_id, crop_id, reject_reason, adjusted_xyxy (nullable)}
+    """
+    data = request.get_json(force=True)
+    session_id = data.get("session_id")
+    crop_id = data.get("crop_id")
+    reject_reason = data.get("reject_reason")
+    adjusted_xyxy = data.get("adjusted_xyxy")  # [x1, y1, x2, y2] or null
+
+    if not session_id or not crop_id or not reject_reason:
+        return jsonify({"error": "session_id, crop_id, and reject_reason are required"}), 400
+
+    session = get_session(session_id)
+    if session is None:
+        return jsonify({"error": "Session not found"}), 404
+
+    crop = session.get_crop(crop_id)
+    if crop is None:
+        return jsonify({"error": "Crop not found"}), 404
+
+    # Set reject_reason on the original crop
+    crop.reject_reason = reject_reason
+
+    new_crop_id = None
+
+    # If an adjusted box was provided, create a corrected crop
+    if adjusted_xyxy is not None:
+        import numpy as np
+        import uuid
+
+        new_crop = CropData(
+            crop_id=str(uuid.uuid4())[:12],
+            frame_idx=crop.frame_idx,
+            xyxy=np.array(adjusted_xyxy, dtype=np.float32),
+            score=1.0,
+            label=CropLabel.ACCEPTED,
+            source=CropSource.BOX_CORRECTED,
+            prompt="box_corrected",
+            corrected_from=crop_id,
+        )
+        session.add_crop(new_crop)
+        new_crop_id = new_crop.crop_id
+
+    save_session(session)
+
+    return jsonify({
+        "crop_id": crop_id,
+        "reject_reason": reject_reason,
+        "new_crop_id": new_crop_id,
+        **session.stats(),
+    })
+
+
 @interview_bp.route("/api/detect/train", methods=["POST"])
 def detect_train():
-    """Start training job: train MLP, score unlabeled, uncertainty sort."""
+    """Re-score pending crops with k-NN (replaces MLP training)."""
     data = request.get_json(force=True)
     session_id = data["session_id"]
 
@@ -675,11 +738,20 @@ def detect_train():
     if session is None:
         return jsonify({"error": "Session not found"}), 404
 
-    def _train(progress):
-        from .dinov3_classifier import train_classifier
-        return train_classifier(session, progress)
+    def _score(progress):
+        from .knn_classifier import compute_uncertainties
+        from .dinov3_classifier import _ensure_crop_features
 
-    job_id = submit_job(_train, name="train_classifier")
+        progress.step = "Extracting features..."
+        _ensure_crop_features(session, list(session.crops.keys()), progress)
+
+        progress.step = "Scoring with k-NN..."
+        n_scored = compute_uncertainties(session)
+        save_session(session)
+
+        return {"n_scored": n_scored, "method": "knn"}
+
+    job_id = submit_job(_score, name="knn_scoring")
     return jsonify({"job_id": job_id}), 202
 
 

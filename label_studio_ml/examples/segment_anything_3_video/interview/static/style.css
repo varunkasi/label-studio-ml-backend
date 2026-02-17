@@ -364,6 +364,15 @@ body {
   gap: 10px;
 }
 
+/* Detection phase header */
+.detection-header {
+  text-align: center;
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+  padding: 12px 16px 4px;
+}
+
 /* -- Crop Card Grid ------------------------------------------------------- */
 .crop-grid {
   flex: 1;
@@ -825,6 +834,78 @@ body {
 .accuracy-trend-bar.high { background: var(--color-accepted); }
 .accuracy-trend-label { font-size: 0.7rem; color: var(--text-muted); white-space: nowrap; }
 .accuracy-trend-value { font-size: 0.75rem; font-weight: 600; color: var(--text-primary); white-space: nowrap; }
+
+/* -- Box Adjuster --------------------------------------------------------- */
+.box-adjuster-active .frame-canvas-overlay {
+  pointer-events: auto !important;
+}
+
+/* -- Reject Review Sub-Phase ---------------------------------------------- */
+.reject-review-bar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border-default);
+}
+
+.subcat-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 6px 16px;
+  font-family: var(--font-stack);
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+  background: var(--bg-body);
+  border: 2px solid var(--border-default);
+  border-radius: 20px;
+  cursor: pointer;
+  transition: background var(--transition-fast), border-color var(--transition-fast),
+    color var(--transition-fast);
+  user-select: none;
+}
+
+.subcat-btn:hover {
+  border-color: var(--text-secondary);
+  color: var(--text-primary);
+}
+
+.subcat-btn.active {
+  background: var(--highlight);
+  border-color: var(--highlight);
+  color: #fff;
+}
+
+.reject-review-counter {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  text-align: center;
+  padding: 6px 16px 2px;
+}
+
+.reject-review-hints {
+  display: flex;
+  gap: 14px;
+  justify-content: center;
+  padding: 6px 16px;
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  border-top: 1px solid var(--border-default);
+}
+
+.reject-review-hints kbd {
+  display: inline-block;
+  padding: 1px 6px;
+  font-family: var(--font-stack);
+  font-size: 0.65rem;
+  background: var(--bg-body);
+  border: 1px solid var(--border-default);
+  border-radius: 3px;
+  margin-right: 3px;
+}
 
 /* -- Utility -------------------------------------------------------------- */
 .hidden { display: none !important; }
