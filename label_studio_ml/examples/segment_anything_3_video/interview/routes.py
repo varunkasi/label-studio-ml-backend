@@ -711,13 +711,31 @@ def detect_subcategorize():
     # Features for the corrected crop are extracted lazily during
     # the next round's _ensure_crop_features() call, not here.
     if adjusted_xyxy is not None:
+        if not isinstance(adjusted_xyxy, (list, tuple)) or len(adjusted_xyxy) != 4:
+            return jsonify({"error": "adjusted_xyxy must be a 4-element array [x1, y1, x2, y2]"}), 400
+        try:
+            coords = [float(v) for v in adjusted_xyxy]
+        except (TypeError, ValueError):
+            return jsonify({"error": "adjusted_xyxy values must be numeric"}), 400
+        if coords[0] >= coords[2] or coords[1] >= coords[3]:
+            return jsonify({"error": "Invalid box: x1 must be < x2 and y1 must be < y2"}), 400
+
         import numpy as np
         import uuid
+
+        # Remove any previously-created corrected crop for this original
+        # (idempotency: re-subcategorize replaces, not duplicates)
+        existing_corrected = [
+            cid for cid, c in session.crops.items()
+            if getattr(c, "corrected_from", None) == crop_id
+        ]
+        for cid in existing_corrected:
+            del session.crops[cid]
 
         new_crop = CropData(
             crop_id=str(uuid.uuid4())[:12],
             frame_idx=crop.frame_idx,
-            xyxy=np.array(adjusted_xyxy, dtype=np.float32),
+            xyxy=np.array(coords, dtype=np.float32),
             score=1.0,
             label=CropLabel.ACCEPTED,
             source=CropSource.BOX_CORRECTED,

@@ -1284,12 +1284,12 @@ function _showRejectReviewCrop(index) {
         fv.loadFrame(crop.frame_idx, AppState.sessionId, true, crop.crop_id);
     }
 
-    // Restore subcategory buttons to match
-    _setSubcategory(initialSubcat);
-
-    // Deactivate box adjuster (will be activated if user selects partial/oversized)
+    // Deactivate box adjuster first (clean slate before _setSubcategory re-activates it)
     var ba = AppState._components.boxAdjuster;
     if (ba && ba.isActive()) ba.deactivate();
+
+    // Restore subcategory buttons — will re-activate adjuster for partial/oversized
+    _setSubcategory(initialSubcat);
 }
 
 /**
@@ -1380,14 +1380,18 @@ async function _prevRejectReviewCrop() {
     var index = AppState.rejectReviewIndex;
     if (index <= 0) return;
 
-    // Save current crop's subcategory before going back
+    // Always save current crop's subcategory before going back (even if re-editing)
     var crop = AppState.rejectReviewCrops[index];
-    if (crop && !crop.reject_reason) {
+    if (crop) {
+        // Only send adjusted_xyxy if the box was newly adjusted in this visit
         var ba = AppState._components.boxAdjuster;
-        var adjustedBox = (ba && ba.isActive()) ? ba.getBox() : null;
-        var adjusted_xyxy = adjustedBox
-            ? [adjustedBox.x1, adjustedBox.y1, adjustedBox.x2, adjustedBox.y2]
-            : null;
+        var adjusted_xyxy = null;
+        if (AppState.rejectReviewBoxAdjusted && ba && ba.isActive()) {
+            var adjustedBox = ba.getBox();
+            if (adjustedBox) {
+                adjusted_xyxy = [adjustedBox.x1, adjustedBox.y1, adjustedBox.x2, adjustedBox.y2];
+            }
+        }
 
         try {
             await API.post('/detect/subcategorize', {
