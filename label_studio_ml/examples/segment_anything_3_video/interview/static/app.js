@@ -167,6 +167,7 @@ const AppState = {
     rejectReviewIndex: 0,
     rejectReviewSubcategory: 'not_person',  // current subcategory selection
     rejectReviewBoxAdjusted: false,         // whether box was adjusted for current crop
+    rejectReviewDrawActive: false,          // reject-review-only draw/save toggle state
 
     // Active components (for cleanup)
     _components: {},
@@ -876,10 +877,12 @@ function _renderToolbar() {
 
     toolbar.render({
         drawMode: AppState.drawMode,
+        disableDrawToggle: AppState.rejectReviewMode,
         sortBy: AppState.sortBy,
         filterLabel: AppState.filterLabel,
         stats: AppState.stats,
         onDrawToggle: () => {
+            if (AppState.rejectReviewMode) return;
             AppState.drawMode = !AppState.drawMode;
             const fv = AppState._components.frameViewer;
             if (fv) {
@@ -1166,6 +1169,7 @@ function _enterRejectReview(rejectedCrops) {
     AppState.rejectReviewIndex = 0;
     AppState.rejectReviewSubcategory = 'not_person';
     AppState.rejectReviewBoxAdjusted = false;
+    AppState.rejectReviewDrawActive = false;
 
     // Change header
     var header = document.querySelector('.detection-header');
@@ -1234,6 +1238,16 @@ function _buildRejectReviewUI() {
 
     wrap.appendChild(bar);
 
+    // Draw/save toggle for corrected boxes (reject-review scope only)
+    var drawToggle = document.createElement('button');
+    drawToggle.id = 'reject-review-draw-toggle';
+    drawToggle.className = 'btn btn-secondary btn-small reject-review-draw-toggle';
+    drawToggle.textContent = 'Draw OFF';
+    drawToggle.addEventListener('click', function () {
+        _toggleRejectReviewDraw();
+    });
+    wrap.appendChild(drawToggle);
+
     // Keyboard hints
     var hints = document.createElement('div');
     hints.className = 'reject-review-hints';
@@ -1261,6 +1275,7 @@ function _showRejectReviewCrop(index) {
 
     AppState.rejectReviewIndex = index;
     AppState.rejectReviewBoxAdjusted = false;
+    AppState.rejectReviewDrawActive = false;
 
     var crop = crops[index];
 
@@ -1284,9 +1299,10 @@ function _showRejectReviewCrop(index) {
         fv.loadFrame(crop.frame_idx, AppState.sessionId, true, crop.crop_id);
     }
 
-    // Deactivate box adjuster first (clean slate before _setSubcategory re-activates it)
+    // Deactivate box adjuster and reset draw toggle first.
     var ba = AppState._components.boxAdjuster;
     if (ba && ba.isActive()) ba.deactivate();
+    _setRejectReviewDrawButton(false);
 
     // Restore subcategory buttons — will re-activate adjuster for partial/oversized
     _setSubcategory(initialSubcat);
@@ -1310,17 +1326,23 @@ function _setSubcategory(subcat) {
     if (subcat === 'partial_box' || subcat === 'oversized_box') {
         if (ba && !ba.isActive()) {
             var crop = AppState.rejectReviewCrops[AppState.rejectReviewIndex];
-            if (crop && crop.xyxy) {
+            var box = crop && (crop.corrected_xyxy || crop.xyxy);
+            if (box) {
                 ba.activate({
-                    x1: crop.xyxy[0],
-                    y1: crop.xyxy[1],
-                    x2: crop.xyxy[2],
-                    y2: crop.xyxy[3],
+                    x1: box[0],
+                    y1: box[1],
+                    x2: box[2],
+                    y2: box[3],
                 });
             }
         }
+        AppState.rejectReviewDrawActive = true;
+        _setRejectReviewDrawButton(true);
     } else {
         if (ba && ba.isActive()) ba.deactivate();
+        AppState.rejectReviewDrawActive = false;
+        AppState.rejectReviewBoxAdjusted = false;
+        _setRejectReviewDrawButton(false);
     }
 }
 
@@ -1338,10 +1360,96 @@ async function _saveAndAdvanceRejectReview() {
     if (index < 0 || index >= crops.length) return;
 
     var crop = crops[index];
+    var neverSaved = !crop.reject_reason;
+    var reasonChanged = AppState.rejectReviewSubcategory !== (crop.reject_reason || 'not_person');
+    var boxChanged = AppState.rejectReviewBoxAdjusted;
+    if (neverSaved || reasonChanged || boxChanged) {
+        var saved = await _saveRejectReviewCurrent(boxChanged);
+        if (!saved) return;
+    }
+
+    if (index + 1 < crops.length) {
+        _showRejectReviewCrop(index + 1);
+    } else {
+        showToast('All rejected crops reviewed', 'success');
+        _exitRejectReview();
+    }
+}
+
+/** Go back to the previous rejected crop (saves current first). */
+async function _prevRejectReviewCrop() {
+    var index = AppState.rejectReviewIndex;
+    if (index <= 0) return;
+
+    var crop = AppState.rejectReviewCrops[index];
+    var neverSaved = !crop.reject_reason;
+    var reasonChanged = AppState.rejectReviewSubcategory !== (crop.reject_reason || 'not_person');
+    var boxChanged = AppState.rejectReviewBoxAdjusted;
+    if (neverSaved || reasonChanged || boxChanged) {
+        var saved = await _saveRejectReviewCurrent(boxChanged);
+        if (!saved) return;
+    }
+
+    _showRejectReviewCrop(index - 1);
+}
+
+function _setRejectReviewDrawButton(active) {
+    var btn = document.getElementById('reject-review-draw-toggle');
+    if (!btn) return;
+    if (active) {
+        btn.classList.add('active');
+        btn.textContent = 'Draw ON / Save crop';
+    } else {
+        btn.classList.remove('active');
+        btn.textContent = 'Draw OFF';
+    }
+}
+
+async function _toggleRejectReviewDraw() {
+    var subcat = AppState.rejectReviewSubcategory;
+    if (subcat !== 'partial_box' && subcat !== 'oversized_box') {
+        showToast('Draw mode is only available for Partial/Oversized categories', 'warning');
+        return;
+    }
+
+    var ba = AppState._components.boxAdjuster;
+    var crop = AppState.rejectReviewCrops[AppState.rejectReviewIndex];
+    if (!ba || !crop) return;
+
+    if (!AppState.rejectReviewDrawActive) {
+        var box = crop.corrected_xyxy || crop.xyxy;
+        if (!ba.isActive() && box) {
+            ba.activate({
+                x1: box[0],
+                y1: box[1],
+                x2: box[2],
+                y2: box[3],
+            });
+        }
+        AppState.rejectReviewDrawActive = true;
+        AppState.rejectReviewBoxAdjusted = false;
+        _setRejectReviewDrawButton(true);
+        return;
+    }
+
+    // Turning draw OFF: persist reason + adjusted box immediately.
+    var saved = await _saveRejectReviewCurrent(true);
+    if (!saved) return;
+
+    if (ba.isActive()) ba.deactivate();
+    AppState.rejectReviewDrawActive = false;
+    _setRejectReviewDrawButton(false);
+}
+
+async function _saveRejectReviewCurrent(includeAdjustedBox) {
+    var crops = AppState.rejectReviewCrops;
+    var index = AppState.rejectReviewIndex;
+    if (index < 0 || index >= crops.length) return false;
+
+    var crop = crops[index];
     var ba = AppState._components.boxAdjuster;
     var adjustedXyxy = null;
-
-    if (AppState.rejectReviewBoxAdjusted && ba && ba.isActive()) {
+    if (includeAdjustedBox && ba && ba.isActive()) {
         var box = ba.getBox();
         if (box) {
             adjustedXyxy = [box.x1, box.y1, box.x2, box.y2];
@@ -1355,70 +1463,35 @@ async function _saveAndAdvanceRejectReview() {
             reject_reason: AppState.rejectReviewSubcategory,
             adjusted_xyxy: adjustedXyxy,
         });
-
-        // Mark locally
         crop.reject_reason = AppState.rejectReviewSubcategory;
+        if (adjustedXyxy) {
+            crop.corrected_xyxy = adjustedXyxy;
+        } else if (AppState.rejectReviewSubcategory === 'not_person') {
+            crop.corrected_xyxy = null;
+        }
         AppState.stats = result;
-
-        // Deactivate adjuster
-        if (ba && ba.isActive()) ba.deactivate();
-
-        // Advance or exit
-        if (index + 1 < crops.length) {
-            _showRejectReviewCrop(index + 1);
-        } else {
-            showToast('All rejected crops reviewed', 'success');
-            _exitRejectReview();
-        }
+        _renderToolbar();
+        return true;
     } catch (err) {
-        // Already toasted by API client
+        return false;
     }
-}
-
-/** Go back to the previous rejected crop (saves current first). */
-async function _prevRejectReviewCrop() {
-    var index = AppState.rejectReviewIndex;
-    if (index <= 0) return;
-
-    // Always save current crop's subcategory before going back (even if re-editing)
-    var crop = AppState.rejectReviewCrops[index];
-    if (crop) {
-        // Only send adjusted_xyxy if the box was newly adjusted in this visit
-        var ba = AppState._components.boxAdjuster;
-        var adjusted_xyxy = null;
-        if (AppState.rejectReviewBoxAdjusted && ba && ba.isActive()) {
-            var adjustedBox = ba.getBox();
-            if (adjustedBox) {
-                adjusted_xyxy = [adjustedBox.x1, adjustedBox.y1, adjustedBox.x2, adjustedBox.y2];
-            }
-        }
-
-        try {
-            await API.post('/detect/subcategorize', {
-                session_id: AppState.sessionId,
-                crop_id: crop.crop_id,
-                reject_reason: AppState.rejectReviewSubcategory,
-                adjusted_xyxy: adjusted_xyxy,
-            });
-            crop.reject_reason = AppState.rejectReviewSubcategory;
-        } catch (err) {
-            // Continue navigation even if save fails
-        }
-    }
-
-    // Deactivate adjuster
-    var ba2 = AppState._components.boxAdjuster;
-    if (ba2 && ba2.isActive()) ba2.deactivate();
-
-    _showRejectReviewCrop(index - 1);
 }
 
 /** Exit reject review mode, restoring normal detection UI. */
 function _exitRejectReview() {
+    var unreviewed = AppState.rejectReviewCrops.filter(function (c) {
+        return !c.reject_reason;
+    });
+    if (unreviewed.length > 0) {
+        showToast('Please assign a subcategory to all rejected crops before exiting.', 'warning');
+        return;
+    }
+
     AppState.rejectReviewMode = false;
     AppState.rejectReviewCrops = [];
     AppState.rejectReviewIndex = 0;
     AppState.rejectReviewBoxAdjusted = false;
+    AppState.rejectReviewDrawActive = false;
 
     // Deactivate box adjuster
     var ba = AppState._components.boxAdjuster;

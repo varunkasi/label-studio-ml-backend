@@ -165,10 +165,19 @@ The Interview UI is a browser-based active learning workflow for generating seed
 | Phase | What happens | User action |
 |-------|-------------|-------------|
 | **Init** | Create session with project/task IDs | Enter LS project + task ID |
-| **Detection** | Stage 1: SAM3 text detection on ~40 uniform keyframes (~30-60s). Stage 2: FPS-capped background embeddings with incremental change detection (paused during training). Round 2+ samples from change-detected keyframes | Review detected crops as they appear |
-| **Classification** | MLP quality-gate classifier trains on accepted/rejected crops with warm-start weights + LR decay. Active learning picks most uncertain crops for next labeling round. Click "Finish Labeling → ReID" after round 1+ to proceed | Label crops: Accept (good box) / Reject (bad box or not target) / Skip (ambiguous) |
+| **Detection** | Stage 1: SAM3 text detection on ~40 uniform keyframes (~30-60s). Stage 2: FPS-capped background embeddings with incremental change detection. Round 2+ samples from change-detected keyframes | Label crops: Accept (good box) / Reject (bad box or not target) / Skip (ambiguous). For rejects, run subcategory review (`not_person`, `partial_box`, `oversized_box`) and optionally add corrected boxes |
+| **Quality Scoring (k-NN)** | The "Next Round" action re-scores pending crops using DINOv3 + distance-weighted k-NN over all labeled support crops, then runs detection on newly selected frames. Click "Finish Labeling → ReID" after round 1+ to proceed | Continue active learning rounds until coverage/quality are sufficient |
 | **ReID** | Three-phase centroid-growing pipeline: **Phase 1** (centroid building) — human judges crop pairs to accumulate must-links; confirmed "same" crops are averaged into strong cluster centroids. **Phase 2** (ambiguous resolution) — unassigned crops are compared against Phase 1 centroids; decisive matches auto-assign, ambiguous cases go to human. **Phase 3** (done) — summary view with expandable cluster thumbnails. Constraint-based clustering (COP-KMeans) respects must-links and cannot-links across re-clusters | Judge pairs: same person / different / unsure |
-| **Seeding** | Three-path dual-proposer pipeline generates dense seeds across all frames, filtered by MLP quality gate. Guards against missing ReID clusters. Upload to Label Studio | Configure frame interval + confidence threshold, review + upload |
+| **Seeding** | Three-path dual-proposer pipeline generates dense seeds across all frames, filtered by the same k-NN quality gate used during detection rounds. Guards against missing ReID clusters. Upload to Label Studio | Configure frame interval + confidence threshold, review + upload |
+
+### Session modes
+
+`session/init` returns cache options and `session/resume` applies one of these modes:
+
+- **Resume:** Load the exact saved session state and phase for the same task.
+- **Build on:** Re-open cached state for the same task and continue in Detection.
+- **Build from (`use_from_<task_id>`):** Start a new task in Detection Round 1 (`current_round=0`, empty round history) while transferring labeled support crops/features from another task cache.
+- **Fresh:** Start from an empty session for the task.
 
 After upload, seeds are created with `enabled=false` keyframes in Label Studio. Run the tracking CLI to fill gaps:
 
@@ -182,7 +191,7 @@ docker compose exec segment_anything_3_video python /app/initial_seeding_video_b
 
 - **Backend:** Flask Blueprint (`interview/routes.py`) with background job executor for long-running operations
 - **Frontend:** Vanilla JS SPA with hash-based routing and clickable phase navigation, no framework dependencies
-- **Models used:** SAM3 (text-based detection + box-prompted refinement), DINOv3 (`facebook/dinov3-vitl16-pretrain-lvd1689m` for feature extraction + 3-scale grid search), MLP classifier (trained per session on Accept/Reject labels)
+- **Models and scoring used:** SAM3 (text-based detection + box-prompted refinement), DINOv3 (`facebook/dinov3-vitl16-pretrain-lvd1689m` for feature extraction + 3-scale grid search), distance-weighted k-NN quality gate (full-support scoring over labeled crops)
 - **State:** In-memory sessions with optional disk persistence to `/data/adapters/`
 
 ### Detection Pipeline
@@ -210,21 +219,29 @@ Dense seeding uses three paths for maximum coverage (~80-90% of frames):
 
 | Path | Source | Flow |
 |------|--------|------|
-| **A** (primary) | SAM3 text detection | Detect on frame → NMS → crop → DINOv3 features → MLP quality gate → seed |
-| **B** (refinement) | Sam3Model box+text | Medium-confidence Path A boxes → expand 20% → Sam3Model with text+box prompts → tight box from mask → MLP gate → seed |
-| **C** (grid search) | DINOv3 similarity | Zero-detection frames → tile into grid cells → DINOv3 features per cell → cosine similarity to accepted crops → top-K cells → Sam3Model refinement → MLP gate → seed |
+| **A** (primary) | SAM3 text detection | Detect on frame → NMS → crop → DINOv3 features → k-NN quality gate → seed |
+| **B** (refinement) | Sam3Model box+text | Medium-confidence Path A boxes → expand 20% → Sam3Model with text+box prompts → tight box from mask → k-NN gate → seed |
+| **C** (grid search) | DINOv3 similarity | Zero-detection frames → tile into grid cells → DINOv3 features per cell → cosine similarity to accepted crops → top-K cells → Sam3Model refinement → k-NN gate → seed |
 
 Frames are processed in chunks of 100 (configurable) to bound memory. Each seed includes a `"source"` field (`"path_a"`, `"path_b"`, `"path_c"`) for provenance tracking.
 
-### Classification: Accept / Reject / Skip
+### Quality gate labels: Accept / Reject / Skip
 
-The MLP classifier acts as a **quality gate** during dense seeding. It does NOT propose boxes — SAM3 does. The MLP only says Yes/No to SAM3's proposals. Labels encode **box quality**, not just "is there a person?"
+The k-NN scorer acts as a **quality gate** during active learning and dense seeding. It does NOT propose boxes — SAM3 does. k-NN only scores SAM3 proposals using labeled support crops (accepted/rejected/corrected). Labels encode **box quality**, not just "is there a person?"
 
-| Label | Meaning | MLP learns |
-|-------|---------|------------|
+| Label | Meaning | k-NN effect |
+|-------|---------|-------------|
 | **Accept** | Good-quality, tight bounding box relative to what's visible | "Pass this box through during seeding" |
 | **Reject** | Not a person, OR person is fully visible but box is partial/sloppy | "Block this box during seeding" |
 | **Skip** | Too ambiguous to judge; excluded from training entirely | (nothing — ignored) |
+
+Rejects support subcategories for boundary-aware weighting:
+
+- **`not_person`**: hard reject
+- **`partial_box`**: softer reject
+- **`oversized_box`**: softer reject
+
+When a reject is tagged `partial_box`/`oversized_box`, reviewers may optionally draw a corrected box. Corrected boxes are added immediately as accepted support examples and tracked separately in stats (`corrected_total`). At most one corrected crop exists per rejected crop (upsert semantics). Re-visiting a previously corrected crop loads the corrected box into the adjuster. Navigation auto-saves adjusted boxes and skips the API call entirely when nothing changed (dirty-tracking).
 
 **Critical distinction:** A person partially visible in the frame (walking out of frame edge) with a tight box around whatever IS visible is **Accept**. A person fully visible but only partially boxed is **Reject**. The judgment is always relative to what's visible.
 
@@ -246,17 +263,16 @@ Re-identification uses a three-phase elicitation strategy designed to build stro
 
 | Module | Purpose |
 |--------|---------|
-| `interview/routes.py` | REST endpoints, SPA serving, embedding pause/resume during training |
+| `interview/routes.py` | REST endpoints, SPA serving, background-job orchestration for scoring + detection rounds |
 | `interview/state.py` | Session state management (phases, crops, clusters, embedding indices) |
 | `interview/background.py` | Thread-based job executor with progress polling, pause/resume via `threading.Event` |
 | `interview/cache_manager.py` | Disk persistence for sessions, features, models, embedding indices |
 | `interview/detection.py` | Two-stage detection pipeline: batch SAM3 inference + FPS-capped background embeddings with incremental change detection |
-| `interview/dinov3_classifier.py` | DINOv3 feature extraction (batch decode + LRU cache), MLP quality-gate classifier with feature-level augmentation |
-| `interview/mask_utils.py` | Mask-quality feature computation (fill ratio, edge contact, compactness) and LR decay |
+| `interview/dinov3_classifier.py` | DINOv3 feature extraction (crop/context features, metadata, mask-quality support features) |
+| `interview/knn_classifier.py` | Distance-weighted full-support k-NN scorer with reject subcategory and corrected/reject pair weighting |
+| `interview/mask_utils.py` | Mask-quality feature computation (fill ratio, edge contact, compactness) |
 | `interview/frame_cache.py` | Shared LRU frame cache (in-memory, ~64 entries) — tier 1 of 3-tier cache hierarchy |
 | `interview/disk_frame_cache.py` | Disk-based JPEG frame cache under `/data/adapters/{cache_key}/frames/` — tier 2 of 3-tier cache; populated during background embedding, reused by change detection, seeding, and UI |
-| `interview/reid_phase.py` | Three-phase centroid-growing ReID: COP-KMeans with must-link/cannot-link constraints, centroid averaging for confirmed crops, Phase 1→2→3 elicitation pipeline |
-| `interview/reid_pipeline.py` | Visual ReID pipeline — multi-cue enrichment (appearance, spatial, color, temporal), over-clustering, merge proposal scoring, weight learning from human feedback |
 | `interview/reid_ufm.py` | UFM (Universal Feature Model) pairwise similarity computation for ReID |
 | `interview/ufm_model.py` | UFM model definition and inference |
 | `interview/seeding_phase.py` | Three-path dual-proposer dense seeding + Label Studio upload |
@@ -276,10 +292,10 @@ Re-identification uses a three-phase elicitation strategy designed to build stro
 | `INTERVIEW_EMBEDDING_FPS` | `10` | FPS cap for background embedding (subsamples to this rate) |
 | `INTERVIEW_EMBEDDING_BATCH` | `64` | Batch size for SAM3 frame embedding |
 | `INTERVIEW_DETECT_BATCH` | `8` | Batch size for SAM3 text detection |
-| `INTERVIEW_LR_DECAY` | `0.7` | Per-round learning rate decay factor for MLP classifier |
+| `INTERVIEW_KNN_THRESHOLD` | `0.6` | Confidence threshold for k-NN quality gating decisions |
 | `INTERVIEW_FRAME_CACHE_SIZE` | `64` | LRU frame cache entries (~6 MB each) |
 | `INTERVIEW_FRAMES_PER_ROUND` | `40` | Frames selected per active learning round |
-| `INTERVIEW_VALIDATION_FRAMES` | `20` | Held-out frames for MLP validation accuracy tracking |
+| `INTERVIEW_VALIDATION_FRAMES` | `20` | Held-out frames used for round-level validation tracking |
 | `INTERVIEW_CACHE_ROOT` | `/data/adapters` | Root directory for disk persistence (sessions, frames, models) |
 | `INTERVIEW_EMBEDDING_MODE` | `lightweight` | Embedding strategy: `lightweight` (change-detection) or `full` |
 
