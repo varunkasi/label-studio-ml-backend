@@ -265,11 +265,34 @@ def session_resume():
         # scoring — only features + labels + reject_reason matter.
         session = create_session(project_id, task_id, annotation_id)
         session.prompts = list(source.prompts)
-        for cid, crop in source.crops.items():
-            if crop.label in (CropLabel.ACCEPTED, CropLabel.REJECTED) and crop.features is not None:
-                import copy
-                transferred = copy.deepcopy(crop)
-                session.crops[cid] = transferred
+        import copy
+        transferable = {
+            cid: crop for cid, crop in source.crops.items()
+            if crop.label in (CropLabel.ACCEPTED, CropLabel.REJECTED) and crop.features is not None
+        }
+        id_map: Dict[str, str] = {}
+        for cid in transferable.keys():
+            new_cid = cid
+            if new_cid in session.crops:
+                i = 1
+                while f"imp_{source_task_id}_{cid}_{i}" in session.crops:
+                    i += 1
+                new_cid = f"imp_{source_task_id}_{cid}_{i}"
+            id_map[cid] = new_cid
+
+        for cid, crop in transferable.items():
+            transferred = copy.deepcopy(crop)
+            transferred.crop_id = id_map[cid]
+            if transferred.corrected_from in id_map:
+                transferred.corrected_from = id_map[transferred.corrected_from]
+            transferred.is_imported_support = True
+            transferred.source_project_id = source.project_id
+            transferred.source_task_id = source.task_id
+            transferred.source_session_id = source.session_id
+            transferred.source_crop_id = cid
+            transferred.source_frame_idx = crop.frame_idx
+            transferred.source_video_key = source.video_key
+            session.crops[transferred.crop_id] = transferred
         # Build-from starts a fresh detection round timeline while preserving
         # transferred support knowledge.
         session.current_round = 0
@@ -337,13 +360,44 @@ def session_video_info(session_id: str):
             session.fps = fps
             session.touch()
 
-        return {
+        # Gate: strip imported supports from a different video.
+        # Same-video imports are safe (frame_idx and xyxy are valid).
+        # Cross-video imports would corrupt context features, dedup, and
+        # frame rendering — not yet supported.
+        cross_video_ids = [
+            cid for cid, crop in session.crops.items()
+            if crop.is_imported_support
+            and crop.source_video_key
+            and crop.source_video_key != video_key
+        ]
+        warning = None
+        if cross_video_ids:
+            logger.warning(
+                "Cross-video import: %d imported supports from a different "
+                "video removed (source_video_key != %s). Cross-task import "
+                "with different videos is not yet supported.",
+                len(cross_video_ids), video_key,
+            )
+            with session._lock:
+                for cid in cross_video_ids:
+                    del session.crops[cid]
+                session.touch()
+            warning = (
+                f"Removed {len(cross_video_ids)} imported supports — they "
+                f"came from a different video. Cross-video transfer is not "
+                f"yet supported."
+            )
+
+        result = {
             "video_path": video_path,
             "width": width,
             "height": height,
             "frames_count": frames_count,
             "fps": fps,
         }
+        if warning:
+            result["warning"] = warning
+        return result
 
     job_id = submit_job(_fetch, name="fetch_video_info")
     return jsonify({"job_id": job_id}), 202
@@ -486,6 +540,7 @@ def detect_crops():
     session_id = request.args.get("session_id")
     filter_label = request.args.get("filter", "all")
     sort_by = request.args.get("sort", "uncertainty")  # uncertainty, cluster, frame
+    include_imported = str(request.args.get("include_imported", "0")).lower() in {"1", "true", "yes", "on"}
     offset = int(request.args.get("offset", 0))
     limit = int(request.args.get("limit", 50))
 
@@ -494,6 +549,8 @@ def detect_crops():
         return jsonify({"error": "Session not found"}), 404
 
     crops = list(session.crops.values())
+    if not include_imported:
+        crops = [c for c in crops if not getattr(c, "is_imported_support", False)]
 
     # Filter
     if filter_label != "all":
@@ -521,6 +578,7 @@ def detect_crops():
         "total": total,
         "offset": offset,
         "limit": limit,
+        "include_imported": include_imported,
         "crops": [c.to_dict() for c in crops],
     })
 
