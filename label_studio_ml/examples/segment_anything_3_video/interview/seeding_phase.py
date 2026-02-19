@@ -1,14 +1,14 @@
 """Dense seed generation and Label Studio upload for the Interview UI.
 
-Implements Phase 3 of the interview workflow: after the user has trained an
-MLP classifier (detection phase) and resolved identity clusters (ReID phase),
+Implements Phase 3 of the interview workflow: after the user has labeled
+crops in the detection phase and resolved identity clusters (ReID phase),
 this module scans every Nth frame of the video, detects candidate bounding
-boxes, classifies them with the trained MLP, assigns identities via nearest
-ReID cluster centroid, and uploads the results to Label Studio as
-videorectangle regions with ``enabled=false`` keyframes.
+boxes, scores them with a distance-weighted k-NN quality gate, assigns
+identities via nearest ReID cluster centroid, and uploads the results to
+Label Studio as videorectangle regions with ``enabled=false`` keyframes.
 
 Functions:
-    generate_seeds  -- run the full detection+classification+identity pipeline
+    generate_seeds  -- run the full detection+k-NN scoring+identity pipeline
     upload_seeds    -- push seed regions to Label Studio as a prediction
 """
 
@@ -29,9 +29,10 @@ from seeding_common import (
 )
 
 from .state import CropData, CropLabel, InterviewSession, Phase
-from .cache_manager import save_session, load_model
+from .cache_manager import save_session
 from .background import JobProgress
 from .dinov3_classifier import extract_features
+from .knn_classifier import build_support_set, score_crops
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +138,48 @@ _REFINE_THRESHOLD = float(os.getenv("INTERVIEW_REFINE_THRESHOLD", "0.3"))
 _ENABLE_REFINEMENT = os.getenv("INTERVIEW_ENABLE_REFINEMENT", "true").lower() == "true"
 _SEED_CHUNK_SIZE = int(os.getenv("INTERVIEW_SEED_CHUNK_SIZE", "100"))
 _SEED_DETECT_BATCH = int(os.getenv("INTERVIEW_SEED_DETECT_BATCH", "8"))
+
+
+def _infer_reject_reasons(
+    query_features: np.ndarray,
+    support_features: np.ndarray,
+    support_labels: np.ndarray,
+    support_reasons: List[Optional[str]],
+) -> List[Optional[str]]:
+    """Infer the dominant reject reason per query from reject supports.
+
+    Uses inverse-square cosine-distance voting over reject-labeled support
+    examples and returns the reason with the largest total vote.
+    """
+    if query_features.shape[0] == 0:
+        return []
+
+    reject_idx = np.where(support_labels == 0.0)[0]
+    if reject_idx.size == 0:
+        return [None] * query_features.shape[0]
+
+    support_reject = support_features[reject_idx]
+    reasons_reject = [support_reasons[i] for i in reject_idx]
+
+    eps = 1e-6
+    q_norm = query_features / np.maximum(
+        np.linalg.norm(query_features, axis=1, keepdims=True), eps,
+    )
+    s_norm = support_reject / np.maximum(
+        np.linalg.norm(support_reject, axis=1, keepdims=True), eps,
+    )
+
+    sim = q_norm @ s_norm.T
+    dist = np.clip(1.0 - sim, 0.0, 2.0)
+    weights = 1.0 / np.maximum(dist ** 2, eps)
+
+    inferred: List[Optional[str]] = []
+    for qi in range(weights.shape[0]):
+        reason_votes: Dict[Optional[str], float] = {}
+        for si, reason in enumerate(reasons_reject):
+            reason_votes[reason] = reason_votes.get(reason, 0.0) + float(weights[qi, si])
+        inferred.append(max(reason_votes.items(), key=lambda kv: kv[1])[0] if reason_votes else None)
+    return inferred
 
 
 def _get_sam3_image_model():
@@ -292,21 +335,22 @@ def _refine_candidates_sam3(
 def _score_and_accept_seed(
     box: np.ndarray,
     pil_frame,
-    classifier,
+    support_features: np.ndarray,
+    support_labels: np.ndarray,
+    support_reasons: list,
     centroids: Dict[int, np.ndarray],
     threshold: float,
     source: str,
     frame_idx: int,
     mask: Optional[np.ndarray] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Crop, extract features, score with MLP, and return seed dict if accepted.
+    """Crop, extract features, score with k-NN, and return seed dict if accepted.
 
-    Shared helper for Path A and refinement. Uses 1032-dim input:
-    [DINOv3(1024) + spatial(4) + mask_quality(4)].
+    Shared helper for Path A and refinement. Uses 2056-dim input:
+    [DINOv3 crop CLS (1024) + context CLS (1024) + spatial (4) + mask quality (4)].
 
-    Returns None if the crop fails to pass the MLP threshold.
+    Returns None if the crop fails to pass the k-NN confidence threshold.
     """
-    import torch
     from .dinov3_classifier import compute_crop_metadata, compute_mask_quality
 
     x1, y1, x2, y2 = box.astype(int)
@@ -315,8 +359,8 @@ def _score_and_accept_seed(
     if x2 <= x1 or y2 <= y1:
         return None
 
-    crop = pil_frame.crop((x1, y1, x2, y2))
-    feat = extract_features([crop])  # (1, 1024)
+    crop_img = pil_frame.crop((x1, y1, x2, y2))
+    feat = extract_features([crop_img])  # (1, 1024)
     meta = compute_crop_metadata(box, pil_frame.width, pil_frame.height)
 
     if mask is not None:
@@ -324,21 +368,35 @@ def _score_and_accept_seed(
     else:
         mq = np.zeros(4, dtype=np.float32)
 
-    mlp_in = np.concatenate([feat, meta.reshape(1, -1), mq.reshape(1, -1)], axis=1)
+    # Context features: expand box by 50% of max(w, h), extract DINOv3
+    bw, bh = float(x2 - x1), float(y2 - y1)
+    expand = 0.5 * max(bw, bh)
+    cx1 = max(0, int(x1 - expand))
+    cy1 = max(0, int(y1 - expand))
+    cx2 = min(pil_frame.width, int(x2 + expand))
+    cy2 = min(pil_frame.height, int(y2 + expand))
+    if cx2 > cx1 and cy2 > cy1:
+        ctx_img = pil_frame.crop((cx1, cy1, cx2, cy2))
+        ctx_feat = extract_features([ctx_img])  # (1, 1024)
+    else:
+        ctx_feat = np.zeros((1, 1024), dtype=np.float32)
 
-    with torch.inference_mode():
-        p = torch.sigmoid(
-            classifier(torch.from_numpy(mlp_in).float().to(DEVICE))
-        ).item()
+    # Build 2056-dim query: [crop CLS | context CLS | spatial | mask quality]
+    query = np.concatenate([feat, ctx_feat, meta.reshape(1, -1), mq.reshape(1, -1)], axis=1)
 
-    if p < threshold:
+    confidences, _ = score_crops(
+        query, support_features, support_labels, support_reasons,
+    )
+    conf = float(confidences[0])
+
+    if conf < threshold:
         return None
 
     identity, identity_sim = _assign_identity(feat[0], centroids)
     return {
         "frame_idx": int(frame_idx),
         "xyxy": box.tolist(),
-        "confidence": round(p, 4),
+        "confidence": round(conf, 4),
         "identity": int(identity),
         "identity_similarity": round(float(identity_sim), 4),
         "source": source,
@@ -349,15 +407,15 @@ def generate_seeds(
     session: InterviewSession,
     progress: JobProgress,
 ) -> Dict[str, Any]:
-    """Generate dense seeds: multi-prompt SAM3 detection + MLP quality gate.
+    """Generate dense seeds: multi-prompt SAM3 detection + k-NN quality gate.
 
     For every Nth frame across the entire video:
       1. Run SAM3 text detection with ALL prompts accumulated during rounds 1-4
       2. NMS + pad boxes across all prompts (cross-prompt dedup)
-      3. For each candidate: extract DINOv3 features + compute mask quality
-      4. MLP quality gate (1032-dim: DINOv3 + spatial + mask_quality)
+      3. For each candidate: extract DINOv3 crop + context features + metadata
+      4. k-NN quality gate (2056-dim: crop CLS + context CLS + spatial + mask quality)
       5. Assign identity via nearest ReID centroid
-      6. Accept if MLP confidence >= threshold
+      6. Accept if k-NN confidence >= threshold
 
     This is fully automatic — no human interaction needed for 30K+ frames.
 
@@ -369,12 +427,12 @@ def generate_seeds(
             "confidence": float,
             "identity": int,
             "identity_similarity": float,
-            "source": str,   # "multi_prompt_mlp" or "refined"
+            "source": str,   # "multi_prompt_knn" or "refined"
         }
 
     Args:
         session: The interview session (must be at REID phase or later,
-            with a trained MLP model on disk).
+            with labeled crops for k-NN support set).
         progress: :class:`JobProgress` handle for reporting status to the
             frontend polling loop.
 
@@ -383,8 +441,7 @@ def generate_seeds(
         ``identities``, and ``prompts_used``.
 
     Raises:
-        RuntimeError: If the MLP model has not been trained yet or if no
-            ReID clusters have been defined.
+        RuntimeError: If no labeled crops exist or no ReID clusters are defined.
     """
     from .detection import (
         Sam3TextBasedDetector, nms_numpy, pad_boxes,
@@ -392,7 +449,7 @@ def generate_seeds(
         precompute_text_tokens,
     )
     from .dinov3_classifier import (
-        CropClassifier, compute_crop_metadata, compute_mask_quality,
+        compute_crop_metadata, compute_mask_quality,
     )
     from seeding_common import _get_video_info_pyav
 
@@ -402,10 +459,11 @@ def generate_seeds(
     progress.step = "Validating session state..."
     progress.current = 0
 
-    state_dict = load_model(session.cache_key)
-    if state_dict is None:
+    # Build k-NN support set from labeled crops
+    support_feats, support_labels, _, support_reasons = build_support_set(session)
+    if support_feats.shape[0] == 0:
         raise RuntimeError(
-            "No trained MLP model found. Complete the classification phase first."
+            "No labeled crops with features found. Complete the detection phase first."
         )
     if not session.reid_clusters:
         raise RuntimeError(
@@ -415,11 +473,6 @@ def generate_seeds(
     # ---- Load models ----
     progress.step = "Loading models..."
     detector = Sam3TextBasedDetector()
-
-    classifier = CropClassifier(input_dim=1032)
-    classifier.load_state_dict(state_dict)
-    classifier.to(DEVICE)
-    classifier.eval()
 
     centroids = _compute_cluster_centroids(session)
     prompts = session.prompts if session.prompts else ["person"]
@@ -477,9 +530,10 @@ def generate_seeds(
 
     logger.info(
         "Seed generation: scanning %d frames (pct=%d%%, threshold=%.2f, "
-        "prompts=%s, refinement=%s, batch_size=%d)",
+        "prompts=%s, refinement=%s, batch_size=%d, support_set=%d)",
         total_frames, pct, threshold,
         prompts, _ENABLE_REFINEMENT, _SEED_DETECT_BATCH,
+        support_feats.shape[0],
     )
 
     # Check if disk frame cache is available for fast reads
@@ -544,8 +598,9 @@ def generate_seeds(
 
         progress.current = chunk_start + len(chunk_indices)
 
-        # --- Per-frame: cross-prompt NMS + features + MLP gate ---
+        # --- Per-frame: cross-prompt NMS + features + k-NN gate ---
         medium_candidates: List[Tuple[int, np.ndarray, float]] = []
+        oversized_candidates: List[Tuple[int, np.ndarray, float]] = []
 
         for frame_idx in chunk_indices:
             dets = frame_detections.get(frame_idx)
@@ -568,8 +623,9 @@ def generate_seeds(
             if len(boxes) == 0:
                 continue
 
-            # Crop + DINOv3 features + mask quality + MLP (1032-dim)
+            # Crop images + context images for DINOv3
             crop_images = []
+            context_images = []
             valid_indices = []
             for idx, box in enumerate(boxes):
                 x1, y1, x2, y2 = box.astype(int)
@@ -577,6 +633,17 @@ def generate_seeds(
                 x2, y2 = min(pil_frame.width, x2), min(pil_frame.height, y2)
                 if x2 > x1 and y2 > y1:
                     crop_images.append(pil_frame.crop((x1, y1, x2, y2)))
+                    # Context: expand by 50% of max(w, h)
+                    bw, bh = float(x2 - x1), float(y2 - y1)
+                    expand = 0.5 * max(bw, bh)
+                    cx1 = max(0, int(x1 - expand))
+                    cy1 = max(0, int(y1 - expand))
+                    cx2 = min(pil_frame.width, int(x2 + expand))
+                    cy2 = min(pil_frame.height, int(y2 + expand))
+                    if cx2 > cx1 and cy2 > cy1:
+                        context_images.append(pil_frame.crop((cx1, cy1, cx2, cy2)))
+                    else:
+                        context_images.append(crop_images[-1])
                     valid_indices.append(idx)
 
             if not crop_images:
@@ -585,7 +652,10 @@ def generate_seeds(
             boxes = boxes[valid_indices]
             det_scores = det_scores[valid_indices]
 
+            # Extract DINOv3 features for crops and contexts
             crop_features = extract_features(crop_images)
+            ctx_features = extract_features(context_images)
+
             metadata = np.array([
                 compute_crop_metadata(b, pil_frame.width, pil_frame.height)
                 for b in boxes
@@ -597,18 +667,21 @@ def generate_seeds(
                 for idx in range(len(boxes))
             ], dtype=np.float32)
 
-            # Build 1032-dim input: [DINOv3(1024) + spatial(4) + mask_quality(4)]
-            mlp_input = np.concatenate(
-                [crop_features, metadata, mask_quality_arr], axis=1,
+            # Build 2056-dim query: [crop CLS | context CLS | spatial | mask quality]
+            query_features = np.concatenate(
+                [crop_features, ctx_features, metadata, mask_quality_arr], axis=1,
             )
 
-            with torch.inference_mode():
-                probs = torch.sigmoid(
-                    classifier(torch.from_numpy(mlp_input).float().to(DEVICE))
-                ).squeeze(-1).cpu().numpy()
+            # k-NN scoring against labeled support set
+            confidences, _ = score_crops(
+                query_features, support_feats, support_labels, support_reasons,
+            )
+            inferred_reasons = _infer_reject_reasons(
+                query_features, support_feats, support_labels, support_reasons,
+            )
 
             for i in range(len(boxes)):
-                conf = float(probs[i]) if probs.ndim > 0 else float(probs)
+                conf = float(confidences[i])
                 if conf >= threshold:
                     identity, identity_sim = _assign_identity(
                         crop_features[i], centroids,
@@ -619,24 +692,35 @@ def generate_seeds(
                         "confidence": round(conf, 4),
                         "identity": int(identity),
                         "identity_similarity": round(float(identity_sim), 4),
-                        "source": "multi_prompt_mlp",
+                        "source": "multi_prompt_knn",
                     })
                 elif _ENABLE_REFINEMENT and conf >= _REFINE_THRESHOLD:
+                    # Preserve original behavior: refine all medium-confidence rejects.
                     medium_candidates.append((frame_idx, boxes[i], det_scores[i]))
+                elif (
+                    _ENABLE_REFINEMENT
+                    and i < len(inferred_reasons)
+                    and inferred_reasons[i] == "oversized_box"
+                ):
+                    # Additional fallback: if inferred reject subtype is oversized_box,
+                    # attempt SAM3 refinement even for low-confidence rejects.
+                    oversized_candidates.append((frame_idx, boxes[i], det_scores[i]))
 
-        # Refine medium-confidence candidates
-        if medium_candidates and _ENABLE_REFINEMENT:
-            progress.step = f"Refining {len(medium_candidates)} candidates..."
+        # Refine medium-confidence candidates and oversized fallbacks.
+        refine_candidates = medium_candidates + oversized_candidates
+        if refine_candidates and _ENABLE_REFINEMENT:
+            progress.step = f"Refining {len(refine_candidates)} candidates..."
             refined = _refine_candidates_sam3(
-                frames, medium_candidates, prompt=prompts[0],
+                frames, refine_candidates, prompt=prompts[0],
             )
             for frame_idx, box, _det_score in refined:
                 pil_frame = frames.get(frame_idx)
                 if pil_frame is None:
                     continue
                 seed = _score_and_accept_seed(
-                    box, pil_frame, classifier, centroids,
-                    threshold, "refined", frame_idx,
+                    box, pil_frame,
+                    support_feats, support_labels, support_reasons,
+                    centroids, threshold, "refined", frame_idx,
                 )
                 if seed is not None:
                     seeds.append(seed)

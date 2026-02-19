@@ -860,6 +860,28 @@ body {
   display: block;
 }
 
+.reject-review-fix-expand-wrap {
+  margin: 2px auto 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+.reject-review-fix-expand-label {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+}
+
+.reject-review-fix-expand-select {
+  padding: 3px 8px;
+  font-size: 0.75rem;
+  background: var(--bg-body);
+  color: var(--text-primary);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+}
+
 .reject-review-fix-btn:disabled {
   opacity: 0.6;
   cursor: wait;

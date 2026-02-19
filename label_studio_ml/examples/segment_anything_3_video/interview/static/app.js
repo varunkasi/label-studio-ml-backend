@@ -168,6 +168,7 @@ const AppState = {
     rejectReviewSubcategory: 'not_person',  // current subcategory selection
     rejectReviewBoxAdjusted: false,         // whether box was adjusted for current crop
     rejectReviewDrawActive: false,          // reject-review-only draw/save toggle state
+    rejectReviewFixExpandPct: 0,            // expansion percent for pre-Fix prompt preview
 
     // Active components (for cleanup)
     _components: {},
@@ -969,15 +970,25 @@ async function _refreshCrops() {
             if (AppState.currentCropIndex >= 0 && AppState.currentCropIndex < AppState.crops.length) {
                 grid.select(AppState.currentCropIndex);
                 const labeler = AppState._components.cropLabeler;
+                const fv = AppState._components.frameViewer;
                 if (labeler) {
-                    labeler.showCrop(AppState.crops[AppState.currentCropIndex], AppState.sessionId);
+                    const selected = AppState.crops[AppState.currentCropIndex];
+                    labeler.showCrop(selected, AppState.sessionId);
+                    if (fv && selected) {
+                        fv.loadFrame(selected.frame_idx, AppState.sessionId, true, selected.crop_id);
+                    }
                 }
             } else if (AppState.crops.length > 0) {
                 AppState.currentCropIndex = 0;
                 grid.select(0);
                 const labeler = AppState._components.cropLabeler;
+                const fv = AppState._components.frameViewer;
                 if (labeler) {
-                    labeler.showCrop(AppState.crops[0], AppState.sessionId);
+                    const selected = AppState.crops[0];
+                    labeler.showCrop(selected, AppState.sessionId);
+                    if (fv) {
+                        fv.loadFrame(selected.frame_idx, AppState.sessionId, true, selected.crop_id);
+                    }
                 }
             }
         }
@@ -1259,6 +1270,35 @@ function _buildRejectReviewUI() {
     });
     wrap.appendChild(fixBtn);
 
+    // Expansion selector for pre-Fix prompt preview
+    var expandWrap = document.createElement('div');
+    expandWrap.id = 'reject-review-fix-expand-wrap';
+    expandWrap.className = 'reject-review-fix-expand-wrap';
+    expandWrap.style.display = 'none';  // shown/hidden by _setSubcategory
+
+    var expandLabel = document.createElement('label');
+    expandLabel.className = 'reject-review-fix-expand-label';
+    expandLabel.setAttribute('for', 'reject-review-fix-expand-select');
+    expandLabel.textContent = 'Expand before Fix';
+    expandWrap.appendChild(expandLabel);
+
+    var expandSelect = document.createElement('select');
+    expandSelect.id = 'reject-review-fix-expand-select';
+    expandSelect.className = 'reject-review-fix-expand-select';
+    [0, 10, 25, 50, 75, 100].forEach(function (pct) {
+        var opt = document.createElement('option');
+        opt.value = String(pct);
+        opt.textContent = pct + '%';
+        expandSelect.appendChild(opt);
+    });
+    expandSelect.value = String(AppState.rejectReviewFixExpandPct || 0);
+    expandSelect.addEventListener('change', function () {
+        AppState.rejectReviewFixExpandPct = parseInt(expandSelect.value, 10) || 0;
+        _previewRejectReviewExpansion();
+    });
+    expandWrap.appendChild(expandSelect);
+    wrap.appendChild(expandWrap);
+
     // Keyboard hints
     var hints = document.createElement('div');
     hints.className = 'reject-review-hints';
@@ -1288,6 +1328,7 @@ function _showRejectReviewCrop(index) {
     AppState.rejectReviewIndex = index;
     AppState.rejectReviewBoxAdjusted = false;
     AppState.rejectReviewDrawActive = false;
+    AppState.rejectReviewFixExpandPct = 0;
 
     var crop = crops[index];
 
@@ -1315,6 +1356,7 @@ function _showRejectReviewCrop(index) {
     var ba = AppState._components.boxAdjuster;
     if (ba && ba.isActive()) ba.deactivate();
     _setRejectReviewDrawButton(false);
+    _setRejectReviewExpandControl(0);
 
     // Restore subcategory buttons — will re-activate adjuster for partial/oversized
     _setSubcategory(initialSubcat);
@@ -1339,6 +1381,11 @@ function _setSubcategory(subcat) {
         fixBtn.style.display = (subcat === 'partial_box' || subcat === 'oversized_box')
             ? '' : 'none';
     }
+    var expandWrap = document.getElementById('reject-review-fix-expand-wrap');
+    if (expandWrap) {
+        expandWrap.style.display = (subcat === 'partial_box' || subcat === 'oversized_box')
+            ? '' : 'none';
+    }
 
     // Activate/deactivate box adjuster based on subcategory
     var ba = AppState._components.boxAdjuster;
@@ -1357,10 +1404,13 @@ function _setSubcategory(subcat) {
         }
         AppState.rejectReviewDrawActive = true;
         _setRejectReviewDrawButton(true);
+        _previewRejectReviewExpansion();
     } else {
         if (ba && ba.isActive()) ba.deactivate();
         AppState.rejectReviewDrawActive = false;
         AppState.rejectReviewBoxAdjusted = false;
+        AppState.rejectReviewFixExpandPct = 0;
+        _setRejectReviewExpandControl(0);
         _setRejectReviewDrawButton(false);
     }
 }
@@ -1458,6 +1508,62 @@ async function _toggleRejectReviewDraw() {
     if (ba.isActive()) ba.deactivate();
     AppState.rejectReviewDrawActive = false;
     _setRejectReviewDrawButton(false);
+}
+
+function _setRejectReviewExpandControl(value) {
+    var select = document.getElementById('reject-review-fix-expand-select');
+    if (!select) return;
+    select.value = String(value);
+}
+
+function _expandBoxForPreview(box, pct, frameViewer) {
+    if (!box || box.length !== 4) return null;
+    if (!pct || pct <= 0 || !frameViewer) return [box[0], box[1], box[2], box[3]];
+    var x1 = box[0], y1 = box[1], x2 = box[2], y2 = box[3];
+    var bw = Math.max(0, x2 - x1);
+    var bh = Math.max(0, y2 - y1);
+    var frac = pct / 100.0;
+    var dx = bw * frac;
+    var dy = bh * frac;
+    var w = frameViewer.videoWidth || 0;
+    var h = frameViewer.videoHeight || 0;
+    return [
+        Math.max(0, x1 - dx),
+        Math.max(0, y1 - dy),
+        w > 0 ? Math.min(w, x2 + dx) : (x2 + dx),
+        h > 0 ? Math.min(h, y2 + dy) : (y2 + dy),
+    ];
+}
+
+function _previewRejectReviewExpansion() {
+    var subcat = AppState.rejectReviewSubcategory;
+    if (subcat !== 'partial_box' && subcat !== 'oversized_box') return;
+
+    var crops = AppState.rejectReviewCrops;
+    var index = AppState.rejectReviewIndex;
+    if (index < 0 || index >= crops.length) return;
+    var crop = crops[index];
+    if (!crop) return;
+
+    var baseBox = crop.corrected_xyxy || crop.xyxy;
+    if (!baseBox) return;
+
+    var ba = AppState._components.boxAdjuster;
+    var fv = AppState._components.frameViewer;
+    if (!ba || !fv) return;
+
+    var expanded = _expandBoxForPreview(baseBox, AppState.rejectReviewFixExpandPct || 0, fv);
+    if (!expanded) return;
+
+    if (ba.isActive()) ba.deactivate();
+    ba.activate({
+        x1: expanded[0],
+        y1: expanded[1],
+        x2: expanded[2],
+        y2: expanded[3],
+    });
+    AppState.rejectReviewDrawActive = true;
+    _setRejectReviewDrawButton(true);
 }
 
 /**
@@ -1573,6 +1679,10 @@ async function _saveRejectReviewCurrent(includeAdjustedBox) {
         }
         AppState.stats = result;
         _renderToolbar();
+        var fv = AppState._components.frameViewer;
+        if (fv) {
+            fv.reload(AppState.sessionId, crop.crop_id);
+        }
         return true;
     } catch (err) {
         return false;
