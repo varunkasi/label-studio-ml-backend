@@ -43,13 +43,19 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Install UFM (UniFlowMatch) for ReID pairwise covisibility.
+# IMPORTANT: --no-deps prevents UFM from pulling torch/torchvision/torchaudio
+# from PyPI.  On aarch64, PyPI only has CPU-only torch wheels, so letting UFM
+# resolve its own torch deps would overwrite the CUDA-enabled torch installed
+# above.  UFM's non-torch deps are installed in a separate pip call.
+RUN git clone --recursive https://github.com/UniFlowMatch/UFM.git /opt/UFM \
+    && pip install --no-cache-dir --no-deps -e /opt/UFM/UniCeption \
+    && pip install --no-cache-dir --no-deps -e /opt/UFM
+RUN pip install --no-cache-dir \
+    flow_vis einops gradio timm jaxtyping scikit-learn
 # UFM requires opencv-python; swap to headless (no X11) in a separate RUN
 # so the cv2 module files are properly installed.
-RUN git clone --recursive https://github.com/UniFlowMatch/UFM.git /opt/UFM \
-    && pip install --no-cache-dir -e /opt/UFM/UniCeption \
-    && pip install --no-cache-dir -e /opt/UFM
-RUN pip uninstall -y opencv-python && \
-    pip install --no-cache-dir --force-reinstall opencv-python-headless numpy==2.0.2 && \
+RUN pip uninstall -y opencv-python 2>/dev/null; \
+    pip install --no-cache-dir opencv-python-headless && \
     python3 -c "import cv2; print('cv2 OK:', cv2.__version__)"
 
 COPY requirements-test.txt .
