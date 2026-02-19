@@ -56,6 +56,75 @@ def cluster_hac(
     return labels.astype(np.intp)
 
 
+def apply_same_frame_constraints(
+    sim_matrix: np.ndarray,
+    crop_ids: List[str],
+    crops: Dict[str, Any],
+    iou_threshold: float = 0.3,
+) -> int:
+    """Zero similarity for same-frame non-overlapping accepted crops.
+
+    Two accepted crops at different spatial locations on the same frame
+    are physically different people.  Zeroing their similarity forces
+    HAC to treat them as maximally distant, preventing same-cluster
+    assignment for any reasonable k.
+
+    Corrected crops (BOX_CORRECTED) are excluded — they spatially
+    overlap with their rejected parent and don't represent independent
+    spatial assertions.
+
+    Modifies *sim_matrix* **in place**.
+
+    Args:
+        sim_matrix: (N, N) symmetric similarity matrix.
+        crop_ids: ordered crop IDs matching matrix rows/cols.
+        crops: crop_id -> CropData mapping.
+        iou_threshold: pairs with IoU >= this are NOT constrained
+            (they may be near-duplicates rather than distinct people).
+
+    Returns:
+        Number of pairs zeroed.
+    """
+    from .state import CropSource
+    from .detection import _compute_iou_matrix
+
+    # Build crop_id -> matrix index, skipping corrected crops
+    id_to_idx: Dict[str, int] = {}
+    for idx, cid in enumerate(crop_ids):
+        crop = crops.get(cid)
+        if crop is None:
+            continue
+        if getattr(crop, "source", None) == CropSource.BOX_CORRECTED:
+            continue
+        id_to_idx[cid] = idx
+
+    # Group by frame
+    frame_map: Dict[int, List[str]] = {}
+    for cid, idx in id_to_idx.items():
+        crop = crops[cid]
+        frame_map.setdefault(crop.frame_idx, []).append(cid)
+
+    n_zeroed = 0
+    for frame_idx, cids in frame_map.items():
+        if len(cids) < 2:
+            continue
+
+        # Build box array for IoU computation
+        boxes = np.array([crops[cid].xyxy for cid in cids], dtype=np.float32)
+        iou = _compute_iou_matrix(boxes, boxes)
+
+        # Zero pairs with IoU below threshold
+        for a in range(len(cids)):
+            for b in range(a + 1, len(cids)):
+                if iou[a, b] < iou_threshold:
+                    i, j = id_to_idx[cids[a]], id_to_idx[cids[b]]
+                    sim_matrix[i, j] = 0.0
+                    sim_matrix[j, i] = 0.0
+                    n_zeroed += 1
+
+    return n_zeroed
+
+
 def silhouette_score(sim_matrix: np.ndarray, labels: np.ndarray) -> float:
     """Compute silhouette score from a similarity matrix and labels.
 
@@ -291,6 +360,13 @@ def run_ufm_reid_pipeline(
     # Restore to step-level for remaining steps
     progress.total = 4
     progress.current = 2
+
+    # Step 2.5: Enforce same-frame cannot-links before clustering
+    n_constrained = apply_same_frame_constraints(
+        sim_matrix, crop_ids, session.crops,
+    )
+    if n_constrained:
+        logger.info("UFM ReID: zeroed %d same-frame pairs", n_constrained)
 
     # Step 3: HAC clustering
     progress.step = "Clustering identities"
