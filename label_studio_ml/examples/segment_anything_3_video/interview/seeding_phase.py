@@ -193,7 +193,8 @@ def _refine_candidates_sam3(
     candidates: List[Tuple[int, np.ndarray, float]],
     prompt: str = "person",
     expand_frac: float = 0.2,
-) -> List[Tuple[int, np.ndarray, float]]:
+    tags: Optional[List[str]] = None,
+) -> List[Tuple]:
     """Refine candidate boxes using Sam3Model with text+box prompts.
 
     For each candidate, expands the box by *expand_frac* on each side,
@@ -205,16 +206,19 @@ def _refine_candidates_sam3(
         candidates:  List of (frame_idx, box_xyxy, det_score).
         prompt:      Text prompt for Sam3Model (e.g., "person").
         expand_frac: Fraction to expand each side of the box.
+        tags:        Optional per-candidate source tags.  When provided,
+                     output tuples include a 4th element with the tag.
 
     Returns:
-        List of (frame_idx, refined_box_xyxy, det_score) for successful refinements.
+        List of (frame_idx, refined_box_xyxy, det_score[, tag]) for successful
+        refinements.
     """
     import torch
     model, processor = _get_sam3_image_model()
 
-    refined: List[Tuple[int, np.ndarray, float]] = []
+    refined: List[Tuple] = []
 
-    for frame_idx, box, det_score in candidates:
+    for ci, (frame_idx, box, det_score) in enumerate(candidates):
         pil_frame = frames.get(frame_idx)
         if pil_frame is None:
             continue
@@ -319,7 +323,10 @@ def _refine_candidates_sam3(
                             logger.debug("Fallback raw mask extraction succeeded for frame %d", frame_idx)
 
             if tight is not None:
-                refined.append((frame_idx, tight, det_score))
+                entry = (frame_idx, tight, det_score)
+                if tags is not None and ci < len(tags):
+                    entry = (frame_idx, tight, det_score, tags[ci])
+                refined.append(entry)
 
         except Exception as exc:
             logger.warning("Refinement failed for frame %d: %s", frame_idx, exc)
@@ -427,7 +434,7 @@ def generate_seeds(
             "confidence": float,
             "identity": int,
             "identity_similarity": float,
-            "source": str,   # "multi_prompt_knn" or "refined"
+            "source": str,   # "multi_prompt_knn", "refined_medium", or "refined_oversized"
         }
 
     Args:
@@ -696,7 +703,7 @@ def generate_seeds(
                     })
                 elif _ENABLE_REFINEMENT and conf >= _REFINE_THRESHOLD:
                     # Preserve original behavior: refine all medium-confidence rejects.
-                    medium_candidates.append((frame_idx, boxes[i], det_scores[i]))
+                    medium_candidates.append((frame_idx, boxes[i], det_scores[i], "refined_medium"))
                 elif (
                     _ENABLE_REFINEMENT
                     and i < len(inferred_reasons)
@@ -704,23 +711,28 @@ def generate_seeds(
                 ):
                     # Additional fallback: if inferred reject subtype is oversized_box,
                     # attempt SAM3 refinement even for low-confidence rejects.
-                    oversized_candidates.append((frame_idx, boxes[i], det_scores[i]))
+                    oversized_candidates.append((frame_idx, boxes[i], det_scores[i], "refined_oversized"))
 
         # Refine medium-confidence candidates and oversized fallbacks.
         refine_candidates = medium_candidates + oversized_candidates
         if refine_candidates and _ENABLE_REFINEMENT:
             progress.step = f"Refining {len(refine_candidates)} candidates..."
+            refine_inputs = [(fi, bx, sc) for fi, bx, sc, _tag in refine_candidates]
+            refine_tags = [tag for _fi, _bx, _sc, tag in refine_candidates]
             refined = _refine_candidates_sam3(
-                frames, refine_candidates, prompt=prompts[0],
+                frames, refine_inputs, prompt=prompts[0],
+                tags=refine_tags,
             )
-            for frame_idx, box, _det_score in refined:
+            for result in refined:
+                frame_idx, box, _det_score = result[0], result[1], result[2]
+                tag = result[3] if len(result) > 3 else "refined"
                 pil_frame = frames.get(frame_idx)
                 if pil_frame is None:
                     continue
                 seed = _score_and_accept_seed(
                     box, pil_frame,
                     support_feats, support_labels, support_reasons,
-                    centroids, threshold, "refined", frame_idx,
+                    centroids, threshold, tag, frame_idx,
                 )
                 if seed is not None:
                     seeds.append(seed)

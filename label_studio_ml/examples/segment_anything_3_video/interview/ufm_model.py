@@ -262,7 +262,8 @@ def extract_crop_images_from_session(
     from PIL import Image
     from .state import CropLabel
 
-    accepted = session.get_crops_by_label(CropLabel.ACCEPTED)
+    # ReID should cluster crops from the current task timeline only.
+    accepted = session.get_crops_by_label(CropLabel.ACCEPTED, include_imported=False)
     # Sort by frame then crop_id for deterministic ordering
     accepted.sort(key=lambda c: (c.frame_idx, c.crop_id))
 

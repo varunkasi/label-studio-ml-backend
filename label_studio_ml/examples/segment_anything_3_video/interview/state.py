@@ -44,6 +44,7 @@ class CropSource(str, Enum):
     MULTI_PROMPT = "multi_prompt"     # Strategy A
     HUMAN_DRAWN = "human_drawn"       # Manual draw mode
     CHANGE_DETECT = "change_detect"   # Detection on change-detected keyframes
+    BOX_CORRECTED = "box_corrected"   # Adjusted box from reject review
 
 
 @dataclass
@@ -60,13 +61,24 @@ class CropData:
     reid_cluster_id: Optional[int] = None  # ReID identity cluster
     uncertainty: float = 0.5            # classifier uncertainty (0=certain, 1=uncertain)
     features: Optional[np.ndarray] = None  # DINOv3 CLS token (1024,)
+    context_features: Optional[np.ndarray] = None  # DINOv3 CLS on 50%-expanded crop (1024,)
     metadata: Optional[np.ndarray] = None  # [norm_cx, norm_cy, scale, aspect] (4,)
     mask_quality: Optional[np.ndarray] = None  # [fill_ratio, det_score, edge_contact, compactness] (4,)
     histogram: Optional[np.ndarray] = None  # HSV color histogram for ReID
+    reject_reason: Optional[str] = None  # "not_person", "partial_box", "oversized_box"
+    corrected_from: Optional[str] = None  # crop_id of original bad box (for BOX_CORRECTED crops)
+    # Cross-task support transfer provenance (use_from_<task_id> mode)
+    is_imported_support: bool = False
+    source_project_id: Optional[int] = None
+    source_task_id: Optional[int] = None
+    source_session_id: Optional[str] = None
+    source_crop_id: Optional[str] = None
+    source_frame_idx: Optional[int] = None
+    source_video_key: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize for JSON (excludes numpy arrays)."""
-        return {
+        d = {
             "crop_id": self.crop_id,
             "frame_idx": self.frame_idx,
             "xyxy": self.xyxy.tolist(),
@@ -79,6 +91,25 @@ class CropData:
             "uncertainty": self.uncertainty,
             "mask_quality": self.mask_quality.tolist() if self.mask_quality is not None else None,
         }
+        if self.reject_reason is not None:
+            d["reject_reason"] = self.reject_reason
+        if self.corrected_from is not None:
+            d["corrected_from"] = self.corrected_from
+        if self.is_imported_support:
+            d["is_imported_support"] = True
+        if self.source_project_id is not None:
+            d["source_project_id"] = self.source_project_id
+        if self.source_task_id is not None:
+            d["source_task_id"] = self.source_task_id
+        if self.source_session_id is not None:
+            d["source_session_id"] = self.source_session_id
+        if self.source_crop_id is not None:
+            d["source_crop_id"] = self.source_crop_id
+        if self.source_frame_idx is not None:
+            d["source_frame_idx"] = self.source_frame_idx
+        if self.source_video_key is not None:
+            d["source_video_key"] = self.source_video_key
+        return d
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "CropData":
@@ -95,6 +126,15 @@ class CropData:
             reid_cluster_id=d.get("reid_cluster_id"),
             uncertainty=d.get("uncertainty", 0.5),
             mask_quality=np.array(d["mask_quality"], dtype=np.float32) if d.get("mask_quality") is not None else None,
+            reject_reason=d.get("reject_reason"),
+            corrected_from=d.get("corrected_from"),
+            is_imported_support=bool(d.get("is_imported_support", False)),
+            source_project_id=d.get("source_project_id"),
+            source_task_id=d.get("source_task_id"),
+            source_session_id=d.get("source_session_id"),
+            source_crop_id=d.get("source_crop_id"),
+            source_frame_idx=d.get("source_frame_idx"),
+            source_video_key=d.get("source_video_key"),
         )
 
 
@@ -333,8 +373,11 @@ class InterviewSession:
         self.touch()
         return True
 
-    def get_crops_by_label(self, label: CropLabel) -> List[CropData]:
-        return [c for c in self.crops.values() if c.label == label]
+    def get_crops_by_label(self, label: CropLabel, include_imported: bool = True) -> List[CropData]:
+        return [
+            c for c in self.crops.values()
+            if c.label == label and (include_imported or not c.is_imported_support)
+        ]
 
     def get_crops_by_frame(self, frame_idx: int) -> List[CropData]:
         return [c for c in self.crops.values() if c.frame_idx == frame_idx]
@@ -359,10 +402,16 @@ class InterviewSession:
     # -- Stats --
 
     def stats(self) -> Dict[str, Any]:
-        accepted = len(self.get_crops_by_label(CropLabel.ACCEPTED))
-        rejected = len(self.get_crops_by_label(CropLabel.REJECTED))
-        pending = len(self.get_crops_by_label(CropLabel.PENDING))
-        skipped = len(self.get_crops_by_label(CropLabel.SKIPPED))
+        local_crops = [c for c in self.crops.values() if not c.is_imported_support]
+        imported_crops = [c for c in self.crops.values() if c.is_imported_support]
+
+        accepted = sum(1 for c in local_crops if c.label == CropLabel.ACCEPTED)
+        rejected = sum(1 for c in local_crops if c.label == CropLabel.REJECTED)
+        pending = sum(1 for c in local_crops if c.label == CropLabel.PENDING)
+        skipped = sum(1 for c in local_crops if c.label == CropLabel.SKIPPED)
+        corrected_total = sum(
+            1 for c in local_crops if c.source == CropSource.BOX_CORRECTED
+        )
         return {
             "session_id": self.session_id,
             "phase": self.phase.value,
@@ -370,11 +419,14 @@ class InterviewSession:
             "task_id": self.task_id,
             "video_frames": self.frames_count,
             "sampled_frames": len(self.sampled_frames),
-            "total_crops": len(self.crops),
+            "total_crops": len(local_crops),
+            "total_crops_all": len(self.crops),
+            "imported_support_total": len(imported_crops),
             "accepted": accepted,
             "rejected": rejected,
             "skipped": skipped,
             "pending": pending,
+            "corrected_total": corrected_total,
             "model_trained": self.model_trained,
             "training_accuracy": self.training_accuracy,
             "n_identities": self.n_identities,

@@ -329,23 +329,6 @@ def delete_cache(
     return True
 
 
-def save_model(cache_key: str, state_dict: dict) -> None:
-    """Save MLP classifier state_dict to disk."""
-    import torch
-    d = _cache_dir(cache_key)
-    d.mkdir(parents=True, exist_ok=True)
-    torch.save(state_dict, d / "model.pt")
-    logger.info("Saved MLP model to %s", d / "model.pt")
-
-
-def load_model(cache_key: str) -> Optional[dict]:
-    """Load MLP classifier state_dict from disk."""
-    import torch
-    path = _cache_dir(cache_key) / "model.pt"
-    if not path.is_file():
-        return None
-    return torch.load(path, map_location="cpu", weights_only=True)
-
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -370,30 +353,39 @@ def _read_json(path: Path) -> Optional[Any]:
 
 
 def _save_features(d: Path, session: InterviewSession) -> None:
-    """Save DINOv3 features and metadata arrays to npz."""
+    """Save DINOv3 features, context features, and metadata arrays to npz."""
     ids = []
     feats = []
     metas = []
+    ctx_feats = []
+    has_ctx = False
     for cid, crop in session.crops.items():
         if crop.features is not None:
             ids.append(cid)
             feats.append(crop.features)
             if crop.metadata is not None:
                 metas.append(crop.metadata)
+            if crop.context_features is not None:
+                ctx_feats.append(crop.context_features)
+                has_ctx = True
+            else:
+                ctx_feats.append(np.zeros(1024, dtype=np.float32))
 
     if feats:
         feat_arr = np.stack(feats).astype(np.float16)
         meta_arr = np.stack(metas).astype(np.float16) if metas and len(metas) == len(feats) else np.array([])
-        np.savez_compressed(
-            d / "features.npz",
+        save_kwargs = dict(
             ids=np.array(ids, dtype=object),
             features=feat_arr,
             metadata=meta_arr,
         )
+        if has_ctx:
+            save_kwargs["context_features"] = np.stack(ctx_feats).astype(np.float16)
+        np.savez_compressed(d / "features.npz", **save_kwargs)
 
 
 def _load_features(d: Path, session: InterviewSession) -> None:
-    """Load DINOv3 features back into session crops."""
+    """Load DINOv3 features (and context features) back into session crops."""
     path = d / "features.npz"
     if not path.is_file():
         return
@@ -404,6 +396,9 @@ def _load_features(d: Path, session: InterviewSession) -> None:
         metas = data.get("metadata")
         if metas is not None and metas.size > 0:
             metas = metas.astype(np.float32)
+        ctx = data.get("context_features")
+        if ctx is not None and ctx.size > 0:
+            ctx = ctx.astype(np.float32)
 
         for i, cid in enumerate(ids):
             cid_str = str(cid)
@@ -412,6 +407,11 @@ def _load_features(d: Path, session: InterviewSession) -> None:
                 crop.features = feats[i]
                 if metas is not None and metas.size > 0 and i < len(metas):
                     crop.metadata = metas[i]
+                if ctx is not None and ctx.size > 0 and i < len(ctx):
+                    vec = ctx[i]
+                    # Skip zero-vectors (placeholder for missing context)
+                    if np.any(vec != 0):
+                        crop.context_features = vec
     except Exception as e:
         logger.warning("Failed to load features from %s: %s", path, e)
 

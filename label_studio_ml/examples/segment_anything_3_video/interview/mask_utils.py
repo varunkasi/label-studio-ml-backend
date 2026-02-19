@@ -5,7 +5,6 @@ Pure numpy/scipy — no torch, PIL, or model dependencies.
 
 from __future__ import annotations
 
-import os
 
 import numpy as np
 
@@ -16,7 +15,7 @@ def compute_mask_quality(
     frame_width: int,
     frame_height: int,
 ) -> np.ndarray:
-    """Compute mask-quality features for MLP input.
+    """Compute mask-quality features for classifier input.
 
     Args:
         mask:         Binary mask (H, W) from SAM3 instance segmentation.
@@ -70,12 +69,3 @@ def compute_mask_quality(
 # LR decay for round-based training
 # ---------------------------------------------------------------------------
 
-LR_DECAY_FACTOR = float(os.getenv("INTERVIEW_LR_DECAY", "0.7"))
-
-
-def compute_lr(base_lr: float, round_num: int, decay_factor: float = LR_DECAY_FACTOR) -> float:
-    """Compute learning rate with exponential decay per round.
-
-    Round 1: base_lr.  Round 2: base_lr * decay.  Round N: base_lr * decay^(N-1).
-    """
-    return base_lr * (decay_factor ** max(0, round_num - 1))

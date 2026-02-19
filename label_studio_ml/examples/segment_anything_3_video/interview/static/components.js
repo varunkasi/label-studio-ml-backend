@@ -784,6 +784,10 @@ class Toolbar {
         drawBtn.className = 'btn btn-secondary btn-small';
         if (options.drawMode) drawBtn.classList.add('active');
         drawBtn.textContent = options.drawMode ? 'Draw Mode ON' : 'Draw Mode';
+        if (options.disableDrawToggle) {
+            drawBtn.disabled = true;
+            drawBtn.title = 'Use reject-review Draw ON / Save crop controls';
+        }
         drawBtn.addEventListener('click', () => {
             if (options.onDrawToggle) options.onDrawToggle();
         });
@@ -798,11 +802,11 @@ class Toolbar {
         roundBadge.textContent = `Round ${options.currentRound || 1}`;
         this.el.appendChild(roundBadge);
 
-        // Next Round button (trains MLP + detects new frames)
+        // Next Round button (scores with k-NN + detects new frames)
         const nextRoundBtn = document.createElement('button');
         nextRoundBtn.className = 'btn btn-primary btn-small';
         nextRoundBtn.textContent = 'Next Round';
-        nextRoundBtn.title = 'Train MLP on all labels, then detect on new frames';
+        nextRoundBtn.title = 'Score crops with k-NN, then detect on new frames';
         nextRoundBtn.addEventListener('click', () => {
             if (options.onNextRound) options.onNextRound();
         });
@@ -850,7 +854,7 @@ class Toolbar {
             'padding:3px 6px;font-size:0.75rem;background:var(--bg-body);' +
             'color:var(--text-primary);border:1px solid var(--border-default);' +
             'border-radius:var(--radius-sm);';
-        ['all', 'pending', 'accepted', 'rejected', 'skipped'].forEach((f) => {
+        ['all', 'pending', 'accepted', 'rejected', 'corrected', 'skipped'].forEach((f) => {
             const opt = document.createElement('option');
             opt.value = f;
             opt.textContent = f.charAt(0).toUpperCase() + f.slice(1);
@@ -874,6 +878,7 @@ class Toolbar {
             const s = options.stats;
             statsEl.textContent =
                 `${s.accepted || 0} accepted | ${s.rejected || 0} rejected | ` +
+                `${s.corrected_total || 0} corrected | ` +
                 `${s.skipped || 0} skipped | ` +
                 `${s.pending || 0} pending | ${s.total_crops || 0} total`;
             this.el.appendChild(statsEl);
@@ -1096,5 +1101,373 @@ class Modal {
         setTimeout(() => {
             container.innerHTML = '';
         }, 300);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BoxAdjuster
+// ---------------------------------------------------------------------------
+
+class BoxAdjuster {
+    /**
+     * Overlay component that renders 8 resize handles on an existing bounding
+     * box and allows the user to drag them to adjust the box.  Works with the
+     * FrameViewer's canvas overlay for drawing and its coordinate helpers for
+     * pixel <-> screen mapping.
+     *
+     * @param {FrameViewer} frameViewer - The FrameViewer instance to overlay on.
+     */
+    constructor(frameViewer) {
+        this._fv = frameViewer;
+        this._active = false;
+        this._box = null;               // {x1, y1, x2, y2} in video-pixel coords
+        this._callbacks = [];            // onBoxChanged listeners
+        this._dragging = false;
+        this._dragHandle = null;         // which handle is being dragged
+        this._destroyed = false;
+
+        // Minimum box dimension in video-pixel coords
+        this._MIN_SIZE = 16;
+
+        // Handle visual size (screen px) and hit radius (screen px)
+        this._HANDLE_SIZE = 8;
+        this._HIT_RADIUS = 12;
+
+        // Handle definitions: name -> which edges it controls and cursor
+        this._HANDLES = [
+            { name: 'tl', edgesX: 'x1', edgesY: 'y1', cursor: 'nwse-resize' },
+            { name: 'tc', edgesX: null,  edgesY: 'y1', cursor: 'ns-resize'   },
+            { name: 'tr', edgesX: 'x2', edgesY: 'y1', cursor: 'nesw-resize' },
+            { name: 'ml', edgesX: 'x1', edgesY: null,  cursor: 'ew-resize'   },
+            { name: 'mr', edgesX: 'x2', edgesY: null,  cursor: 'ew-resize'   },
+            { name: 'bl', edgesX: 'x1', edgesY: 'y2', cursor: 'nesw-resize' },
+            { name: 'bc', edgesX: null,  edgesY: 'y2', cursor: 'ns-resize'   },
+            { name: 'br', edgesX: 'x2', edgesY: 'y2', cursor: 'nwse-resize' },
+        ];
+
+        // Bind event handlers so we can add/remove them cleanly
+        this._onPointerDown = this._onPointerDown.bind(this);
+        this._onPointerMove = this._onPointerMove.bind(this);
+        this._onPointerUp   = this._onPointerUp.bind(this);
+    }
+
+    // -- Public API -----------------------------------------------------------
+
+    /**
+     * Activate box adjustment mode with the given bounding box.
+     * @param {Object} xyxy - {x1, y1, x2, y2} in video-pixel coords.
+     */
+    activate(xyxy) {
+        if (this._destroyed) return;
+        this._box = {
+            x1: Math.min(xyxy.x1, xyxy.x2),
+            y1: Math.min(xyxy.y1, xyxy.y2),
+            x2: Math.max(xyxy.x1, xyxy.x2),
+            y2: Math.max(xyxy.y1, xyxy.y2),
+        };
+        this._active = true;
+        this._dragging = false;
+        this._dragHandle = null;
+
+        // Enable pointer events on the canvas overlay
+        this._fv.el.classList.add('box-adjuster-active');
+        this._fv.canvas.style.cursor = 'default';
+
+        // Attach listeners
+        this._fv.canvas.addEventListener('pointerdown', this._onPointerDown);
+        this._fv.canvas.addEventListener('pointermove', this._onPointerMove);
+        this._fv.canvas.addEventListener('pointerup',   this._onPointerUp);
+        this._fv.canvas.addEventListener('pointerleave', this._onPointerUp);
+
+        this._draw();
+    }
+
+    /** Deactivate box adjustment, remove listeners, clear canvas. */
+    deactivate() {
+        if (!this._active) return;
+        this._active = false;
+        this._dragging = false;
+        this._dragHandle = null;
+
+        this._fv.el.classList.remove('box-adjuster-active');
+        this._fv.canvas.style.cursor = 'default';
+
+        // Remove listeners
+        this._fv.canvas.removeEventListener('pointerdown', this._onPointerDown);
+        this._fv.canvas.removeEventListener('pointermove', this._onPointerMove);
+        this._fv.canvas.removeEventListener('pointerup',   this._onPointerUp);
+        this._fv.canvas.removeEventListener('pointerleave', this._onPointerUp);
+
+        // Clear canvas
+        this._fv._syncCanvasSize();
+        this._fv.ctx.clearRect(0, 0, this._fv.canvas.width, this._fv.canvas.height);
+    }
+
+    /** @returns {boolean} Whether box adjustment is currently active. */
+    isActive() {
+        return this._active;
+    }
+
+    /** @returns {Object|null} Current adjusted {x1, y1, x2, y2} or null. */
+    getBox() {
+        if (!this._active || !this._box) return null;
+        return { x1: this._box.x1, y1: this._box.y1, x2: this._box.x2, y2: this._box.y2 };
+    }
+
+    /**
+     * Register a callback for when the box changes (on handle release).
+     * @param {Function} callback - Receives {x1, y1, x2, y2} in video-pixel coords.
+     */
+    onBoxChanged(callback) {
+        this._callbacks.push(callback);
+    }
+
+    /** Permanently destroy the adjuster, cleaning up all state. */
+    destroy() {
+        this.deactivate();
+        this._callbacks = [];
+        this._destroyed = true;
+    }
+
+    // -- Coordinate Helpers ---------------------------------------------------
+
+    /**
+     * Convert video-pixel coords to canvas (screen) coords.
+     * Inverse of FrameViewer._eventToPixelCoords.
+     */
+    _pixelToCanvas(px, py) {
+        const rect = this._fv.el.getBoundingClientRect();
+        const containerW = rect.width;
+        const containerH = rect.height;
+        const imgAspect = this._fv.videoWidth / this._fv.videoHeight;
+        const containerAspect = containerW / containerH;
+
+        let renderW, renderH, offsetX, offsetY;
+        if (containerAspect > imgAspect) {
+            renderH = containerH;
+            renderW = containerH * imgAspect;
+            offsetX = (containerW - renderW) / 2;
+            offsetY = 0;
+        } else {
+            renderW = containerW;
+            renderH = containerW / imgAspect;
+            offsetX = 0;
+            offsetY = (containerH - renderH) / 2;
+        }
+
+        return {
+            cx: offsetX + (px / this._fv.videoWidth) * renderW,
+            cy: offsetY + (py / this._fv.videoHeight) * renderH,
+        };
+    }
+
+    // -- Handle Geometry ------------------------------------------------------
+
+    /**
+     * Compute the canvas-space position for each of the 8 handles.
+     * @returns {Array<{def: Object, cx: number, cy: number}>}
+     */
+    _handlePositions() {
+        const b = this._box;
+        const positions = [];
+
+        const pixelPoints = [
+            { def: this._HANDLES[0], px: b.x1,                  py: b.y1 },                  // tl
+            { def: this._HANDLES[1], px: (b.x1 + b.x2) / 2,    py: b.y1 },                  // tc
+            { def: this._HANDLES[2], px: b.x2,                  py: b.y1 },                  // tr
+            { def: this._HANDLES[3], px: b.x1,                  py: (b.y1 + b.y2) / 2 },    // ml
+            { def: this._HANDLES[4], px: b.x2,                  py: (b.y1 + b.y2) / 2 },    // mr
+            { def: this._HANDLES[5], px: b.x1,                  py: b.y2 },                  // bl
+            { def: this._HANDLES[6], px: (b.x1 + b.x2) / 2,    py: b.y2 },                  // bc
+            { def: this._HANDLES[7], px: b.x2,                  py: b.y2 },                  // br
+        ];
+
+        for (const pt of pixelPoints) {
+            const c = this._pixelToCanvas(pt.px, pt.py);
+            positions.push({ def: pt.def, cx: c.cx, cy: c.cy });
+        }
+        return positions;
+    }
+
+    /**
+     * Hit-test mouse coordinates against the 8 handles.
+     * @param {number} mx - Mouse X in canvas/screen space.
+     * @param {number} my - Mouse Y in canvas/screen space.
+     * @returns {Object|null} The handle definition, or null.
+     */
+    _hitTest(mx, my) {
+        const positions = this._handlePositions();
+        const r = this._HIT_RADIUS;
+        for (const h of positions) {
+            if (Math.abs(mx - h.cx) <= r && Math.abs(my - h.cy) <= r) {
+                return h.def;
+            }
+        }
+        return null;
+    }
+
+    // -- Drawing --------------------------------------------------------------
+
+    /** Draw the box outline and all 8 handles on the FrameViewer canvas. */
+    _draw() {
+        if (!this._active || !this._box) return;
+
+        this._fv._syncCanvasSize();
+        const ctx = this._fv.ctx;
+        ctx.clearRect(0, 0, this._fv.canvas.width, this._fv.canvas.height);
+
+        const tl = this._pixelToCanvas(this._box.x1, this._box.y1);
+        const br = this._pixelToCanvas(this._box.x2, this._box.y2);
+
+        // Box outline -- dashed cyan
+        ctx.strokeStyle = '#00bcd4';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([6, 4]);
+        ctx.strokeRect(tl.cx, tl.cy, br.cx - tl.cx, br.cy - tl.cy);
+        ctx.setLineDash([]);
+
+        // Semi-transparent fill for visibility
+        ctx.fillStyle = 'rgba(0, 188, 212, 0.08)';
+        ctx.fillRect(tl.cx, tl.cy, br.cx - tl.cx, br.cy - tl.cy);
+
+        // Draw handles
+        const half = this._HANDLE_SIZE / 2;
+        const positions = this._handlePositions();
+        for (const h of positions) {
+            ctx.fillStyle = '#00bcd4';
+            ctx.fillRect(h.cx - half, h.cy - half, this._HANDLE_SIZE, this._HANDLE_SIZE);
+            ctx.strokeStyle = '#fff';
+            ctx.lineWidth = 1;
+            ctx.strokeRect(h.cx - half, h.cy - half, this._HANDLE_SIZE, this._HANDLE_SIZE);
+        }
+    }
+
+    // -- Pointer Events -------------------------------------------------------
+
+    _onPointerDown(e) {
+        if (!this._active) return;
+        e.preventDefault();
+        e.stopPropagation();
+
+        const rect = this._fv.el.getBoundingClientRect();
+        const mx = e.clientX - rect.left;
+        const my = e.clientY - rect.top;
+
+        const handle = this._hitTest(mx, my);
+        if (!handle) return;
+
+        this._dragging = true;
+        this._dragHandle = handle;
+        this._fv.canvas.setPointerCapture(e.pointerId);
+        this._fv.canvas.style.cursor = handle.cursor;
+    }
+
+    _onPointerMove(e) {
+        if (!this._active) return;
+        e.preventDefault();
+        e.stopPropagation();
+
+        const rect = this._fv.el.getBoundingClientRect();
+        const mx = e.clientX - rect.left;
+        const my = e.clientY - rect.top;
+
+        if (this._dragging && this._dragHandle) {
+            // Convert mouse position to video-pixel coords
+            const coords = this._fv._eventToPixelCoords(e);
+            const px = coords.px;
+            const py = coords.py;
+
+            // Move the edge(s) controlled by this handle
+            if (this._dragHandle.edgesX) {
+                this._box[this._dragHandle.edgesX] = Math.max(0, Math.min(this._fv.videoWidth, px));
+            }
+            if (this._dragHandle.edgesY) {
+                this._box[this._dragHandle.edgesY] = Math.max(0, Math.min(this._fv.videoHeight, py));
+            }
+
+            // Enforce minimum box size -- prevent edge inversion
+            this._enforceMinSize();
+
+            this._draw();
+        } else {
+            // Hover: update cursor based on which handle is under the mouse
+            const handle = this._hitTest(mx, my);
+            this._fv.canvas.style.cursor = handle ? handle.cursor : 'default';
+        }
+    }
+
+    _onPointerUp(e) {
+        if (!this._active || !this._dragging) return;
+        e.preventDefault();
+        e.stopPropagation();
+
+        this._dragging = false;
+        this._dragHandle = null;
+
+        if (e.pointerId != null) {
+            try { this._fv.canvas.releasePointerCapture(e.pointerId); } catch (_) { /* ignore */ }
+        }
+
+        this._fv.canvas.style.cursor = 'default';
+
+        // Normalize: ensure x1 < x2, y1 < y2
+        this._normalizeBox();
+        this._draw();
+
+        // Fire callbacks
+        const box = this.getBox();
+        if (box) {
+            for (const cb of this._callbacks) {
+                cb(box);
+            }
+        }
+    }
+
+    // -- Box Constraints ------------------------------------------------------
+
+    /** Normalize box so x1 <= x2 and y1 <= y2. */
+    _normalizeBox() {
+        if (!this._box) return;
+        const b = this._box;
+        const nx1 = Math.min(b.x1, b.x2);
+        const ny1 = Math.min(b.y1, b.y2);
+        const nx2 = Math.max(b.x1, b.x2);
+        const ny2 = Math.max(b.y1, b.y2);
+        b.x1 = nx1;
+        b.y1 = ny1;
+        b.x2 = nx2;
+        b.y2 = ny2;
+    }
+
+    /**
+     * Enforce minimum box size of _MIN_SIZE pixels in each dimension.
+     * When a drag would make the box too small, clamp the moving edge
+     * so the box stays at minimum size.
+     */
+    _enforceMinSize() {
+        if (!this._box || !this._dragHandle) return;
+        const b = this._box;
+        const min = this._MIN_SIZE;
+        const h = this._dragHandle;
+
+        // X-axis enforcement
+        if (h.edgesX === 'x1' && b.x1 > b.x2 - min) {
+            b.x1 = b.x2 - min;
+        } else if (h.edgesX === 'x2' && b.x2 < b.x1 + min) {
+            b.x2 = b.x1 + min;
+        }
+
+        // Y-axis enforcement
+        if (h.edgesY === 'y1' && b.y1 > b.y2 - min) {
+            b.y1 = b.y2 - min;
+        } else if (h.edgesY === 'y2' && b.y2 < b.y1 + min) {
+            b.y2 = b.y1 + min;
+        }
+
+        // Re-clamp to frame bounds after min-size enforcement
+        b.x1 = Math.max(0, b.x1);
+        b.y1 = Math.max(0, b.y1);
+        b.x2 = Math.min(this._fv.videoWidth, b.x2);
+        b.y2 = Math.min(this._fv.videoHeight, b.y2);
     }
 }

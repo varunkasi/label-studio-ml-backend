@@ -341,7 +341,7 @@ def select_validation_frames(
 
     Uses the same temporal-bin strategy as ``select_round_frames`` but
     excludes Round 1 detection frames.  These frames are never used for
-    MLP training — only for evaluation.
+    classifier scoring — only for evaluation.
 
     Args:
         session: InterviewSession (must have frames_count set).
@@ -1190,7 +1190,7 @@ def run_round_detection(
 
     1. Select frames via temporal stratification (excludes prior rounds)
     2. Batch-decode and batch-detect
-    3. Store crops on session (NO auto-scoring — MLP trains at round boundary)
+    3. Store crops on session (k-NN scoring done separately via compute_uncertainties)
     4. Record round state
 
     Args:
