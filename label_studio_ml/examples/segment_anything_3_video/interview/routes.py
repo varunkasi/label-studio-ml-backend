@@ -773,6 +773,106 @@ def detect_subcategorize():
     })
 
 
+@interview_bp.route("/api/detect/refine_box", methods=["POST"])
+def detect_refine_box():
+    """Refine an oversized/partial box using Sam3TrackerModel (single-image PVS).
+
+    Body: {session_id, crop_id}
+    Returns: {refined_xyxy: [x1, y1, x2, y2], confidence: float}
+
+    Uses Sam3TrackerModel with box prompt — segments the object *within* the
+    crop's bounding box and returns a tighter box derived from the mask.
+    This is a preview-only endpoint; persistence happens via /detect/subcategorize.
+    """
+    data = request.get_json(force=True)
+    session_id = data.get("session_id")
+    crop_id = data.get("crop_id")
+
+    if not session_id or not crop_id:
+        return jsonify({"error": "session_id and crop_id are required"}), 400
+
+    session = get_session(session_id)
+    if session is None:
+        return jsonify({"error": "Session not found"}), 404
+
+    crop = session.get_crop(crop_id)
+    if crop is None:
+        return jsonify({"error": "Crop not found"}), 404
+
+    # Read the frame
+    from .detection import _read_frame_cached_or_pyav
+    frame = _read_frame_cached_or_pyav(
+        session.video_path, crop.frame_idx, cache_key=session_id,
+    )
+    if frame is None:
+        return jsonify({"error": f"Could not read frame {crop.frame_idx}"}), 500
+
+    # Run Sam3TrackerModel with box prompt
+    import numpy as np
+    import torch
+    from seeding_common import _get_sam3_tracker_image_model, DEVICE, DTYPE
+
+    model, processor = _get_sam3_tracker_image_model()
+    box_xyxy = [float(v) for v in crop.xyxy]
+
+    try:
+        # Sam3TrackerProcessor: input_boxes is 3D [[box_xyxy]]
+        inputs = processor(
+            images=frame,
+            input_boxes=[[box_xyxy]],
+            return_tensors="pt",
+        ).to(DEVICE)
+
+        with torch.inference_mode():
+            if DEVICE != "cpu":
+                with torch.autocast(device_type=DEVICE, dtype=DTYPE):
+                    outputs = model(**inputs, multimask_output=False)
+            else:
+                outputs = model(**inputs, multimask_output=False)
+
+        # Post-process mask to original size
+        masks = processor.post_process_masks(
+            outputs.pred_masks.cpu(), inputs["original_sizes"],
+        )[0]  # (objects=1, num_masks=1, H, W)
+
+        iou_score = float(outputs.iou_scores[0, 0, 0].item())
+
+        # Extract tight bounding box from mask
+        best_mask = masks[0, 0]  # (H, W)
+        if hasattr(best_mask, "cpu"):
+            best_mask = best_mask.cpu().float().numpy()
+
+        mask_bool = best_mask.astype(bool)
+        rows = np.any(mask_bool, axis=1)
+        cols = np.any(mask_bool, axis=0)
+
+        if not rows.any() or not cols.any():
+            # Empty mask — return original box
+            return jsonify({
+                "refined_xyxy": box_xyxy,
+                "confidence": 0.0,
+            })
+
+        y_indices = np.where(rows)[0]
+        x_indices = np.where(cols)[0]
+        w, h = frame.size
+        refined_xyxy = [
+            max(0.0, float(x_indices[0])),
+            max(0.0, float(y_indices[0])),
+            min(float(w), float(x_indices[-1] + 1)),
+            min(float(h), float(y_indices[-1] + 1)),
+        ]
+
+        return jsonify({
+            "refined_xyxy": refined_xyxy,
+            "confidence": iou_score,
+        })
+
+    except Exception as exc:
+        logger.exception("Sam3TrackerModel refine_box failed")
+        return jsonify({"error": str(exc)}), 500
+
+
 @interview_bp.route("/api/detect/train", methods=["POST"])
 def detect_train():
     """Re-score pending crops with k-NN (replaces MLP training)."""

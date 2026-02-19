@@ -1248,11 +1248,23 @@ function _buildRejectReviewUI() {
     });
     wrap.appendChild(drawToggle);
 
+    // Fix button — auto-refine box via Sam3TrackerModel (shown for partial/oversized)
+    var fixBtn = document.createElement('button');
+    fixBtn.id = 'reject-review-fix-btn';
+    fixBtn.className = 'btn btn-secondary btn-small reject-review-fix-btn';
+    fixBtn.textContent = 'Fix (SAM3)';
+    fixBtn.style.display = 'none';  // shown/hidden by _setSubcategory
+    fixBtn.addEventListener('click', function () {
+        _fixOversizedBox();
+    });
+    wrap.appendChild(fixBtn);
+
     // Keyboard hints
     var hints = document.createElement('div');
     hints.className = 'reject-review-hints';
     hints.innerHTML =
         '<span><kbd>J</kbd>/<kbd>K</kbd> Category</span>' +
+        '<span><kbd>F</kbd> Fix (SAM3)</span>' +
         '<span><kbd>&rarr;</kbd> Save & Next</span>' +
         '<span><kbd>&larr;</kbd> Previous</span>' +
         '<span><kbd>Esc</kbd> Exit</span>';
@@ -1320,6 +1332,13 @@ function _setSubcategory(subcat) {
     btns.forEach(function (btn) {
         btn.classList.toggle('active', btn.dataset.subcat === subcat);
     });
+
+    // Show/hide Fix button based on subcategory
+    var fixBtn = document.getElementById('reject-review-fix-btn');
+    if (fixBtn) {
+        fixBtn.style.display = (subcat === 'partial_box' || subcat === 'oversized_box')
+            ? '' : 'none';
+    }
 
     // Activate/deactivate box adjuster based on subcategory
     var ba = AppState._components.boxAdjuster;
@@ -1439,6 +1458,77 @@ async function _toggleRejectReviewDraw() {
     if (ba.isActive()) ba.deactivate();
     AppState.rejectReviewDrawActive = false;
     _setRejectReviewDrawButton(false);
+}
+
+/**
+ * Auto-fix an oversized/partial box using Sam3TrackerModel.
+ * Calls /api/detect/refine_box, applies the refined box to the BoxAdjuster,
+ * and keeps Draw mode ON so the user can further adjust.
+ */
+async function _fixOversizedBox() {
+    var subcat = AppState.rejectReviewSubcategory;
+    if (subcat !== 'partial_box' && subcat !== 'oversized_box') {
+        showToast('Fix is only available for Partial/Oversized categories', 'warning');
+        return;
+    }
+
+    var crop = AppState.rejectReviewCrops[AppState.rejectReviewIndex];
+    if (!crop) return;
+
+    var fixBtn = document.getElementById('reject-review-fix-btn');
+    if (fixBtn) {
+        fixBtn.disabled = true;
+        fixBtn.textContent = 'Fixing...';
+    }
+
+    try {
+        var result = await API.post('/detect/refine_box', {
+            session_id: AppState.sessionId,
+            crop_id: crop.crop_id,
+        });
+
+        if (result.error) {
+            showToast('Fix failed: ' + result.error, 'error');
+            return;
+        }
+
+        var refined = result.refined_xyxy;
+        if (!refined || refined.length !== 4) {
+            showToast('Fix returned invalid box', 'error');
+            return;
+        }
+
+        // Apply the refined box to BoxAdjuster
+        var ba = AppState._components.boxAdjuster;
+        if (ba) {
+            // Deactivate and reactivate with new box to update handles
+            if (ba.isActive()) ba.deactivate();
+            ba.activate({
+                x1: refined[0],
+                y1: refined[1],
+                x2: refined[2],
+                y2: refined[3],
+            });
+        }
+
+        // Mark box as adjusted and ensure draw mode stays on
+        AppState.rejectReviewBoxAdjusted = true;
+        AppState.rejectReviewDrawActive = true;
+        _setRejectReviewDrawButton(true);
+
+        // Store refined box on crop for later save
+        crop.corrected_xyxy = refined;
+
+        var conf = (result.confidence * 100).toFixed(0);
+        showToast('Box refined (IoU ' + conf + '%). Adjust if needed, then save.', 'success');
+    } catch (err) {
+        showToast('Fix failed: ' + (err.message || err), 'error');
+    } finally {
+        if (fixBtn) {
+            fixBtn.disabled = false;
+            fixBtn.textContent = 'Fix (SAM3)';
+        }
+    }
 }
 
 async function _saveRejectReviewCurrent(includeAdjustedBox) {
@@ -1688,6 +1778,9 @@ document.addEventListener('keydown', (e) => {
             } else if (e.key === 'k' || e.key === 'K') {
                 e.preventDefault();
                 _cycleSubcategory(1);
+            } else if (e.key === 'f' || e.key === 'F') {
+                e.preventDefault();
+                _fixOversizedBox();
             } else if (e.key === 'ArrowRight' || e.key === 'Enter') {
                 e.preventDefault();
                 _saveAndAdvanceRejectReview();

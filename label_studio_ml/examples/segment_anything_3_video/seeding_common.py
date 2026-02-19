@@ -61,6 +61,8 @@ _sam3_video_model = None
 _sam3_video_processor = None
 _sam3_tracker_model = None
 _sam3_tracker_processor = None
+_sam3_tracker_image_model = None
+_sam3_tracker_image_processor = None
 
 
 def _get_sam3_image_model():
@@ -97,6 +99,26 @@ def _get_sam3_tracker_model():
         _sam3_tracker_processor = Sam3TrackerVideoProcessor.from_pretrained(MODEL_NAME)
         logger.info("Sam3TrackerVideoModel loaded on %s", DEVICE)
     return _sam3_tracker_model, _sam3_tracker_processor
+
+
+def _get_sam3_tracker_image_model():
+    """Lazy-load Sam3TrackerModel for single-image box-prompted segmentation (PVS).
+
+    Distinct from:
+    - _get_sam3_image_model() → Sam3Model (concept segmentation / PCS)
+    - _get_sam3_tracker_model() → Sam3TrackerVideoModel (video tracking)
+
+    Sam3TrackerModel treats box prompts as spatial constraints — it segments
+    the object *within* the box, ideal for refining oversized bounding boxes.
+    """
+    global _sam3_tracker_image_model, _sam3_tracker_image_processor
+    if _sam3_tracker_image_model is None:
+        from transformers import Sam3TrackerModel, Sam3TrackerProcessor
+        logger.info("Loading Sam3TrackerModel (image PVS) from %s ...", MODEL_NAME)
+        _sam3_tracker_image_model = Sam3TrackerModel.from_pretrained(MODEL_NAME).to(DEVICE, dtype=DTYPE)
+        _sam3_tracker_image_processor = Sam3TrackerProcessor.from_pretrained(MODEL_NAME)
+        logger.info("Sam3TrackerModel loaded on %s", DEVICE)
+    return _sam3_tracker_image_model, _sam3_tracker_image_processor
 
 
 # ---------------------------------------------------------------------------

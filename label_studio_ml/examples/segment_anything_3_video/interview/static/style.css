@@ -850,6 +850,21 @@ body {
   border-bottom: 1px solid var(--border-default);
 }
 
+.reject-review-draw-toggle {
+  margin: 8px auto 4px;
+  display: block;
+}
+
+.reject-review-fix-btn {
+  margin: 4px auto 4px;
+  display: block;
+}
+
+.reject-review-fix-btn:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
 .subcat-btn {
   display: inline-flex;
   align-items: center;
