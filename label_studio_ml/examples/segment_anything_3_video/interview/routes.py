@@ -777,7 +777,7 @@ def detect_subcategorize():
 def detect_refine_box():
     """Refine an oversized/partial box using Sam3TrackerModel (single-image PVS).
 
-    Body: {session_id, crop_id}
+    Body: {session_id, crop_id, prompt_xyxy?}
     Returns: {refined_xyxy: [x1, y1, x2, y2], confidence: float}
 
     Uses Sam3TrackerModel with box prompt — segments the object *within* the
@@ -787,6 +787,7 @@ def detect_refine_box():
     data = request.get_json(force=True)
     session_id = data.get("session_id")
     crop_id = data.get("crop_id")
+    prompt_xyxy = data.get("prompt_xyxy")
 
     if not session_id or not crop_id:
         return jsonify({"error": "session_id and crop_id are required"}), 400
@@ -813,9 +814,30 @@ def detect_refine_box():
     from seeding_common import _get_sam3_tracker_image_model, DEVICE, DTYPE
 
     model, processor = _get_sam3_tracker_image_model()
-    box_xyxy = [float(v) for v in crop.xyxy]
+    if prompt_xyxy is not None:
+        if not isinstance(prompt_xyxy, (list, tuple)) or len(prompt_xyxy) != 4:
+            return jsonify({"error": "prompt_xyxy must be a 4-element array [x1, y1, x2, y2]"}), 400
+        try:
+            box_xyxy = [float(v) for v in prompt_xyxy]
+        except (TypeError, ValueError):
+            return jsonify({"error": "prompt_xyxy values must be numeric"}), 400
+        if box_xyxy[0] >= box_xyxy[2] or box_xyxy[1] >= box_xyxy[3]:
+            return jsonify({"error": "Invalid prompt_xyxy: x1 must be < x2 and y1 must be < y2"}), 400
+    else:
+        box_xyxy = [float(v) for v in crop.xyxy]
 
     try:
+        # Clamp prompt box to frame bounds.
+        w, h = frame.size
+        box_xyxy = [
+            max(0.0, min(float(w), box_xyxy[0])),
+            max(0.0, min(float(h), box_xyxy[1])),
+            max(0.0, min(float(w), box_xyxy[2])),
+            max(0.0, min(float(h), box_xyxy[3])),
+        ]
+        if box_xyxy[0] >= box_xyxy[2] or box_xyxy[1] >= box_xyxy[3]:
+            return jsonify({"error": "prompt_xyxy is outside frame bounds"}), 400
+
         # Sam3TrackerProcessor: input_boxes is 3D [[box_xyxy]]
         inputs = processor(
             images=frame,
@@ -855,7 +877,6 @@ def detect_refine_box():
 
         y_indices = np.where(rows)[0]
         x_indices = np.where(cols)[0]
-        w, h = frame.size
         refined_xyxy = [
             max(0.0, float(x_indices[0])),
             max(0.0, float(y_indices[0])),

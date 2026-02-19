@@ -1482,9 +1482,22 @@ async function _fixOversizedBox() {
     }
 
     try {
+        var ba = AppState._components.boxAdjuster;
+        var promptXyxy = null;
+        if (ba && ba.isActive()) {
+            var activeBox = ba.getBox();
+            if (activeBox) {
+                promptXyxy = [activeBox.x1, activeBox.y1, activeBox.x2, activeBox.y2];
+            }
+        }
+        if (!promptXyxy) {
+            promptXyxy = crop.corrected_xyxy || crop.xyxy;
+        }
+
         var result = await API.post('/detect/refine_box', {
             session_id: AppState.sessionId,
             crop_id: crop.crop_id,
+            prompt_xyxy: promptXyxy,
         });
 
         if (result.error) {
@@ -1499,7 +1512,6 @@ async function _fixOversizedBox() {
         }
 
         // Apply the refined box to BoxAdjuster
-        var ba = AppState._components.boxAdjuster;
         if (ba) {
             // Deactivate and reactivate with new box to update handles
             if (ba.isActive()) ba.deactivate();
@@ -1575,6 +1587,14 @@ function _exitRejectReview() {
     if (unreviewed.length > 0) {
         showToast('Please assign a subcategory to all rejected crops before exiting.', 'warning');
         return;
+    }
+
+    // Guard against discarding unsaved box edits on current crop (e.g., Esc exit).
+    if (AppState.rejectReviewBoxAdjusted) {
+        var discard = window.confirm(
+            'You have unsaved box changes for this crop. Exit reject review and discard these changes?'
+        );
+        if (!discard) return;
     }
 
     AppState.rejectReviewMode = false;
