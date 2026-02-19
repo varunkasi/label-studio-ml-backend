@@ -241,7 +241,12 @@ Rejects support subcategories for boundary-aware weighting:
 - **`partial_box`**: softer reject
 - **`oversized_box`**: softer reject
 
-When a reject is tagged `partial_box`/`oversized_box`, reviewers may optionally draw a corrected box. Corrected boxes are added immediately as accepted support examples and tracked separately in stats (`corrected_total`). At most one corrected crop exists per rejected crop (upsert semantics). Re-visiting a previously corrected crop loads the corrected box into the adjuster. Navigation auto-saves adjusted boxes and skips the API call entirely when nothing changed (dirty-tracking).
+When a reject is tagged `partial_box`/`oversized_box`, reviewers can correct the box in two ways:
+
+- **Fix (SAM3)** (`F` key): Calls `Sam3TrackerModel` (single-image PVS) with the current box as a spatial constraint. The model segments the object within the box and returns a tighter bounding box derived from the mask. The refined box is applied to the canvas adjuster and can be further tweaked manually. Pressing `F` again re-refines from the current (possibly adjusted) box, enabling iterative refinement.
+- **Manual draw**: Draw a corrected box directly on the canvas.
+
+Corrected boxes are added immediately as accepted support examples and tracked separately in stats (`corrected_total`). At most one corrected crop exists per rejected crop (upsert semantics). Re-visiting a previously corrected crop loads the corrected box into the adjuster. Navigation auto-saves adjusted boxes and skips the API call entirely when nothing changed (dirty-tracking). Exiting reject review with unsaved box edits triggers a confirmation dialog.
 
 **Critical distinction:** A person partially visible in the frame (walking out of frame edge) with a tight box around whatever IS visible is **Accept**. A person fully visible but only partially boxed is **Reject**. The judgment is always relative to what's visible.
 
