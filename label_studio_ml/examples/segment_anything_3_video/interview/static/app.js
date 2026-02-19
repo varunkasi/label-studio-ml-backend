@@ -661,7 +661,44 @@ async function _startSession(mode, keepFrameCache) {
     // Disable buttons
     actionsEl.querySelectorAll('.btn').forEach(function (b) { b.disabled = true; });
     progressEl.classList.remove('hidden');
-    progressEl.textContent = 'Initializing session...';
+
+    // Build inline progress widget (step text + bar + elapsed timer)
+    progressEl.innerHTML = '';
+    var _stepText = document.createElement('div');
+    _stepText.style.cssText = 'font-weight:600;margin-bottom:8px;';
+    _stepText.textContent = 'Initializing session...';
+    progressEl.appendChild(_stepText);
+
+    var _barWrapper = document.createElement('div');
+    _barWrapper.className = 'progress-bar-wrapper';
+    _barWrapper.style.cssText = 'width:320px;max-width:100%;';
+    var _track = document.createElement('div');
+    _track.className = 'progress-bar-track';
+    var _fill = document.createElement('div');
+    _fill.className = 'progress-bar-fill indeterminate';
+    _track.appendChild(_fill);
+    _barWrapper.appendChild(_track);
+    progressEl.appendChild(_barWrapper);
+
+    var _elapsed = document.createElement('div');
+    _elapsed.style.cssText = 'font-size:0.8rem;color:var(--text-muted,#999);margin-top:4px;';
+    _elapsed.textContent = '';
+    progressEl.appendChild(_elapsed);
+
+    /** Update the setup progress widget from a poll response. */
+    function _updateSetupProgress(p) {
+        _stepText.textContent = p.step || 'Processing...';
+        if (typeof p.elapsed_seconds === 'number') {
+            var secs = Math.round(p.elapsed_seconds);
+            _elapsed.textContent = secs < 60
+                ? secs + 's elapsed'
+                : Math.floor(secs / 60) + 'm ' + (secs % 60) + 's elapsed';
+        }
+        if (typeof p.percent === 'number' && p.percent >= 0) {
+            _fill.classList.remove('indeterminate');
+            _fill.style.width = Math.min(100, Math.max(0, p.percent)) + '%';
+        }
+    }
 
     try {
         // 1) Resume or create session
@@ -683,12 +720,12 @@ async function _startSession(mode, keepFrameCache) {
         if (mode === 'resume' && sessionResult.phase && sessionResult.phase !== 'init') {
             // Re-download video if file was lost (e.g. container rebuild)
             if (sessionResult.needs_video_info) {
-                progressEl.textContent = 'Re-downloading video file...';
+                _stepText.textContent = 'Re-downloading video file...';
                 var reVideoJob = await API.post('/session/' + AppState.sessionId + '/video_info', {});
                 await new Promise(function (resolve, reject) {
                     pollJob(
                         reVideoJob.job_id,
-                        function (p) { progressEl.textContent = p.step || 'Re-downloading video...'; },
+                        function (p) { _updateSetupProgress(p); },
                         function (p) {
                             if (p.status === 'failed') reject(new Error(p.error || 'Video download failed'));
                             else resolve(p);
@@ -703,14 +740,14 @@ async function _startSession(mode, keepFrameCache) {
         }
 
         // 2) Fetch video info (background job)
-        progressEl.textContent = 'Fetching video info...';
+        _stepText.textContent = 'Fetching video info...';
         const videoJob = await API.post(`/session/${AppState.sessionId}/video_info`, {});
 
         await new Promise((resolve, reject) => {
             pollJob(
                 videoJob.job_id,
                 (p) => {
-                    progressEl.textContent = p.step || 'Fetching video info...';
+                    _updateSetupProgress(p);
                 },
                 (p) => {
                     if (p.status === 'failed') {
@@ -727,7 +764,10 @@ async function _startSession(mode, keepFrameCache) {
         _applyStats(status);
 
         // 4) Run detection (Stage 1 = fast, embedding = background)
-        progressEl.textContent = 'Running detection on sampled frames...';
+        _stepText.textContent = 'Running detection on sampled frames...';
+        _elapsed.textContent = '';
+        _fill.classList.add('indeterminate');
+        _fill.style.width = '';
         const prompt = document.getElementById('setup-prompt').value.trim() || 'person';
         const detectResult = await API.post('/detect/start', {
             session_id: AppState.sessionId,
@@ -742,8 +782,7 @@ async function _startSession(mode, keepFrameCache) {
             pollJob(
                 detectResult.job_id,
                 (p) => {
-                    const pct = p.percent > 0 ? ` (${Math.round(p.percent)}%)` : '';
-                    progressEl.textContent = (p.step || 'Detecting...') + pct;
+                    _updateSetupProgress(p);
                 },
                 (p) => {
                     if (p.status === 'failed') {
@@ -765,7 +804,8 @@ async function _startSession(mode, keepFrameCache) {
     } catch (err) {
         showToast(`Setup failed: ${err.message}`, 'error');
         actionsEl.querySelectorAll('.btn').forEach((b) => (b.disabled = false));
-        progressEl.textContent = '';
+        progressEl.innerHTML = '';
+        progressEl.classList.add('hidden');
     }
 }
 
