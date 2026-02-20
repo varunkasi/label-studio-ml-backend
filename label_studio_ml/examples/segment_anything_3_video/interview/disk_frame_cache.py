@@ -132,6 +132,28 @@ def finalize_frame_cache(cache_key: str, sampled_indices: List[int],
     )
 
 
+def update_frame_cache_meta(cache_key: str, updates: dict) -> bool:
+    """Merge *updates* into an existing meta.json.
+
+    Only writes if at least one key is new (does not overwrite existing keys).
+    Returns True if meta.json was modified, False otherwise.
+    """
+    with _meta_lock:
+        existing = _read_meta(_meta_path(cache_key))
+        if existing is None:
+            return False
+        added_keys = []
+        for k, v in updates.items():
+            if k not in existing:
+                existing[k] = v
+                added_keys.append(k)
+        if added_keys:
+            _write_meta(_meta_path(cache_key), existing)
+            logger.info("Updated meta.json for %s: added keys %s",
+                        cache_key, added_keys)
+    return bool(added_keys)
+
+
 # ---------------------------------------------------------------------------
 # Read API (used by change detection, seeding, UI)
 # ---------------------------------------------------------------------------

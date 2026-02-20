@@ -1137,6 +1137,8 @@ def compute_lightweight_change_from_video(
             "target_fps": target_fps,
             "src_fps": src_fps,
             "resolution": [w, h],
+            "total_frames": total_frames,
+            "video_path": video_path,
             "created_at": _time.strftime("%Y-%m-%dT%H:%M:%S"),
         })
 

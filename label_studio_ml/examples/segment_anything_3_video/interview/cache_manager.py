@@ -323,6 +323,20 @@ def delete_cache(
             shutil.rmtree(d)
             logger.info("Deleted cache %s", cache_key)
 
+    # Also clean up the video download cache if present.
+    # cache_key is "p{project}_t{task}" — extract task_id.
+    if not keep_frame_cache:
+        try:
+            parts = cache_key.split("_t", 1)
+            if len(parts) == 2:
+                task_id = parts[1]
+                video_cache_dir = Path("/data/video_cache") / task_id
+                if video_cache_dir.is_dir():
+                    shutil.rmtree(video_cache_dir)
+                    logger.info("Deleted video download cache %s", video_cache_dir)
+        except Exception as exc:
+            logger.debug("Could not clean video cache for %s: %s", cache_key, exc)
+
     if project_id is not None:
         _remove_from_project_index(project_id, cache_key)
 

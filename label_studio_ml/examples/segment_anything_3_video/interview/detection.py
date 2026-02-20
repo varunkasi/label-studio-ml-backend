@@ -1372,6 +1372,16 @@ def run_embedding_background(
             progress_callback=_progress_cb,
             cache_key=session.cache_key,
         )
+        # Backfill video_key into disk frame cache (not available during
+        # compute_lightweight_change_from_video which is video_key-agnostic)
+        if session.cache_key and session.video_key:
+            try:
+                from .disk_frame_cache import update_frame_cache_meta
+                update_frame_cache_meta(session.cache_key, {
+                    "video_key": session.video_key,
+                })
+            except ImportError:
+                pass
         frames_count = len(scores)
         smooth = smooth_change_scores(scores, kernel_size=5)
     else:

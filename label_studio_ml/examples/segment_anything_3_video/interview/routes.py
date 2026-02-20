@@ -10,6 +10,7 @@ import io
 import logging
 import os
 from typing import Any, Dict, Optional
+from urllib.parse import urlparse
 
 from flask import Blueprint, jsonify, request, send_from_directory, abort
 
@@ -182,6 +183,15 @@ def _recover_embedding_if_needed(session: InterviewSession) -> None:
         session.video_path, target_fps=EMBEDDING_TARGET_FPS,
         cache_key=session.cache_key,
     )
+    # Backfill video_key into disk frame cache if available
+    if session.cache_key and session.video_key:
+        try:
+            from .disk_frame_cache import update_frame_cache_meta
+            update_frame_cache_meta(session.cache_key, {
+                "video_key": session.video_key,
+            })
+        except ImportError:
+            pass
     smooth = smooth_change_scores(scores, kernel_size=5)
     change_keyframes_sub = select_keyframes(
         len(scores), DEFAULT_KEYFRAME_FRAC, smooth,
@@ -318,6 +328,88 @@ def session_status(session_id: str):
     return jsonify(session.stats())
 
 
+def _origin_tuple(url: str) -> Optional[tuple]:
+    """Return normalized (scheme, host, port) for absolute HTTP(S) URLs."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return None
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return None
+    port = parsed.port
+    if port is None:
+        port = 443 if parsed.scheme == "https" else 80
+    return (parsed.scheme, host, port)
+
+
+def _same_origin(url_a: str, url_b: str) -> bool:
+    """True if both absolute URLs share scheme/host/port origin."""
+    oa = _origin_tuple(url_a)
+    ob = _origin_tuple(url_b)
+    return oa is not None and ob is not None and oa == ob
+
+
+def _download_video_with_progress(video_url: str, task_id: int,
+                                  progress, *, ls_base_url: str = "",
+                                  ls_api_key: str = "",
+                                  cache_root: str = "/data/video_cache") -> str:
+    """Download video with byte-level progress, using a deterministic cache.
+
+    Cache path: ``/data/video_cache/{task_id}/{url_hash}.mp4``
+    Returns the local path to the downloaded (or cached) video file.
+    """
+    import hashlib
+    import requests
+
+    url_hash = hashlib.md5(video_url.encode()).hexdigest()[:12]
+    cache_dir = os.path.join(cache_root, str(task_id))
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_path = os.path.join(cache_dir, f"{url_hash}.mp4")
+
+    # Cache hit
+    if os.path.exists(cache_path) and os.path.getsize(cache_path) > 0:
+        logger.info("Video cache hit: %s (%.1f MB)",
+                     cache_path, os.path.getsize(cache_path) / 1024**2)
+        return cache_path
+
+    # Cache miss — streaming download with progress
+    headers = {}
+    if ls_api_key and _same_origin(video_url, ls_base_url):
+        headers["Authorization"] = f"Token {ls_api_key}"
+
+    logger.info("Downloading video from %s to %s", video_url, cache_path)
+    tmp_path = cache_path + ".tmp"
+    try:
+        with requests.get(video_url, headers=headers, stream=True,
+                          timeout=600) as r:
+            r.raise_for_status()
+            total_bytes = int(r.headers.get("Content-Length", 0))
+            if total_bytes > 0:
+                progress.total = total_bytes
+                size_gb = total_bytes / (1024**3)
+                progress.step = f"Downloading video ({size_gb:.1f} GB)..."
+            else:
+                progress.step = "Downloading video..."
+                progress.total = 0
+
+            written = 0
+            with open(tmp_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=65536):
+                    f.write(chunk)
+                    written += len(chunk)
+                    progress.current = written
+
+        os.rename(tmp_path, cache_path)
+        logger.info("Video download complete: %s (%.1f MB)",
+                     cache_path, written / 1024**2)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
+
+    return cache_path
+
+
 @interview_bp.route("/api/session/<session_id>/video_info", methods=["POST"])
 def session_video_info(session_id: str):
     """Fetch video info for the session's task. Must be called after init."""
@@ -326,13 +418,69 @@ def session_video_info(session_id: str):
         return jsonify({"error": "Session not found"}), 404
 
     def _fetch(progress):
-        progress.step = "Fetching video info..."
+        progress.step = "Checking frame cache..."
         progress.total = 3
 
+        # ---- Fast path: disk frame cache has all metadata we need ----
+        try:
+            from .disk_frame_cache import (
+                frame_cache_exists, get_frame_cache_meta,
+            )
+            if frame_cache_exists(session.cache_key):
+                meta = get_frame_cache_meta(session.cache_key)
+                if meta and "resolution" in meta and "src_fps" in meta:
+                    res = meta["resolution"]  # [W, H]
+                    width, height = res[0], res[1]
+                    fps = meta["src_fps"]
+
+                    # total_frames: new caches have it; old ones estimate
+                    total_frames = meta.get("total_frames")
+                    if not total_frames:
+                        indices = meta.get("sampled_indices", [])
+                        target_fps = meta.get("target_fps", 10.0)
+                        skip = max(1, int(round(fps / target_fps)))
+                        total_frames = (max(indices) + skip) if indices else 0
+
+                    video_path = meta.get("video_path", "")
+                    video_key = meta.get("video_key", "video")
+                    if not video_path or not os.path.isfile(video_path):
+                        logger.info(
+                            "Frame-cache metadata present but video_path is "
+                            "missing/unreadable; falling back to task fetch "
+                            "and download (cache_key=%s)",
+                            session.cache_key,
+                        )
+                    else:
+                        progress.step = "Using cached video metadata"
+                        progress.current = 3
+
+                        with session._lock:
+                            session.video_path = video_path
+                            session.video_key = video_key
+                            session.width = width
+                            session.height = height
+                            session.frames_count = total_frames
+                            session.fps = fps
+                            session.touch()
+
+                        logger.info(
+                            "Fast path: video info from disk frame cache "
+                            "(%dx%d, %d frames, %.1f fps)",
+                            width, height, total_frames, fps,
+                        )
+
+                        return _cross_video_gate(
+                            session, video_path, video_key,
+                            width, height, total_frames, fps,
+                        )
+        except ImportError:
+            pass
+
+        # ---- Slow path: fetch task from LS + download video ----
         import sys
         sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
         from seeding_common import (
-            _build_ls_client, _fetch_task, _get_video_path,
+            _build_ls_client, _fetch_task, _detect_video_key,
             _get_video_info_pyav,
         )
 
@@ -345,7 +493,20 @@ def session_video_info(session_id: str):
         progress.step = "Fetching task data..."
         progress.current = 2
         task = _fetch_task(ls, session.project_id, session.task_id)
-        video_path, video_key = _get_video_path(task)
+        data = task.get("data") or {}
+        video_key, video_url = _detect_video_key(data)
+
+        # Resolve relative URL to absolute
+        if not video_url.startswith("http") and video_url.startswith("/"):
+            from urllib.parse import urljoin
+            video_url = urljoin(ls_url.rstrip("/"), video_url)
+
+        # Download with byte-level progress
+        video_path = _download_video_with_progress(
+            video_url, session.task_id, progress,
+            ls_base_url=ls_url,
+            ls_api_key=ls_api_key,
+        )
 
         progress.step = "Reading video metadata..."
         progress.current = 3
@@ -360,47 +521,64 @@ def session_video_info(session_id: str):
             session.fps = fps
             session.touch()
 
-        # Gate: strip imported supports from a different video.
-        # Same-video imports are safe (frame_idx and xyxy are valid).
-        # Cross-video imports would corrupt context features, dedup, and
-        # frame rendering — not yet supported.
-        cross_video_ids = [
-            cid for cid, crop in session.crops.items()
-            if crop.is_imported_support
-            and crop.source_video_key
-            and crop.source_video_key != video_key
-        ]
-        warning = None
-        if cross_video_ids:
-            logger.warning(
-                "Cross-video import: %d imported supports from a different "
-                "video removed (source_video_key != %s). Cross-task import "
-                "with different videos is not yet supported.",
-                len(cross_video_ids), video_key,
-            )
-            with session._lock:
-                for cid in cross_video_ids:
-                    del session.crops[cid]
-                session.touch()
-            warning = (
-                f"Removed {len(cross_video_ids)} imported supports — they "
-                f"came from a different video. Cross-video transfer is not "
-                f"yet supported."
-            )
+        # Backfill disk frame cache meta.json so future starts use fast path
+        try:
+            from .disk_frame_cache import update_frame_cache_meta
+            if update_frame_cache_meta(session.cache_key, {
+                "video_path": video_path,
+                "video_key": video_key,
+                "total_frames": frames_count,
+            }):
+                logger.info("Backfilled meta.json for %s", session.cache_key)
+        except Exception as exc:
+            logger.debug("Could not backfill meta.json: %s", exc)
 
-        result = {
-            "video_path": video_path,
-            "width": width,
-            "height": height,
-            "frames_count": frames_count,
-            "fps": fps,
-        }
-        if warning:
-            result["warning"] = warning
-        return result
+        return _cross_video_gate(
+            session, video_path, video_key,
+            width, height, frames_count, fps,
+        )
 
     job_id = submit_job(_fetch, name="fetch_video_info")
     return jsonify({"job_id": job_id}), 202
+
+
+def _cross_video_gate(session, video_path, video_key,
+                      width, height, frames_count, fps):
+    """Strip imported supports from a different video and build result dict."""
+    cross_video_ids = [
+        cid for cid, crop in session.crops.items()
+        if crop.is_imported_support
+        and crop.source_video_key
+        and crop.source_video_key != video_key
+    ]
+    warning = None
+    if cross_video_ids:
+        logger.warning(
+            "Cross-video import: %d imported supports from a different "
+            "video removed (source_video_key != %s). Cross-task import "
+            "with different videos is not yet supported.",
+            len(cross_video_ids), video_key,
+        )
+        with session._lock:
+            for cid in cross_video_ids:
+                del session.crops[cid]
+            session.touch()
+        warning = (
+            f"Removed {len(cross_video_ids)} imported supports — they "
+            f"came from a different video. Cross-video transfer is not "
+            f"yet supported."
+        )
+
+    result = {
+        "video_path": video_path,
+        "width": width,
+        "height": height,
+        "frames_count": frames_count,
+        "fps": fps,
+    }
+    if warning:
+        result["warning"] = warning
+    return result
 
 
 # ===========================================================================
