@@ -23,7 +23,10 @@ from .cache_manager import (
     cache_exists, list_project_caches, save_session, load_session,
     delete_cache,
 )
-from .background import submit_job, get_job_progress, get_job_result, pause_job, resume_job
+from .background import (
+    submit_job, get_job_progress, get_job_result, pause_job, resume_job,
+    cancel_job,
+)
 from .frame_cache import read_frame_cached as _read_frame_cached
 
 logger = logging.getLogger(__name__)
@@ -183,13 +186,17 @@ def _recover_embedding_if_needed(session: InterviewSession) -> None:
         session.video_path, target_fps=EMBEDDING_TARGET_FPS,
         cache_key=session.cache_key,
     )
-    # Backfill video_key into disk frame cache if available
+    # Backfill video_key and video_path into disk frame cache if available
     if session.cache_key and session.video_key:
         try:
             from .disk_frame_cache import update_frame_cache_meta
-            update_frame_cache_meta(session.cache_key, {
-                "video_key": session.video_key,
-            })
+            updates = {"video_key": session.video_key}
+            force = set()
+            if session.video_path:
+                updates["video_path"] = session.video_path
+                force.add("video_path")
+            update_frame_cache_meta(session.cache_key, updates,
+                                    force_keys=force)
         except ImportError:
             pass
     smooth = smooth_change_scores(scores, kernel_size=5)
@@ -521,14 +528,16 @@ def session_video_info(session_id: str):
             session.fps = fps
             session.touch()
 
-        # Backfill disk frame cache meta.json so future starts use fast path
+        # Backfill disk frame cache meta.json so future starts use fast path.
+        # Force-overwrite video_path: if an old/stale path was already stored,
+        # the add-only default would skip it, leaving the fast path broken.
         try:
             from .disk_frame_cache import update_frame_cache_meta
             if update_frame_cache_meta(session.cache_key, {
                 "video_path": video_path,
                 "video_key": video_key,
                 "total_frames": frames_count,
-            }):
+            }, force_keys={"video_path"}):
                 logger.info("Backfilled meta.json for %s", session.cache_key)
         except Exception as exc:
             logger.debug("Could not backfill meta.json: %s", exc)
@@ -1490,6 +1499,17 @@ def job_progress(job_id: str):
     if progress is None:
         return jsonify({"error": "Job not found"}), 404
     return jsonify(progress)
+
+
+@interview_bp.route("/api/job/<job_id>/cancel", methods=["POST"])
+def job_cancel(job_id: str):
+    """Request cooperative cancellation for a running background job."""
+    cancelled = cancel_job(job_id)
+    if cancelled is None:
+        return jsonify({"error": "Job not found"}), 404
+    if cancelled is False:
+        return jsonify({"error": "Job is not running"}), 409
+    return jsonify({"job_id": job_id, "cancel_requested": True})
 
 
 @interview_bp.route("/api/session/<session_id>/save", methods=["POST"])

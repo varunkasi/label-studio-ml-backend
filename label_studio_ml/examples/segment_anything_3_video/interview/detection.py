@@ -1372,14 +1372,19 @@ def run_embedding_background(
             progress_callback=_progress_cb,
             cache_key=session.cache_key,
         )
-        # Backfill video_key into disk frame cache (not available during
-        # compute_lightweight_change_from_video which is video_key-agnostic)
+        # Backfill video_key and video_path into disk frame cache (not
+        # available during compute_lightweight_change_from_video which is
+        # video_key-agnostic)
         if session.cache_key and session.video_key:
             try:
                 from .disk_frame_cache import update_frame_cache_meta
-                update_frame_cache_meta(session.cache_key, {
-                    "video_key": session.video_key,
-                })
+                updates = {"video_key": session.video_key}
+                force = set()
+                if session.video_path:
+                    updates["video_path"] = session.video_path
+                    force.add("video_path")
+                update_frame_cache_meta(session.cache_key, updates,
+                                        force_keys=force)
             except ImportError:
                 pass
         frames_count = len(scores)

@@ -132,26 +132,35 @@ def finalize_frame_cache(cache_key: str, sampled_indices: List[int],
     )
 
 
-def update_frame_cache_meta(cache_key: str, updates: dict) -> bool:
+def update_frame_cache_meta(cache_key: str, updates: dict,
+                           force_keys: Optional[set] = None) -> bool:
     """Merge *updates* into an existing meta.json.
 
-    Only writes if at least one key is new (does not overwrite existing keys).
+    By default, only writes keys that are new (does not overwrite existing).
+    Keys listed in *force_keys* will overwrite even if they already exist —
+    used for repairing stale ``video_path`` entries after container rebuilds.
+
     Returns True if meta.json was modified, False otherwise.
     """
+    if force_keys is None:
+        force_keys = set()
     with _meta_lock:
         existing = _read_meta(_meta_path(cache_key))
         if existing is None:
             return False
-        added_keys = []
+        changed_keys = []
         for k, v in updates.items():
             if k not in existing:
                 existing[k] = v
-                added_keys.append(k)
-        if added_keys:
+                changed_keys.append(k)
+            elif k in force_keys and existing[k] != v:
+                existing[k] = v
+                changed_keys.append(k)
+        if changed_keys:
             _write_meta(_meta_path(cache_key), existing)
-            logger.info("Updated meta.json for %s: added keys %s",
-                        cache_key, added_keys)
-    return bool(added_keys)
+            logger.info("Updated meta.json for %s: changed keys %s",
+                        cache_key, changed_keys)
+    return bool(changed_keys)
 
 
 # ---------------------------------------------------------------------------
