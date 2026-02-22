@@ -270,31 +270,51 @@ def extract_crop_images_from_session(
     crop_images = []
     crop_ids = []
 
-    # Group by frame to minimize video seeks
-    frame_to_crops: Dict[int, list] = {}
-    for crop in accepted:
-        frame_to_crops.setdefault(crop.frame_idx, []).append(crop)
+    from .cache_manager import read_cached_accepted_crop_image
 
-    for frame_idx in sorted(frame_to_crops.keys()):
-        frame = read_frame_fn(
-            session.video_path, frame_idx, cache_key=session.cache_key,
+    # On-demand frame cache for fallback path (when temp accepted crop missing).
+    frame_cache: Dict[int, Optional[Image.Image]] = {}
+    cache_hits = 0
+    fallback_reads = 0
+
+    for crop in accepted:
+        cached_crop = read_cached_accepted_crop_image(
+            session.cache_key, crop.crop_id, target_size=target_size,
         )
+        if cached_crop is not None:
+            crop_images.append(cached_crop)
+            crop_ids.append(crop.crop_id)
+            cache_hits += 1
+            continue
+
+        frame_idx = crop.frame_idx
+        if frame_idx not in frame_cache:
+            frame_cache[frame_idx] = read_frame_fn(
+                session.video_path, frame_idx, cache_key=session.cache_key,
+            )
+            if frame_cache[frame_idx] is not None:
+                fallback_reads += 1
+        frame = frame_cache[frame_idx]
         if frame is None:
             logger.warning("Could not read frame %d for UFM crop extraction", frame_idx)
             continue
 
-        for crop in frame_to_crops[frame_idx]:
-            x1, y1, x2, y2 = [int(round(v)) for v in crop.xyxy]
-            x1 = max(0, x1)
-            y1 = max(0, y1)
-            x2 = min(frame.width, x2)
-            y2 = min(frame.height, y2)
+        x1, y1, x2, y2 = [int(round(v)) for v in crop.xyxy]
+        x1 = max(0, x1)
+        y1 = max(0, y1)
+        x2 = min(frame.width, x2)
+        y2 = min(frame.height, y2)
+        if x2 <= x1 or y2 <= y1:
+            logger.warning("Skipping invalid crop %s with box %s", crop.crop_id, crop.xyxy)
+            continue
 
-            cropped = frame.crop((x1, y1, x2, y2))
-            cropped = cropped.resize(target_size, Image.BILINEAR)
-            crop_images.append(cropped)
-            crop_ids.append(crop.crop_id)
+        cropped = frame.crop((x1, y1, x2, y2))
+        cropped = cropped.resize(target_size, Image.BILINEAR)
+        crop_images.append(cropped)
+        crop_ids.append(crop.crop_id)
 
-    logger.info("Extracted %d crop images for UFM from %d frames",
-                len(crop_images), len(frame_to_crops))
+    logger.info(
+        "Extracted %d crop images for UFM (cached=%d, fallback_frame_reads=%d)",
+        len(crop_images), cache_hits, fallback_reads,
+    )
     return crop_images, crop_ids

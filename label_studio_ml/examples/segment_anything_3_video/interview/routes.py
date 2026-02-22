@@ -21,7 +21,7 @@ from .state import (
 )
 from .cache_manager import (
     cache_exists, list_project_caches, save_session, load_session,
-    delete_cache,
+    delete_cache, cache_accepted_crop_image, delete_cached_accepted_crop_image,
 )
 from .background import (
     submit_job, get_job_progress, get_job_result, pause_job, resume_job,
@@ -40,6 +40,37 @@ interview_bp = Blueprint(
     static_url_path="",
     url_prefix="/interview",
 )
+
+
+def _cache_accepted_crop_for_reid(session: InterviewSession, crop: CropData) -> None:
+    """Persist a UFM-ready accepted crop JPEG under the session temp cache."""
+    if getattr(crop, "is_imported_support", False):
+        return
+
+    try:
+        frame = _read_frame_cached(session.video_path, crop.frame_idx, cache_key=session.cache_key)
+        if frame is None:
+            logger.warning("Could not read frame %d for accepted crop cache (%s)", crop.frame_idx, crop.crop_id)
+            return
+
+        x1, y1, x2, y2 = [int(round(v)) for v in crop.xyxy]
+        x1 = max(0, x1)
+        y1 = max(0, y1)
+        x2 = min(frame.width, x2)
+        y2 = min(frame.height, y2)
+        if x2 <= x1 or y2 <= y1:
+            logger.warning("Invalid accepted crop box for cache (%s): %s", crop.crop_id, crop.xyxy)
+            return
+
+        cropped = frame.crop((x1, y1, x2, y2))
+        cache_accepted_crop_image(session.cache_key, crop.crop_id, cropped)
+    except Exception as exc:
+        # Temp cache is an optimization only; never fail endpoint logic.
+        logger.warning("Failed caching accepted crop %s: %s", crop.crop_id, exc)
+
+
+def _delete_cached_accepted_crop(session: InterviewSession, crop_id: str) -> None:
+    delete_cached_accepted_crop_image(session.cache_key, crop_id)
 
 
 @interview_bp.after_request
@@ -888,6 +919,12 @@ def detect_label():
             label = CropLabel(label_str)
             if session.label_crop(crop_id, label):
                 updated += 1
+                crop = session.get_crop(crop_id)
+                if crop is not None:
+                    if label == CropLabel.ACCEPTED:
+                        _cache_accepted_crop_for_reid(session, crop)
+                    else:
+                        _delete_cached_accepted_crop(session, crop_id)
         except ValueError:
             pass
 
@@ -920,6 +957,7 @@ def detect_draw():
         prompt="human_drawn",
     )
     session.add_crop(crop)
+    _cache_accepted_crop_for_reid(session, crop)
     save_session(session)
 
     return jsonify({"crop": crop.to_dict(), **session.stats()})
@@ -972,6 +1010,7 @@ def detect_subcategorize():
     # Saving "not_person" removes any corrected counterpart.
     if reject_reason == "not_person":
         for cid in existing_corrected:
+            _delete_cached_accepted_crop(session, cid)
             del session.crops[cid]
 
     # If an adjusted box was provided, create a corrected crop.
@@ -993,6 +1032,7 @@ def detect_subcategorize():
         # Remove any previously-created corrected crop for this original
         # (idempotency: re-subcategorize replaces, not duplicates)
         for cid in existing_corrected:
+            _delete_cached_accepted_crop(session, cid)
             del session.crops[cid]
 
         new_crop = CropData(
@@ -1006,6 +1046,7 @@ def detect_subcategorize():
             corrected_from=crop_id,
         )
         session.add_crop(new_crop)
+        _cache_accepted_crop_for_reid(session, new_crop)
         new_crop_id = new_crop.crop_id
 
     save_session(session)

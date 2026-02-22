@@ -9,12 +9,14 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+from PIL import Image
 
 from .state import (
     CropData, CropLabel, CropSource, InterviewSession, Phase,
@@ -25,12 +27,79 @@ logger = logging.getLogger(__name__)
 
 CACHE_ROOT = os.getenv("INTERVIEW_CACHE_ROOT", "/data/adapters")
 PROJECT_INDEX_FILE = "_project_index.json"
+ACCEPTED_CROPS_DIRNAME = "accepted_crops"
+ACCEPTED_CROP_SIZE: Tuple[int, int] = (224, 224)
 
 _index_lock = threading.Lock()
 
 
 def _cache_dir(cache_key: str) -> Path:
     return Path(CACHE_ROOT) / cache_key
+
+
+def _accepted_crops_dir(cache_key: str) -> Path:
+    return _cache_dir(cache_key) / ACCEPTED_CROPS_DIRNAME
+
+
+def _accepted_crop_path(cache_key: str, crop_id: str) -> Path:
+    # Prevent path traversal; crop IDs are expected to be short IDs.
+    safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", str(crop_id))
+    return _accepted_crops_dir(cache_key) / f"{safe_id}.jpg"
+
+
+def cache_accepted_crop_image(
+    cache_key: str,
+    crop_id: str,
+    pil_img: Image.Image,
+    target_size: Tuple[int, int] = ACCEPTED_CROP_SIZE,
+    quality: int = 90,
+) -> Path:
+    """Write a UFM-ready accepted crop JPEG to temp cache."""
+    out_dir = _accepted_crops_dir(cache_key)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = _accepted_crop_path(cache_key, crop_id)
+
+    img = pil_img.convert("RGB")
+    if img.size != target_size:
+        img = img.resize(target_size, Image.BILINEAR)
+
+    tmp = out_path.with_suffix(".tmp")
+    img.save(tmp, "JPEG", quality=quality)
+    tmp.rename(out_path)
+    return out_path
+
+
+def read_cached_accepted_crop_image(
+    cache_key: str,
+    crop_id: str,
+    target_size: Tuple[int, int] = ACCEPTED_CROP_SIZE,
+) -> Optional[Image.Image]:
+    """Read a cached accepted crop JPEG, or None if absent/unreadable."""
+    path = _accepted_crop_path(cache_key, crop_id)
+    if not path.is_file():
+        return None
+    try:
+        img = Image.open(path)
+        img.load()
+        img = img.convert("RGB")
+        if img.size != target_size:
+            img = img.resize(target_size, Image.BILINEAR)
+        return img
+    except (OSError, IOError) as exc:
+        logger.warning("Failed reading accepted crop cache %s: %s", path, exc)
+        return None
+
+
+def delete_cached_accepted_crop_image(cache_key: str, crop_id: str) -> bool:
+    """Delete cached accepted crop JPEG if present."""
+    path = _accepted_crop_path(cache_key, crop_id)
+    try:
+        if path.is_file():
+            path.unlink()
+            return True
+    except OSError as exc:
+        logger.warning("Failed deleting accepted crop cache %s: %s", path, exc)
+    return False
 
 
 def cache_exists(cache_key: str) -> bool:
@@ -428,5 +497,4 @@ def _load_features(d: Path, session: InterviewSession) -> None:
                         crop.context_features = vec
     except Exception as e:
         logger.warning("Failed to load features from %s: %s", path, e)
-
 
