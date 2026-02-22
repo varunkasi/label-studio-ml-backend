@@ -921,6 +921,8 @@ function _renderToolbar() {
     toolbar.render({
         drawMode: AppState.drawMode,
         disableDrawToggle: AppState.rejectReviewMode,
+        disableNextRound: AppState.rejectReviewMode,
+        disableNextRoundReason: 'Finish reject review before starting the next round',
         sortBy: AppState.sortBy,
         filterLabel: AppState.filterLabel,
         stats: AppState.stats,
@@ -1170,6 +1172,43 @@ function _navigateFrame(direction) {
 
 /** Handle Next Round: score crops with k-NN, then detect on new frames. */
 async function _onNextRound() {
+    if (AppState.rejectReviewMode) {
+        var unreviewedInReview = AppState.rejectReviewCrops.filter(function (c) {
+            return !c.reject_reason;
+        });
+        if (unreviewedInReview.length > 0) {
+            showToast('Please review all rejected crops before starting the next round.', 'warning');
+            return;
+        }
+
+        var index = AppState.rejectReviewIndex;
+        if (index >= 0 && index < AppState.rejectReviewCrops.length) {
+            var crop = AppState.rejectReviewCrops[index];
+            var neverSaved = !crop.reject_reason;
+            var reasonChanged = AppState.rejectReviewSubcategory !== (crop.reject_reason || 'not_person');
+            var boxChanged = AppState.rejectReviewBoxAdjusted;
+            if (neverSaved || reasonChanged || boxChanged) {
+                var saved = await _saveRejectReviewCurrent(boxChanged, false);
+                if (!saved) {
+                    showToast('Please save reject review changes before starting the next round.', 'warning');
+                    return;
+                }
+                AppState.rejectReviewBoxAdjusted = false;
+            }
+        }
+
+        _exitRejectReview();
+    }
+
+    var unreviewedRejects = AppState.crops.filter(function (c) {
+        return c.label === 'rejected' && !c.reject_reason;
+    });
+    if (unreviewedRejects.length > 0) {
+        showToast('Please review all rejected crops before starting the next round.', 'warning');
+        _enterRejectReview(unreviewedRejects);
+        return;
+    }
+
     const progress = AppState._components.progressOverlay;
 
     try {

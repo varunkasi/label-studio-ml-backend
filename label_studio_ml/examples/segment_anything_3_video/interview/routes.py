@@ -710,6 +710,19 @@ def detect_next_round():
     if session is None:
         return jsonify({"error": "Session not found"}), 404
 
+    unreviewed_rejects = [
+        c.crop_id
+        for c in session.crops.values()
+        if c.label == CropLabel.REJECTED and not c.reject_reason
+    ]
+    if unreviewed_rejects:
+        return jsonify({
+            "error": (
+                "Cannot start next round: all rejected crops must be subcategorized first"
+            ),
+            "unreviewed_reject_count": len(unreviewed_rejects),
+        }), 400
+
     next_round = session.current_round + 1
     prompt = session.prompts[0] if session.prompts else "person"
 
