@@ -313,8 +313,6 @@ class InterviewSession:
     prompts: List[str] = field(default_factory=list)
     sampled_frames: List[int] = field(default_factory=list)
     crops: Dict[str, CropData] = field(default_factory=dict)
-    _crops_by_frame: Dict[int, Dict[str, CropData]] = field(default_factory=dict, repr=False)
-    _crop_index_count: int = field(default=0, repr=False)
 
     # Background embedding state
     embedding_job_id: Optional[str] = None
@@ -348,15 +346,7 @@ class InterviewSession:
 
     # Seeding
     seed_config: SeedConfig = field(default_factory=SeedConfig)
-    # All generated seed candidates (unfiltered). Confidence filtering is applied
-    # at list/upload time using ``seed_config.confidence_threshold``.
-    seeds: List[Dict[str, Any]] = field(default_factory=list)
-    # Cached-frame subset selected by the frame-coverage slider for the current
-    # generation state. Used to compute incremental regeneration deltas.
-    seed_cached_frames: List[int] = field(default_factory=list)
-    # Full target frame set currently represented in ``seeds`` (coverage subset
-    # plus any forced change keyframes).
-    seed_target_frames: List[int] = field(default_factory=list)
+    seeds: List[Dict[str, Any]] = field(default_factory=list)  # final seed regions
     upload_result: Optional[Dict[str, Any]] = None
 
     # Thread safety
@@ -369,31 +359,8 @@ class InterviewSession:
     # -- Crop CRUD --
 
     def add_crop(self, crop: CropData) -> None:
-        existing = self.crops.get(crop.crop_id)
-        if existing is not None:
-            frame_map = self._crops_by_frame.get(existing.frame_idx)
-            if frame_map is not None and crop.crop_id in frame_map:
-                frame_map.pop(crop.crop_id, None)
-                if not frame_map:
-                    self._crops_by_frame.pop(existing.frame_idx, None)
-        else:
-            self._crop_index_count += 1
         self.crops[crop.crop_id] = crop
-        self._crops_by_frame.setdefault(crop.frame_idx, {})[crop.crop_id] = crop
         self.touch()
-
-    def remove_crop(self, crop_id: str) -> Optional[CropData]:
-        crop = self.crops.pop(crop_id, None)
-        if crop is None:
-            return None
-        frame_map = self._crops_by_frame.get(crop.frame_idx)
-        if frame_map is not None:
-            frame_map.pop(crop_id, None)
-            if not frame_map:
-                self._crops_by_frame.pop(crop.frame_idx, None)
-        self._crop_index_count = max(0, self._crop_index_count - 1)
-        self.touch()
-        return crop
 
     def get_crop(self, crop_id: str) -> Optional[CropData]:
         return self.crops.get(crop_id)
@@ -413,26 +380,13 @@ class InterviewSession:
         ]
 
     def get_crops_by_frame(self, frame_idx: int) -> List[CropData]:
-        self._ensure_crop_index()
-        return list(self._crops_by_frame.get(frame_idx, {}).values())
+        return [c for c in self.crops.values() if c.frame_idx == frame_idx]
 
     def get_pending_crops_sorted(self) -> List[CropData]:
         """Return pending crops sorted by uncertainty (most uncertain first),
         with stratified class balance for alternating pos/neg."""
         pending = [c for c in self.crops.values() if c.label == CropLabel.PENDING]
         return sorted(pending, key=lambda c: -c.uncertainty)
-
-    def _ensure_crop_index(self) -> None:
-        # Guard against direct writes to session.crops that bypass add/remove APIs.
-        if self._crop_index_count == len(self.crops):
-            return
-        self._rebuild_crop_index()
-
-    def _rebuild_crop_index(self) -> None:
-        self._crops_by_frame = {}
-        for crop in self.crops.values():
-            self._crops_by_frame.setdefault(crop.frame_idx, {})[crop.crop_id] = crop
-        self._crop_index_count = len(self.crops)
 
     def get_validation_crop_ids(self) -> List[str]:
         """Return crop IDs on validation frames (for held-out evaluation)."""

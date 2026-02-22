@@ -73,20 +73,6 @@ def _delete_cached_accepted_crop(session: InterviewSession, crop_id: str) -> Non
     delete_cached_accepted_crop_image(session.cache_key, crop_id)
 
 
-def _invalidate_reid_cache(session: InterviewSession, reason: str) -> None:
-    """Invalidate cached ReID/UFM artifacts when accepted crop set changes."""
-    session.reid_clusters = {}
-    session.n_identities = 0
-    for crop in session.crops.values():
-        crop.reid_cluster_id = None
-    session.ufm_similarity_matrix = None
-    session.ufm_crop_ids = []
-    session.ufm_complete = False
-    session.ufm_job_id = None
-    session.touch()
-    logger.info("Invalidated ReID cache for session %s: %s", session.session_id, reason)
-
-
 @interview_bp.after_request
 def _fix_passthrough(response):
     """Convert direct-passthrough file responses to buffered responses.
@@ -354,7 +340,7 @@ def session_resume():
             transferred.source_crop_id = cid
             transferred.source_frame_idx = crop.frame_idx
             transferred.source_video_key = source.video_key
-            session.add_crop(transferred)
+            session.crops[transferred.crop_id] = transferred
         # Build-from starts a fresh detection round timeline while preserving
         # transferred support knowledge.
         session.current_round = 0
@@ -615,7 +601,8 @@ def _cross_video_gate(session, video_path, video_key,
         )
         with session._lock:
             for cid in cross_video_ids:
-                session.remove_crop(cid)
+                del session.crops[cid]
+            session.touch()
         warning = (
             f"Removed {len(cross_video_ids)} imported supports — they "
             f"came from a different video. Cross-video transfer is not "
@@ -927,12 +914,9 @@ def detect_label():
         return jsonify({"error": "Session not found"}), 404
 
     updated = 0
-    reid_changed = False
     for crop_id, label_str in labels.items():
         try:
             label = CropLabel(label_str)
-            existing = session.get_crop(crop_id)
-            old_label = existing.label if existing is not None else None
             if session.label_crop(crop_id, label):
                 updated += 1
                 crop = session.get_crop(crop_id)
@@ -941,14 +925,8 @@ def detect_label():
                         _cache_accepted_crop_for_reid(session, crop)
                     else:
                         _delete_cached_accepted_crop(session, crop_id)
-                if old_label is not None and old_label != label:
-                    if old_label == CropLabel.ACCEPTED or label == CropLabel.ACCEPTED:
-                        reid_changed = True
         except ValueError:
             pass
-
-    if reid_changed:
-        _invalidate_reid_cache(session, reason="accepted label set changed")
 
     save_session(session)
     return jsonify({"updated": updated, **session.stats()})
@@ -980,7 +958,6 @@ def detect_draw():
     )
     session.add_crop(crop)
     _cache_accepted_crop_for_reid(session, crop)
-    _invalidate_reid_cache(session, reason="manual accepted crop added")
     save_session(session)
 
     return jsonify({"crop": crop.to_dict(), **session.stats()})
@@ -1029,14 +1006,12 @@ def detect_subcategorize():
         cid for cid, c in session.crops.items()
         if getattr(c, "corrected_from", None) == crop_id
     ]
-    reid_changed = False
 
     # Saving "not_person" removes any corrected counterpart.
     if reject_reason == "not_person":
         for cid in existing_corrected:
             _delete_cached_accepted_crop(session, cid)
-            session.remove_crop(cid)
-            reid_changed = True
+            del session.crops[cid]
 
     # If an adjusted box was provided, create a corrected crop.
     # Features for the corrected crop are extracted lazily during
@@ -1058,8 +1033,7 @@ def detect_subcategorize():
         # (idempotency: re-subcategorize replaces, not duplicates)
         for cid in existing_corrected:
             _delete_cached_accepted_crop(session, cid)
-            session.remove_crop(cid)
-            reid_changed = True
+            del session.crops[cid]
 
         new_crop = CropData(
             crop_id=str(uuid.uuid4())[:12],
@@ -1074,10 +1048,6 @@ def detect_subcategorize():
         session.add_crop(new_crop)
         _cache_accepted_crop_for_reid(session, new_crop)
         new_crop_id = new_crop.crop_id
-        reid_changed = True
-
-    if reid_changed:
-        _invalidate_reid_cache(session, reason="corrected accepted crops changed")
 
     save_session(session)
 
@@ -1454,22 +1424,18 @@ def seeds_list():
     if session is None:
         return jsonify({"error": "Session not found"}), 404
 
-    from .seeding_phase import filter_seeds_by_threshold, summarise_seeds_by_identity
-
-    threshold = max(0.0, min(1.0, float(session.seed_config.confidence_threshold)))
-    filtered = filter_seeds_by_threshold(session.seeds, threshold)
-    identity_summary = summarise_seeds_by_identity(filtered)
-    generated_identity_summary = summarise_seeds_by_identity(session.seeds)
+    # Summarize seeds by identity
+    identity_summary = {}
+    for seed in session.seeds:
+        identity = seed.get("identity", "unknown")
+        if identity not in identity_summary:
+            identity_summary[identity] = {"count": 0, "frames": []}
+        identity_summary[identity]["count"] += 1
+        identity_summary[identity]["frames"].append(seed.get("frame_idx", 0))
 
     return jsonify({
-        # Backward-compatible: total_seeds remains the currently visible
-        # (threshold-filtered) count shown in preview/upload flows.
-        "total_seeds": len(filtered),
-        "total_generated_seeds": len(session.seeds),
+        "total_seeds": len(session.seeds),
         "identities": identity_summary,
-        "generated_identities": generated_identity_summary,
-        "target_frames": len(session.seed_target_frames),
-        "cached_frames_selected": len(session.seed_cached_frames),
         "seed_config": {
             "frame_pct": session.seed_config.frame_pct,
             "confidence_threshold": session.seed_config.confidence_threshold,
@@ -1534,9 +1500,7 @@ def seeds_config_put():
     if "frame_pct" in data:
         session.seed_config.frame_pct = max(1, min(100, int(data["frame_pct"])))
     if "confidence_threshold" in data:
-        session.seed_config.confidence_threshold = max(
-            0.0, min(1.0, float(data["confidence_threshold"])),
-        )
+        session.seed_config.confidence_threshold = float(data["confidence_threshold"])
 
     session.touch()
     save_session(session)
@@ -1556,13 +1520,6 @@ def seeds_upload():
     session = get_session(session_id)
     if session is None:
         return jsonify({"error": "Session not found"}), 404
-
-    if "confidence_threshold" in data:
-        session.seed_config.confidence_threshold = max(
-            0.0, min(1.0, float(data["confidence_threshold"])),
-        )
-        session.touch()
-        save_session(session)
 
     def _upload(progress):
         from .seeding_phase import upload_seeds

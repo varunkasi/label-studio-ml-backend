@@ -170,7 +170,7 @@ const AppState = {
     rejectReviewDrawActive: false,          // reject-review-only draw/save toggle state
     rejectReviewFixExpandPct: 0,            // expansion percent for pre-Fix prompt preview
     rejectReviewExpandBase: null,           // base box for expansion preview [x1,y1,x2,y2]
-    rejectReviewSam3AutoEnabled: false,     // auto-run SAM3 refine after box edit commit
+    rejectReviewSam3AutoEnabled: false,     // persistent in-session SAM3 auto mode preference
     rejectReviewSam3InFlight: false,        // true while /detect/refine_box request is active
     rejectReviewSam3QueuedPrompt: null,     // latest queued {cropId, promptXyxy, source}
     rejectReviewSam3ActiveRequestId: 0,     // monotonic request token for stale-response guard
@@ -1267,7 +1267,6 @@ function _enterRejectReview(rejectedCrops) {
     AppState.rejectReviewBoxAdjusted = false;
     AppState.rejectReviewDrawActive = false;
     AppState.rejectReviewExpandBase = null;
-    AppState.rejectReviewSam3AutoEnabled = false;
     AppState.rejectReviewSam3InFlight = false;
     AppState.rejectReviewSam3QueuedPrompt = null;
     AppState.rejectReviewSam3ActiveRequestId = 0;
@@ -1534,7 +1533,6 @@ function _setSubcategory(subcat) {
         _setRejectReviewDrawButton(true);
         _previewRejectReviewExpansion();
     } else {
-        _setRejectReviewSam3AutoEnabled(false);
         AppState.rejectReviewSam3QueuedPrompt = null;
         if (ba && ba.isActive()) ba.deactivate();
         AppState.rejectReviewDrawActive = false;
@@ -1927,7 +1925,6 @@ function _exitRejectReview() {
     AppState.rejectReviewBoxAdjusted = false;
     AppState.rejectReviewDrawActive = false;
     AppState.rejectReviewExpandBase = null;
-    AppState.rejectReviewSam3AutoEnabled = false;
     AppState.rejectReviewSam3InFlight = false;
     AppState.rejectReviewSam3QueuedPrompt = null;
     AppState.rejectReviewSam3ActiveRequestId = 0;

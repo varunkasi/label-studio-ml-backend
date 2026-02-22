@@ -26,8 +26,6 @@ class SeedingUI {
         this.isUploading = false;
         this.currentGenerateJobId = null;
         this.stopRequested = false;
-        this.thresholdRefreshTimer = null;
-        this.previewRequestSeq = 0;
     }
 
     // ------------------------------------------------------------------
@@ -69,8 +67,7 @@ class SeedingUI {
             var existing = await API.get('/seeds/list', {
                 session_id: sessionId,
             });
-            var totalGenerated = existing.total_generated_seeds || existing.total_seeds || 0;
-            if (totalGenerated > 0) {
+            if (existing.total_seeds > 0) {
                 this.identities = existing.identities || {};
                 this.seedConfig.frame_pct = existing.seed_config
                     ? (existing.seed_config.frame_pct || 100) : this.seedConfig.frame_pct;
@@ -158,8 +155,8 @@ class SeedingUI {
         explanation.style.marginBottom = '20px';
         explanation.textContent =
             'Seeds are generated from cached video frames. ' +
-            'The confidence threshold is applied after generation in preview, ' +
-            'so you can compare thresholds without rerunning SAM3.';
+            'Only detections with confidence above the threshold will be kept. ' +
+            'Each seed is a bounding box keyframe tied to an identity.';
         panel.appendChild(explanation);
 
         // -- Change keyframe coverage visualization --
@@ -294,7 +291,55 @@ class SeedingUI {
         pctGroup.appendChild(pctRow);
         pctGroup.appendChild(pctHint);
 
+        // Confidence threshold
+        var threshGroup = document.createElement('div');
+        threshGroup.className = 'form-group';
+
+        var threshLabel = document.createElement('label');
+        threshLabel.setAttribute('for', 'seed-confidence');
+        threshLabel.textContent = 'Confidence Threshold';
+
+        var threshRow = document.createElement('div');
+        threshRow.style.display = 'flex';
+        threshRow.style.alignItems = 'center';
+        threshRow.style.gap = '10px';
+
+        var threshSlider = document.createElement('input');
+        threshSlider.type = 'range';
+        threshSlider.id = 'seed-confidence';
+        threshSlider.min = '0';
+        threshSlider.max = '1';
+        threshSlider.step = '0.05';
+        threshSlider.value = String(this.seedConfig.confidence_threshold);
+        threshSlider.style.flex = '1';
+
+        var threshValue = document.createElement('span');
+        threshValue.id = 'seed-confidence-value';
+        threshValue.style.fontSize = '0.85rem';
+        threshValue.style.color = 'var(--text-primary)';
+        threshValue.style.minWidth = '40px';
+        threshValue.style.textAlign = 'right';
+        threshValue.textContent = this.seedConfig.confidence_threshold.toFixed(2);
+
+        threshSlider.addEventListener('input', function () {
+            threshValue.textContent = parseFloat(threshSlider.value).toFixed(2);
+        });
+
+        threshRow.appendChild(threshSlider);
+        threshRow.appendChild(threshValue);
+
+        var threshHint = document.createElement('div');
+        threshHint.style.fontSize = '0.7rem';
+        threshHint.style.color = 'var(--text-muted)';
+        threshHint.style.marginTop = '4px';
+        threshHint.textContent = 'Only keep detections above this score (default: 0.80)';
+
+        threshGroup.appendChild(threshLabel);
+        threshGroup.appendChild(threshRow);
+        threshGroup.appendChild(threshHint);
+
         configBox.appendChild(pctGroup);
+        configBox.appendChild(threshGroup);
         panel.appendChild(configBox);
 
         // -- Generate button --
@@ -309,7 +354,8 @@ class SeedingUI {
         btnGenerate.textContent = 'Generate Seeds';
         btnGenerate.addEventListener('click', function () {
             var framePct = parseInt(pctSlider.value, 10);
-            self._generateSeeds(framePct);
+            var threshold = parseFloat(threshSlider.value);
+            self._generateSeeds(framePct, threshold);
         });
 
         var btnStop = document.createElement('button');
@@ -371,7 +417,7 @@ class SeedingUI {
     // Generate seeds
     // ------------------------------------------------------------------
 
-    async _generateSeeds(framePct) {
+    async _generateSeeds(framePct, confidenceThreshold) {
         if (this.isGenerating) return;
         this.isGenerating = true;
         this.stopRequested = false;
@@ -392,6 +438,7 @@ class SeedingUI {
             await API.put('/seeds/config', {
                 session_id: this.sessionId,
                 frame_pct: framePct,
+                confidence_threshold: confidenceThreshold,
             });
         } catch (err) {
             showToast('Failed to update seed config: ' + err.message, 'error');
@@ -420,6 +467,7 @@ class SeedingUI {
         // Show progress
         this._showProgress('Generating seeds...', {
             framePct: framePct,
+            confidenceThreshold: confidenceThreshold,
             estimatedFrames: this._estimateTargetFrames(framePct),
         });
 
@@ -439,10 +487,9 @@ class SeedingUI {
                 var cancelledSeedData = await API.get('/seeds/list', {
                     session_id: this.sessionId,
                 });
-                var cancelledGenerated = cancelledSeedData.total_generated_seeds || cancelledSeedData.total_seeds || 0;
-                if (cancelledGenerated > 0) {
+                if (cancelledSeedData.total_seeds > 0) {
                     this.identities = cancelledSeedData.identities || {};
-                    showToast('Cancelled — ' + cancelledGenerated + ' partial seeds saved.', 'warning');
+                    showToast('Cancelled — ' + cancelledSeedData.total_seeds + ' partial seeds saved.', 'warning');
                     this._renderPreview(cancelledSeedData);
                 } else {
                     this._renderConfig();
@@ -461,8 +508,7 @@ class SeedingUI {
                 session_id: this.sessionId,
             });
             this.identities = seedData.identities || {};
-            var generatedCount = seedData.total_generated_seeds || seedData.total_seeds || 0;
-            showToast('Generated ' + generatedCount + ' seeds.', 'success');
+            showToast('Generated ' + seedData.total_seeds + ' seeds.', 'success');
             this._renderPreview(seedData);
         } catch (err) {
             showToast('Failed to load seeds: ' + err.message, 'error');
@@ -479,16 +525,6 @@ class SeedingUI {
 
     _renderPreview(seedData) {
         this.container.innerHTML = '';
-        var self = this;
-
-        if (seedData && seedData.seed_config) {
-            if (typeof seedData.seed_config.frame_pct === 'number') {
-                this.seedConfig.frame_pct = seedData.seed_config.frame_pct;
-            }
-            if (typeof seedData.seed_config.confidence_threshold === 'number') {
-                this.seedConfig.confidence_threshold = seedData.seed_config.confidence_threshold;
-            }
-        }
 
         var panel = document.createElement('div');
         panel.className = 'seeding-panel';
@@ -509,80 +545,20 @@ class SeedingUI {
         summary.style.fontSize = '0.85rem';
 
         var identityKeys = Object.keys(seedData.identities || {});
-        var generatedCount = seedData.total_generated_seeds || seedData.total_seeds || 0;
-        var filteredCount = seedData.total_seeds || 0;
 
         summary.innerHTML =
-            '<div><span style="color:var(--text-secondary)">Generated:</span> ' +
-            '<strong>' + generatedCount + '</strong></div>' +
-            '<div><span style="color:var(--text-secondary)">Passing Threshold:</span> ' +
-            '<strong>' + filteredCount + '</strong></div>' +
+            '<div><span style="color:var(--text-secondary)">Total Seeds:</span> ' +
+            '<strong>' + seedData.total_seeds + '</strong></div>' +
             '<div><span style="color:var(--text-secondary)">Identities:</span> ' +
             '<strong>' + identityKeys.length + '</strong></div>' +
             '<div><span style="color:var(--text-secondary)">Coverage:</span> ' +
             '<strong>' + (seedData.seed_config ? (seedData.seed_config.frame_pct || 100) : '?') +
             '%</strong></div>' +
             '<div><span style="color:var(--text-secondary)">Threshold:</span> ' +
-            '<strong>' + this.seedConfig.confidence_threshold.toFixed(2) +
+            '<strong>' + (seedData.seed_config ? seedData.seed_config.confidence_threshold : '?') +
             '</strong></div>';
 
         panel.appendChild(summary);
-
-        // -- Post-generation threshold filter --
-        var filterBox = document.createElement('div');
-        filterBox.className = 'seeding-config';
-        filterBox.style.marginBottom = '16px';
-
-        var threshGroup = document.createElement('div');
-        threshGroup.className = 'form-group';
-
-        var threshLabel = document.createElement('label');
-        threshLabel.setAttribute('for', 'seed-confidence');
-        threshLabel.textContent = 'Confidence Threshold';
-
-        var threshRow = document.createElement('div');
-        threshRow.style.display = 'flex';
-        threshRow.style.alignItems = 'center';
-        threshRow.style.gap = '10px';
-
-        var threshSlider = document.createElement('input');
-        threshSlider.type = 'range';
-        threshSlider.id = 'seed-confidence';
-        threshSlider.min = '0';
-        threshSlider.max = '1';
-        threshSlider.step = '0.05';
-        threshSlider.value = String(this.seedConfig.confidence_threshold);
-        threshSlider.style.flex = '1';
-
-        var threshValue = document.createElement('span');
-        threshValue.id = 'seed-confidence-value';
-        threshValue.style.fontSize = '0.85rem';
-        threshValue.style.color = 'var(--text-primary)';
-        threshValue.style.minWidth = '40px';
-        threshValue.style.textAlign = 'right';
-        threshValue.textContent = this.seedConfig.confidence_threshold.toFixed(2);
-
-        var threshStatus = document.createElement('div');
-        threshStatus.style.fontSize = '0.7rem';
-        threshStatus.style.color = 'var(--text-muted)';
-        threshStatus.style.marginTop = '4px';
-        threshStatus.textContent =
-            'Adjust to preview passing seeds without rerunning generation.';
-
-        threshSlider.addEventListener('input', function () {
-            threshValue.textContent = parseFloat(threshSlider.value).toFixed(2);
-        });
-        threshSlider.addEventListener('change', function () {
-            self._refreshPreviewForThreshold(parseFloat(threshSlider.value), threshStatus);
-        });
-
-        threshRow.appendChild(threshSlider);
-        threshRow.appendChild(threshValue);
-        threshGroup.appendChild(threshLabel);
-        threshGroup.appendChild(threshRow);
-        threshGroup.appendChild(threshStatus);
-        filterBox.appendChild(threshGroup);
-        panel.appendChild(filterBox);
 
         // -- Identity table --
         if (identityKeys.length > 0) {
@@ -620,18 +596,6 @@ class SeedingUI {
             table.appendChild(tbody);
             tableWrapper.appendChild(table);
             panel.appendChild(tableWrapper);
-        } else {
-            var emptyState = document.createElement('div');
-            emptyState.className = 'session-setup';
-            emptyState.style.padding = '12px 14px';
-            emptyState.style.marginBottom = '12px';
-            emptyState.style.fontSize = '0.82rem';
-            emptyState.style.color = 'var(--text-secondary)';
-            emptyState.textContent =
-                generatedCount > 0
-                    ? 'No seeds pass the current threshold. Lower the slider to include more seeds.'
-                    : 'No seeds were generated for the current frame coverage.';
-            panel.appendChild(emptyState);
         }
 
         // -- Action buttons --
@@ -651,10 +615,6 @@ class SeedingUI {
         btnUpload.textContent = 'Upload to Label Studio';
         btnUpload.style.padding = '10px 24px';
         btnUpload.style.fontSize = '0.9rem';
-        if (filteredCount <= 0) {
-            btnUpload.disabled = true;
-            btnUpload.title = 'No seeds pass the current threshold.';
-        }
         btnUpload.addEventListener('click', function () {
             this._confirmUpload(seedData);
         }.bind(this));
@@ -664,42 +624,6 @@ class SeedingUI {
         panel.appendChild(actions);
 
         this.container.appendChild(panel);
-    }
-
-    _refreshPreviewForThreshold(threshold, statusEl) {
-        if (isNaN(threshold)) return;
-        var clamped = Math.max(0, Math.min(1, threshold));
-        this.seedConfig.confidence_threshold = clamped;
-        var self = this;
-        var requestId = ++this.previewRequestSeq;
-
-        if (statusEl) {
-            statusEl.textContent = 'Applying threshold...';
-        }
-        if (this.thresholdRefreshTimer) {
-            clearTimeout(this.thresholdRefreshTimer);
-        }
-        this.thresholdRefreshTimer = setTimeout(async function () {
-            try {
-                await API.put('/seeds/config', {
-                    session_id: self.sessionId,
-                    confidence_threshold: clamped,
-                });
-                var seedData = await API.get('/seeds/list', {
-                    session_id: self.sessionId,
-                });
-                if (requestId !== self.previewRequestSeq) return;
-                self.identities = seedData.identities || {};
-                self._renderPreview(seedData);
-            } catch (err) {
-                if (requestId !== self.previewRequestSeq) return;
-                if (statusEl) {
-                    statusEl.textContent =
-                        'Failed to refresh preview: ' + err.message;
-                }
-                showToast('Failed to refresh seed preview: ' + err.message, 'error');
-            }
-        }, 120);
     }
 
     _formatIdentityLabel(id) {
@@ -780,7 +704,6 @@ class SeedingUI {
         try {
             var resp = await API.post('/seeds/upload', {
                 session_id: this.sessionId,
-                confidence_threshold: this.seedConfig.confidence_threshold,
             });
             jobId = resp.job_id;
         } catch (err) {
@@ -954,6 +877,7 @@ class SeedingUI {
             summary.innerHTML =
                 '<div style="display:flex;gap:16px;flex-wrap:wrap">' +
                 '<span>Coverage: <strong style="color:var(--text-primary)">' + meta.framePct + '%</strong></span>' +
+                '<span>Threshold: <strong style="color:var(--text-primary)">' + meta.confidenceThreshold.toFixed(2) + '</strong></span>' +
                 '<span>Estimated frames: <strong style="color:var(--text-primary)">' + meta.estimatedFrames.toLocaleString() + '</strong></span>' +
                 '</div>';
             area.appendChild(summary);
