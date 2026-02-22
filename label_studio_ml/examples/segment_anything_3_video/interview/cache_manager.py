@@ -223,6 +223,8 @@ def save_session(session: InterviewSession) -> None:
             "frame_pct": session.seed_config.frame_pct,
             "confidence_threshold": session.seed_config.confidence_threshold,
         },
+        "seed_cached_frames": session.seed_cached_frames,
+        "seed_target_frames": session.seed_target_frames,
     }
     _write_json(d / "config.json", config)
 
@@ -321,6 +323,8 @@ def load_session(cache_key: str) -> Optional[InterviewSession]:
         frame_pct=sc.get("frame_pct", 100),
         confidence_threshold=sc.get("confidence_threshold", 0.8),
     )
+    session.seed_cached_frames = list(config.get("seed_cached_frames", []))
+    session.seed_target_frames = list(config.get("seed_target_frames", []))
 
     # Load crops
     crops_meta = _read_json(d / "crops_metadata.json")
@@ -497,4 +501,3 @@ def _load_features(d: Path, session: InterviewSession) -> None:
                         crop.context_features = vec
     except Exception as e:
         logger.warning("Failed to load features from %s: %s", path, e)
-

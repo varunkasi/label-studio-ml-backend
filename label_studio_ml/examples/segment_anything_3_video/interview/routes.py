@@ -710,19 +710,6 @@ def detect_next_round():
     if session is None:
         return jsonify({"error": "Session not found"}), 404
 
-    unreviewed_rejects = [
-        c.crop_id
-        for c in session.crops.values()
-        if c.label == CropLabel.REJECTED and not c.reject_reason
-    ]
-    if unreviewed_rejects:
-        return jsonify({
-            "error": (
-                "Cannot start next round: all rejected crops must be subcategorized first"
-            ),
-            "unreviewed_reject_count": len(unreviewed_rejects),
-        }), 400
-
     next_round = session.current_round + 1
     prompt = session.prompts[0] if session.prompts else "person"
 
@@ -1437,18 +1424,22 @@ def seeds_list():
     if session is None:
         return jsonify({"error": "Session not found"}), 404
 
-    # Summarize seeds by identity
-    identity_summary = {}
-    for seed in session.seeds:
-        identity = seed.get("identity", "unknown")
-        if identity not in identity_summary:
-            identity_summary[identity] = {"count": 0, "frames": []}
-        identity_summary[identity]["count"] += 1
-        identity_summary[identity]["frames"].append(seed.get("frame_idx", 0))
+    from .seeding_phase import filter_seeds_by_threshold, summarise_seeds_by_identity
+
+    threshold = max(0.0, min(1.0, float(session.seed_config.confidence_threshold)))
+    filtered = filter_seeds_by_threshold(session.seeds, threshold)
+    identity_summary = summarise_seeds_by_identity(filtered)
+    generated_identity_summary = summarise_seeds_by_identity(session.seeds)
 
     return jsonify({
-        "total_seeds": len(session.seeds),
+        # Backward-compatible: total_seeds remains the currently visible
+        # (threshold-filtered) count shown in preview/upload flows.
+        "total_seeds": len(filtered),
+        "total_generated_seeds": len(session.seeds),
         "identities": identity_summary,
+        "generated_identities": generated_identity_summary,
+        "target_frames": len(session.seed_target_frames),
+        "cached_frames_selected": len(session.seed_cached_frames),
         "seed_config": {
             "frame_pct": session.seed_config.frame_pct,
             "confidence_threshold": session.seed_config.confidence_threshold,
@@ -1513,7 +1504,9 @@ def seeds_config_put():
     if "frame_pct" in data:
         session.seed_config.frame_pct = max(1, min(100, int(data["frame_pct"])))
     if "confidence_threshold" in data:
-        session.seed_config.confidence_threshold = float(data["confidence_threshold"])
+        session.seed_config.confidence_threshold = max(
+            0.0, min(1.0, float(data["confidence_threshold"])),
+        )
 
     session.touch()
     save_session(session)
@@ -1533,6 +1526,13 @@ def seeds_upload():
     session = get_session(session_id)
     if session is None:
         return jsonify({"error": "Session not found"}), 404
+
+    if "confidence_threshold" in data:
+        session.seed_config.confidence_threshold = max(
+            0.0, min(1.0, float(data["confidence_threshold"])),
+        )
+        session.touch()
+        save_session(session)
 
     def _upload(progress):
         from .seeding_phase import upload_seeds
