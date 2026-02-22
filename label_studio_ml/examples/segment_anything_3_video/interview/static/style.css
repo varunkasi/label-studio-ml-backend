@@ -860,6 +860,32 @@ body {
   display: block;
 }
 
+.reject-review-sam3-auto-wrap {
+  margin: 0 auto 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: var(--text-secondary);
+  font-size: 0.74rem;
+  cursor: pointer;
+  user-select: none;
+}
+
+.reject-review-sam3-auto-wrap input[type="checkbox"] {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+}
+
+.reject-review-sam3-auto-wrap input[type="checkbox"]:disabled {
+  cursor: wait;
+}
+
+.reject-review-sam3-auto-label {
+  color: var(--text-secondary);
+}
+
 .reject-review-fix-expand-wrap {
   margin: 2px auto 4px;
   display: flex;
