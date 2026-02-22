@@ -807,6 +807,10 @@ class Toolbar {
         nextRoundBtn.className = 'btn btn-primary btn-small';
         nextRoundBtn.textContent = 'Next Round';
         nextRoundBtn.title = 'Score crops with k-NN, then detect on new frames';
+        if (options.disableNextRound) {
+            nextRoundBtn.disabled = true;
+            nextRoundBtn.title = options.disableNextRoundReason || 'Complete reject review first';
+        }
         nextRoundBtn.addEventListener('click', () => {
             if (options.onNextRound) options.onNextRound();
         });

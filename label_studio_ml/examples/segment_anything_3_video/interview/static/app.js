@@ -170,7 +170,6 @@ const AppState = {
     rejectReviewDrawActive: false,          // reject-review-only draw/save toggle state
     rejectReviewFixExpandPct: 0,            // expansion percent for pre-Fix prompt preview
     rejectReviewExpandBase: null,           // base box for expansion preview [x1,y1,x2,y2]
-    rejectReviewSam3AutoEnabled: false,     // session-scoped SAM3 auto mode toggle
 
     // Active components (for cleanup)
     _components: {},
@@ -921,6 +920,8 @@ function _renderToolbar() {
     toolbar.render({
         drawMode: AppState.drawMode,
         disableDrawToggle: AppState.rejectReviewMode,
+        disableNextRound: AppState.rejectReviewMode,
+        disableNextRoundReason: 'Finish reject review before starting the next round',
         sortBy: AppState.sortBy,
         filterLabel: AppState.filterLabel,
         stats: AppState.stats,
@@ -1170,6 +1171,43 @@ function _navigateFrame(direction) {
 
 /** Handle Next Round: score crops with k-NN, then detect on new frames. */
 async function _onNextRound() {
+    if (AppState.rejectReviewMode) {
+        var unreviewedInReview = AppState.rejectReviewCrops.filter(function (c) {
+            return !c.reject_reason;
+        });
+        if (unreviewedInReview.length > 0) {
+            showToast('Please review all rejected crops before starting the next round.', 'warning');
+            return;
+        }
+
+        var index = AppState.rejectReviewIndex;
+        if (index >= 0 && index < AppState.rejectReviewCrops.length) {
+            var crop = AppState.rejectReviewCrops[index];
+            var neverSaved = !crop.reject_reason;
+            var reasonChanged = AppState.rejectReviewSubcategory !== (crop.reject_reason || 'not_person');
+            var boxChanged = AppState.rejectReviewBoxAdjusted;
+            if (neverSaved || reasonChanged || boxChanged) {
+                var saved = await _saveRejectReviewCurrent(boxChanged, false);
+                if (!saved) {
+                    showToast('Please save reject review changes before starting the next round.', 'warning');
+                    return;
+                }
+                AppState.rejectReviewBoxAdjusted = false;
+            }
+        }
+
+        _exitRejectReview();
+    }
+
+    var unreviewedRejects = AppState.crops.filter(function (c) {
+        return c.label === 'rejected' && !c.reject_reason;
+    });
+    if (unreviewedRejects.length > 0) {
+        showToast('Please review all rejected crops before starting the next round.', 'warning');
+        _enterRejectReview(unreviewedRejects);
+        return;
+    }
+
     const progress = AppState._components.progressOverlay;
 
     try {
@@ -1254,18 +1292,7 @@ function _enterRejectReview(rejectedCrops) {
                 if (ba && ba.isActive()) {
                     var b = ba.getBox();
                     if (b) {
-                        var promptXyxy = [b.x1, b.y1, b.x2, b.y2];
-                        AppState.rejectReviewExpandBase = promptXyxy;
-
-                        // Auto-refine on committed edit when SAM3 mode is ON.
-                        if (
-                            AppState.rejectReviewMode &&
-                            AppState.rejectReviewSam3AutoEnabled &&
-                            (AppState.rejectReviewSubcategory === 'partial_box' ||
-                                AppState.rejectReviewSubcategory === 'oversized_box')
-                        ) {
-                            _fixOversizedBox(promptXyxy);
-                        }
+                        AppState.rejectReviewExpandBase = [b.x1, b.y1, b.x2, b.y2];
                     }
                 }
             });
@@ -1305,7 +1332,7 @@ function _buildRejectReviewUI() {
             btn.classList.add('active');
         }
         btn.addEventListener('click', function () {
-            _setSubcategory(subcat, { fromUser: true });
+            _setSubcategory(subcat);
         });
         bar.appendChild(btn);
     });
@@ -1332,27 +1359,6 @@ function _buildRejectReviewUI() {
         _fixOversizedBox();
     });
     wrap.appendChild(fixBtn);
-
-    // SAM3 auto-mode toggle (shown for partial/oversized)
-    var autoWrap = document.createElement('label');
-    autoWrap.id = 'reject-review-sam3-auto-wrap';
-    autoWrap.className = 'reject-review-sam3-auto-wrap';
-    autoWrap.style.display = 'none';  // shown/hidden by _setSubcategory
-
-    var autoToggle = document.createElement('input');
-    autoToggle.type = 'checkbox';
-    autoToggle.id = 'reject-review-sam3-auto-toggle';
-    autoToggle.checked = !!AppState.rejectReviewSam3AutoEnabled;
-    autoToggle.addEventListener('change', function () {
-        AppState.rejectReviewSam3AutoEnabled = !!autoToggle.checked;
-    });
-    autoWrap.appendChild(autoToggle);
-
-    var autoLabel = document.createElement('span');
-    autoLabel.className = 'reject-review-sam3-auto-label';
-    autoLabel.textContent = 'SAM3 Mode ON';
-    autoWrap.appendChild(autoLabel);
-    wrap.appendChild(autoWrap);
 
     // Expansion selector for pre-Fix prompt preview
     var expandWrap = document.createElement('div');
@@ -1453,10 +1459,7 @@ function _showRejectReviewCrop(index) {
  * Set the current subcategory selection.
  * @param {string} subcat - 'not_person', 'partial_box', or 'oversized_box'
  */
-function _setSubcategory(subcat, options) {
-    var opts = options || {};
-    var fromUser = !!opts.fromUser;
-    var prevSubcat = AppState.rejectReviewSubcategory;
+function _setSubcategory(subcat) {
     AppState.rejectReviewSubcategory = subcat;
 
     // Update button active states
@@ -1470,11 +1473,6 @@ function _setSubcategory(subcat, options) {
     if (fixBtn) {
         fixBtn.style.display = (subcat === 'partial_box' || subcat === 'oversized_box')
             ? '' : 'none';
-    }
-    var autoWrap = document.getElementById('reject-review-sam3-auto-wrap');
-    if (autoWrap) {
-        autoWrap.style.display = (subcat === 'partial_box' || subcat === 'oversized_box')
-            ? 'flex' : 'none';
     }
     var expandWrap = document.getElementById('reject-review-fix-expand-wrap');
     if (expandWrap) {
@@ -1496,24 +1494,13 @@ function _setSubcategory(subcat, options) {
         _setRejectReviewExpandControl(0);
         _setRejectReviewDrawButton(false);
     }
-
-    // Explicit user selection of Oversized Box should immediately run SAM3 refine.
-    if (
-        fromUser &&
-        subcat === 'oversized_box' &&
-        prevSubcat !== 'oversized_box' &&
-        AppState.rejectReviewSam3AutoEnabled &&
-        AppState.rejectReviewMode
-    ) {
-        _fixOversizedBox();
-    }
 }
 
 /** Cycle the subcategory in the given direction (-1 or +1). */
 function _cycleSubcategory(direction) {
     var idx = _SUBCATEGORIES.indexOf(AppState.rejectReviewSubcategory);
     idx = (idx + direction + _SUBCATEGORIES.length) % _SUBCATEGORIES.length;
-    _setSubcategory(_SUBCATEGORIES[idx], { fromUser: true });
+    _setSubcategory(_SUBCATEGORIES[idx]);
 }
 
 /** Save the current reject review crop and advance to the next one. */
@@ -1682,7 +1669,7 @@ function _previewRejectReviewExpansion() {
  * Calls /api/detect/refine_box, applies the refined box to the BoxAdjuster,
  * and keeps Draw mode ON so the user can further adjust.
  */
-async function _fixOversizedBox(promptXyxyOverride) {
+async function _fixOversizedBox() {
     var subcat = AppState.rejectReviewSubcategory;
     if (subcat !== 'partial_box' && subcat !== 'oversized_box') {
         showToast('Fix is only available for Partial/Oversized categories', 'warning');
@@ -1701,15 +1688,7 @@ async function _fixOversizedBox(promptXyxyOverride) {
     try {
         var ba = AppState._components.boxAdjuster;
         var promptXyxy = null;
-        if (promptXyxyOverride && promptXyxyOverride.length === 4) {
-            promptXyxy = [
-                Number(promptXyxyOverride[0]),
-                Number(promptXyxyOverride[1]),
-                Number(promptXyxyOverride[2]),
-                Number(promptXyxyOverride[3]),
-            ];
-        }
-        if (!promptXyxy && ba && ba.isActive()) {
+        if (ba && ba.isActive()) {
             var activeBox = ba.getBox();
             if (activeBox) {
                 promptXyxy = [activeBox.x1, activeBox.y1, activeBox.x2, activeBox.y2];

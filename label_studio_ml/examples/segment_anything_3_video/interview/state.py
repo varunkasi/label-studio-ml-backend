@@ -346,15 +346,7 @@ class InterviewSession:
 
     # Seeding
     seed_config: SeedConfig = field(default_factory=SeedConfig)
-    # All generated seed candidates (unfiltered). Confidence filtering is applied
-    # at list/upload time using ``seed_config.confidence_threshold``.
-    seeds: List[Dict[str, Any]] = field(default_factory=list)
-    # Cached-frame subset selected by the frame-coverage slider for the current
-    # generation state. Used to compute incremental regeneration deltas.
-    seed_cached_frames: List[int] = field(default_factory=list)
-    # Full target frame set currently represented in ``seeds`` (coverage subset
-    # plus any forced change keyframes).
-    seed_target_frames: List[int] = field(default_factory=list)
+    seeds: List[Dict[str, Any]] = field(default_factory=list)  # final seed regions
     upload_result: Optional[Dict[str, Any]] = None
 
     # Thread safety
