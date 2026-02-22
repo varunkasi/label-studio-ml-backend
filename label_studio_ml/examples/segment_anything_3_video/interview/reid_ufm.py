@@ -13,6 +13,7 @@ The human specifies k and directly assigns crops to clusters.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -328,6 +329,8 @@ def run_ufm_reid_pipeline(
     progress.step = "Extracting crop images"
     progress.total = 4
     progress.current = 0
+    progress.eta_seconds = None
+    progress.items_per_second = None
 
     # Step 1: Extract crop images
     crop_images, crop_ids = extract_crop_images_from_session(
@@ -347,10 +350,20 @@ def run_ufm_reid_pipeline(
     progress.total = n_pairs
     progress.current = 0
     progress.step = "Computing UFM similarity (this takes a few minutes)"
+    progress.eta_seconds = None
+    progress.items_per_second = None
+    pair_t0 = time.time()
 
     def _progress_cb(done, total):
         progress.step = f"UFM pairs: {done}/{total}"
         progress.current = done
+        elapsed = max(time.time() - pair_t0, 1e-6)
+        rate = done / elapsed if done > 0 else 0.0
+        progress.items_per_second = rate if rate > 0 else None
+        if rate > 0:
+            progress.eta_seconds = max((total - done) / rate, 0.0)
+        else:
+            progress.eta_seconds = None
 
     sim_matrix = compute_pairwise_similarity(
         crop_images,
@@ -360,6 +373,8 @@ def run_ufm_reid_pipeline(
     # Restore to step-level for remaining steps
     progress.total = 4
     progress.current = 2
+    progress.eta_seconds = None
+    progress.items_per_second = None
 
     # Step 2.5: Enforce same-frame cannot-links before clustering
     n_constrained = apply_same_frame_constraints(
@@ -394,6 +409,8 @@ def run_ufm_reid_pipeline(
     session.touch()
     save_session(session)
     progress.current = 4
+    progress.eta_seconds = None
+    progress.items_per_second = None
 
     # Compute warnings
     warnings = compute_co_occurrence_warnings(clusters, session.crops)

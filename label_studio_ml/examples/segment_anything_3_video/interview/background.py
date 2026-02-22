@@ -41,6 +41,8 @@ class JobProgress:
     finished_at: Optional[float] = None
     result: Any = None
     error: Optional[str] = None
+    eta_seconds: Optional[float] = None
+    items_per_second: Optional[float] = None
     _pause_event: threading.Event = field(default_factory=threading.Event, repr=False)
     _cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
 
@@ -87,6 +89,11 @@ class JobProgress:
             "total": self.total,
             "percent": round(pct, 1),
             "elapsed_seconds": round(elapsed, 1),
+            "eta_seconds": (round(self.eta_seconds, 1) if self.eta_seconds is not None else None),
+            "items_per_second": (
+                round(self.items_per_second, 2)
+                if self.items_per_second is not None else None
+            ),
             "error": self.error,
             "paused": self.paused,
             "cancel_requested": self.cancelled,

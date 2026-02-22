@@ -38,6 +38,22 @@ function _ReIDUI(container) {
     this._boundKeyHandler = this._handleKeyDown.bind(this);
 }
 
+function _isUfmPairsStep(step) {
+    return typeof step === 'string' && step.indexOf('UFM pairs:') === 0;
+}
+
+function _formatEtaSeconds(seconds) {
+    if (!isFinite(seconds) || seconds < 0) return null;
+    var s = Math.max(0, Math.round(seconds));
+    var h = Math.floor(s / 3600);
+    var m = Math.floor((s % 3600) / 60);
+    var sec = s % 60;
+    if (h > 0) {
+        return h + ':' + String(m).padStart(2, '0') + ':' + String(sec).padStart(2, '0');
+    }
+    return m + ':' + String(sec).padStart(2, '0');
+}
+
 _ReIDUI.prototype.init = async function (sessionId) {
     this.sessionId = sessionId;
     this.selected = {};
@@ -207,6 +223,10 @@ _ReIDUI.prototype._runClustering = async function (nClusters) {
     }
 
     var self = this;
+    var prevCurrent = null;
+    var prevTotal = null;
+    var prevTs = null;
+    var smoothRate = null;
 
     try {
         // Use recluster if UFM matrix already exists (instant), else start
@@ -230,7 +250,66 @@ _ReIDUI.prototype._runClustering = async function (nClusters) {
                 function (p) {
                     if (progressArea) {
                         var text = progressArea.querySelector('.progress-text span');
-                        if (text) text.textContent = p.step || 'Clustering...';
+                        if (text) {
+                            var stepText = p.step || 'Clustering...';
+                            if (_isUfmPairsStep(stepText)) {
+                                var now = Date.now() / 1000.0;
+                                if (
+                                    prevTs !== null &&
+                                    typeof p.current === 'number' &&
+                                    typeof p.total === 'number' &&
+                                    p.total === prevTotal &&
+                                    p.current >= prevCurrent
+                                ) {
+                                    var dt = now - prevTs;
+                                    var dPairs = p.current - prevCurrent;
+                                    if (dt > 0 && dPairs >= 0) {
+                                        var instRate = dPairs / dt;
+                                        if (instRate > 0) {
+                                            smoothRate = smoothRate === null
+                                                ? instRate
+                                                : (0.3 * instRate + 0.7 * smoothRate);
+                                        }
+                                    }
+                                }
+                                prevCurrent = (typeof p.current === 'number') ? p.current : prevCurrent;
+                                prevTotal = (typeof p.total === 'number') ? p.total : prevTotal;
+                                prevTs = now;
+
+                                var rate = null;
+                                if (typeof p.items_per_second === 'number' && p.items_per_second > 0) {
+                                    rate = p.items_per_second;
+                                } else if (smoothRate !== null && smoothRate > 0) {
+                                    rate = smoothRate;
+                                }
+
+                                var eta = null;
+                                if (typeof p.eta_seconds === 'number' && p.eta_seconds >= 0) {
+                                    eta = p.eta_seconds;
+                                } else if (
+                                    rate !== null &&
+                                    typeof p.total === 'number' &&
+                                    typeof p.current === 'number' &&
+                                    p.total >= p.current
+                                ) {
+                                    eta = (p.total - p.current) / rate;
+                                }
+
+                                var etaText = _formatEtaSeconds(eta);
+                                if (etaText) {
+                                    stepText += ' • ETA ' + etaText;
+                                }
+                                if (rate !== null && isFinite(rate)) {
+                                    stepText += ' • ' + (rate >= 100 ? rate.toFixed(0) : rate.toFixed(1)) + ' pairs/s';
+                                }
+                            } else {
+                                prevCurrent = null;
+                                prevTotal = null;
+                                prevTs = null;
+                                smoothRate = null;
+                            }
+                            text.textContent = stepText;
+                        }
                         var fill = progressArea.querySelector('.progress-bar-fill');
                         if (fill && p.percent > 0) {
                             fill.classList.remove('indeterminate');
