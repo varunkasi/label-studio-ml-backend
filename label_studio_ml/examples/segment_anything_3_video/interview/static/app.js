@@ -1254,7 +1254,18 @@ function _enterRejectReview(rejectedCrops) {
                 if (ba && ba.isActive()) {
                     var b = ba.getBox();
                     if (b) {
-                        AppState.rejectReviewExpandBase = [b.x1, b.y1, b.x2, b.y2];
+                        var promptXyxy = [b.x1, b.y1, b.x2, b.y2];
+                        AppState.rejectReviewExpandBase = promptXyxy;
+
+                        // Auto-refine on committed edit when SAM3 mode is ON.
+                        if (
+                            AppState.rejectReviewMode &&
+                            AppState.rejectReviewSam3AutoEnabled &&
+                            (AppState.rejectReviewSubcategory === 'partial_box' ||
+                                AppState.rejectReviewSubcategory === 'oversized_box')
+                        ) {
+                            _fixOversizedBox(promptXyxy);
+                        }
                     }
                 }
             });
@@ -1671,7 +1682,7 @@ function _previewRejectReviewExpansion() {
  * Calls /api/detect/refine_box, applies the refined box to the BoxAdjuster,
  * and keeps Draw mode ON so the user can further adjust.
  */
-async function _fixOversizedBox() {
+async function _fixOversizedBox(promptXyxyOverride) {
     var subcat = AppState.rejectReviewSubcategory;
     if (subcat !== 'partial_box' && subcat !== 'oversized_box') {
         showToast('Fix is only available for Partial/Oversized categories', 'warning');
@@ -1690,7 +1701,15 @@ async function _fixOversizedBox() {
     try {
         var ba = AppState._components.boxAdjuster;
         var promptXyxy = null;
-        if (ba && ba.isActive()) {
+        if (promptXyxyOverride && promptXyxyOverride.length === 4) {
+            promptXyxy = [
+                Number(promptXyxyOverride[0]),
+                Number(promptXyxyOverride[1]),
+                Number(promptXyxyOverride[2]),
+                Number(promptXyxyOverride[3]),
+            ];
+        }
+        if (!promptXyxy && ba && ba.isActive()) {
             var activeBox = ba.getBox();
             if (activeBox) {
                 promptXyxy = [activeBox.x1, activeBox.y1, activeBox.x2, activeBox.y2];
