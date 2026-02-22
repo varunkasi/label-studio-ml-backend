@@ -18,6 +18,7 @@ import logging
 import os
 import sys
 import uuid
+from collections import deque
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -138,6 +139,10 @@ _REFINE_THRESHOLD = float(os.getenv("INTERVIEW_REFINE_THRESHOLD", "0.3"))
 _ENABLE_REFINEMENT = os.getenv("INTERVIEW_ENABLE_REFINEMENT", "true").lower() == "true"
 _SEED_CHUNK_SIZE = int(os.getenv("INTERVIEW_SEED_CHUNK_SIZE", "100"))
 _SEED_DETECT_BATCH = int(os.getenv("INTERVIEW_SEED_DETECT_BATCH", "8"))
+# Internal boundary for deciding when to attempt SAM3 refinement. This is an
+# algorithm knob and intentionally independent of the user-facing threshold
+# slider, which now filters post-generation.
+_REFINE_UPPER_CONF = float(os.getenv("INTERVIEW_REFINE_UPPER_CONF", "0.8"))
 
 
 def _infer_reject_reasons(
@@ -339,6 +344,93 @@ def _refine_candidates_sam3(
 # Public API
 # ---------------------------------------------------------------------------
 
+def _clamp_confidence_threshold(value: float) -> float:
+    """Clamp confidence threshold to [0.0, 1.0]."""
+    return max(0.0, min(1.0, float(value)))
+
+
+def _normalise_int_list(values: Optional[List[Any]]) -> List[int]:
+    """Convert a list-like payload to a sorted unique list of ints."""
+    if not values:
+        return []
+    out: List[int] = []
+    for v in values:
+        try:
+            out.append(int(v))
+        except (TypeError, ValueError):
+            continue
+    return sorted(set(out))
+
+
+def _build_progressive_frame_order(frame_indices: List[int]) -> List[int]:
+    """Return a deterministic order whose prefixes are spread across the range.
+
+    Uses breadth-first midpoint splitting over sorted frame indices. This keeps
+    frame additions/removals monotonic by prefix length (for delta regeneration)
+    while avoiding a pure front-of-video bias.
+    """
+    if not frame_indices:
+        return []
+
+    ordered = sorted(set(int(i) for i in frame_indices))
+    queue = deque([(0, len(ordered) - 1)])
+    out: List[int] = []
+    while queue:
+        lo, hi = queue.popleft()
+        mid = (lo + hi) // 2
+        out.append(ordered[mid])
+        if lo <= mid - 1:
+            queue.append((lo, mid - 1))
+        if mid + 1 <= hi:
+            queue.append((mid + 1, hi))
+    return out
+
+
+def _target_cached_frames(cached_indices: List[int], frame_pct: int) -> List[int]:
+    """Select the cached-frame subset for a frame coverage percentage."""
+    ordered = _build_progressive_frame_order(cached_indices)
+    if not ordered:
+        return []
+    pct = max(1, min(100, int(frame_pct)))
+    if pct >= 100:
+        return list(ordered)
+    target_n = max(1, int(round(len(ordered) * pct / 100.0)))
+    target_n = min(target_n, len(ordered))
+    return ordered[:target_n]
+
+
+def filter_seeds_by_threshold(
+    seeds: List[Dict[str, Any]],
+    confidence_threshold: float,
+) -> List[Dict[str, Any]]:
+    """Return seed candidates whose confidence passes the threshold."""
+    thr = _clamp_confidence_threshold(confidence_threshold)
+    out: List[Dict[str, Any]] = []
+    for seed in seeds:
+        try:
+            conf = float(seed.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            conf = 0.0
+        if conf >= thr:
+            out.append(seed)
+    return out
+
+
+def summarise_seeds_by_identity(
+    seeds: List[Dict[str, Any]],
+) -> Dict[int, Dict[str, Any]]:
+    """Build {identity: {count, frames}} summary from a seed list."""
+    identity_summary: Dict[int, Dict[str, Any]] = {}
+    for seed in seeds:
+        identity = int(seed.get("identity", -1))
+        bucket = identity_summary.setdefault(identity, {"count": 0, "frames": []})
+        bucket["count"] += 1
+        bucket["frames"].append(int(seed.get("frame_idx", 0)))
+    for bucket in identity_summary.values():
+        bucket["frames"].sort()
+    return identity_summary
+
+
 def _score_and_accept_seed(
     box: np.ndarray,
     pil_frame,
@@ -346,7 +438,7 @@ def _score_and_accept_seed(
     support_labels: np.ndarray,
     support_reasons: list,
     centroids: Dict[int, np.ndarray],
-    threshold: float,
+    threshold: Optional[float],
     source: str,
     frame_idx: int,
     mask: Optional[np.ndarray] = None,
@@ -356,7 +448,8 @@ def _score_and_accept_seed(
     Shared helper for Path A and refinement. Uses 2056-dim input:
     [DINOv3 crop CLS (1024) + context CLS (1024) + spatial (4) + mask quality (4)].
 
-    Returns None if the crop fails to pass the k-NN confidence threshold.
+    Returns None only for invalid crop geometry. If ``threshold`` is provided,
+    low-confidence seeds are filtered; if ``threshold`` is None, all scores are kept.
     """
     from .dinov3_classifier import compute_crop_metadata, compute_mask_quality
 
@@ -396,7 +489,7 @@ def _score_and_accept_seed(
     )
     conf = float(confidences[0])
 
-    if conf < threshold:
+    if threshold is not None and conf < float(threshold):
         return None
 
     identity, identity_sim = _assign_identity(feat[0], centroids)
@@ -422,7 +515,7 @@ def generate_seeds(
       3. For each candidate: extract DINOv3 crop + context features + metadata
       4. k-NN quality gate (2056-dim: crop CLS + context CLS + spatial + mask quality)
       5. Assign identity via nearest ReID centroid
-      6. Accept if k-NN confidence >= threshold
+      6. Store generated candidates with confidence for post-generation filtering
 
     This is fully automatic — no human interaction needed for 30K+ frames.
 
@@ -500,10 +593,9 @@ def generate_seeds(
     centroids = _compute_cluster_centroids(session)
     prompts = session.prompts if session.prompts else ["person"]
 
-    # ---- Determine target frames ----
+    # ---- Determine target frames and incremental delta ----
     change = set(session.change_keyframes) if session.embedding_complete else set()
 
-    # Determine candidate frame pool from disk cache
     _disk_cache_meta = None
     try:
         from .disk_frame_cache import frame_cache_exists as _fce, get_frame_cache_meta as _gfcm
@@ -513,32 +605,40 @@ def generate_seeds(
         pass
 
     if _disk_cache_meta and "sampled_indices" in _disk_cache_meta:
-        cached_indices = _disk_cache_meta["sampled_indices"]
+        cached_indices = [int(i) for i in _disk_cache_meta["sampled_indices"]]
     else:
         # Fallback: generate uniform indices from video frame count (~10fps from 30fps)
         cached_indices = list(range(0, session.frames_count, 3))
+    cached_indices = sorted(set(cached_indices))
 
-    pct = max(1, min(100, session.seed_config.frame_pct))
+    pct = max(1, min(100, int(session.seed_config.frame_pct)))
+    target_cached = set(_target_cached_frames(cached_indices, pct))
+    target_frames = sorted(target_cached | change)
+    target_frame_set = set(target_frames)
 
-    if pct >= 100:
-        sampled = set(cached_indices)
-    else:
-        # Uniformly subsample cached frames to desired %
-        n_target = max(1, int(len(cached_indices) * pct / 100))
-        step = max(1, len(cached_indices) // n_target)
-        sampled = set(cached_indices[::step])
+    prev_cached = set(_normalise_int_list(session.seed_cached_frames))
+    prev_targets = set(_normalise_int_list(session.seed_target_frames))
+    previous_seeds = list(session.seeds)
 
-    # Always include change keyframes (they're guaranteed in the cache)
-    all_targets = sorted(sampled | change)
-    total_frames = len(all_targets)
+    added_cached = sorted(target_cached - prev_cached)
+    removed_cached = sorted(prev_cached - target_cached)
 
+    # Keep only seeds that still belong to the target frame set.
+    seeds: List[Dict[str, Any]] = [
+        s for s in previous_seeds
+        if int(s.get("frame_idx", -1)) in target_frame_set
+    ]
+
+    # Only run detection for newly-added target frames.
+    frames_to_process = sorted(target_frame_set - prev_targets)
+    processed_new_frames: set[int] = set()
+
+    total_frames = len(target_frames)
+    already_covered = len(target_frame_set & prev_targets)
     progress.step = "Generating seeds..."
     progress.total = total_frames
-    progress.current = 0
+    progress.current = min(already_covered, total_frames)
     _check_cancel()
-
-    threshold = session.seed_config.confidence_threshold
-    seeds: List[Dict[str, Any]] = []
 
     # Get video dimensions for _detect_batch
     vid_width, vid_height, _, _ = _get_video_info_pyav(session.video_path)
@@ -553,10 +653,16 @@ def generate_seeds(
         logger.info("Pre-computed text tokens for %d prompts", len(precomputed_tokens))
 
     logger.info(
-        "Seed generation: scanning %d frames (pct=%d%%, threshold=%.2f, "
-        "prompts=%s, refinement=%s, batch_size=%d, support_set=%d)",
-        total_frames, pct, threshold,
-        prompts, _ENABLE_REFINEMENT, _SEED_DETECT_BATCH,
+        "Seed generation: target_frames=%d, new_frames=%d, pct=%d%%, "
+        "cached_delta=(+%d,-%d), prompts=%s, refinement=%s, batch_size=%d, support_set=%d",
+        total_frames,
+        len(frames_to_process),
+        pct,
+        len(added_cached),
+        len(removed_cached),
+        prompts,
+        _ENABLE_REFINEMENT,
+        _SEED_DETECT_BATCH,
         support_feats.shape[0],
     )
 
@@ -570,16 +676,16 @@ def generate_seeds(
     except ImportError:
         pass
 
-    # ---- Process in chunks (batched detection) ----
+    # ---- Process only added frames (batched detection) ----
     _check_cancel()
-    for chunk_start in range(0, total_frames, _SEED_CHUNK_SIZE):
+    for chunk_start in range(0, len(frames_to_process), _SEED_CHUNK_SIZE):
         if _cancelled:
             break
         _check_cancel()
-        chunk_indices = all_targets[chunk_start:chunk_start + _SEED_CHUNK_SIZE]
+        chunk_indices = frames_to_process[chunk_start:chunk_start + _SEED_CHUNK_SIZE]
         progress.step = (
             f"Decoding frames {chunk_start + 1}"
-            f"-{chunk_start + len(chunk_indices)} / {total_frames}..."
+            f"-{chunk_start + len(chunk_indices)} of {len(frames_to_process)} new..."
         )
 
         # Try disk frame cache first, fall back to video decode
@@ -603,14 +709,13 @@ def generate_seeds(
         _check_cancel()
 
         # --- Batched detection: run all prompts via _detect_batch ---
-        # Collect detections grouped by frame_idx across all prompts
         from collections import defaultdict
         frame_detections: Dict[int, List[Tuple[np.ndarray, float]]] = defaultdict(list)
 
         for prompt_text in prompts:
             _check_cancel()
             progress.step = (
-                f"Detecting '{prompt_text}' on frames "
+                f"Detecting '{prompt_text}' on new frames "
                 f"{chunk_start + 1}-{chunk_start + len(chunk_indices)}..."
             )
             crops = _detect_batch(
@@ -626,11 +731,15 @@ def generate_seeds(
                     (crop.xyxy, crop.score)
                 )
 
-        progress.current = chunk_start + len(chunk_indices)
+        processed_new_frames.update(chunk_indices)
+        progress.current = min(
+            total_frames,
+            already_covered + len(processed_new_frames),
+        )
 
         # --- Per-frame: cross-prompt NMS + features + k-NN gate ---
-        medium_candidates: List[Tuple[int, np.ndarray, float]] = []
-        oversized_candidates: List[Tuple[int, np.ndarray, float]] = []
+        medium_candidates: List[Tuple[int, np.ndarray, float, str]] = []
+        oversized_candidates: List[Tuple[int, np.ndarray, float, str]] = []
 
         for frame_idx in chunk_indices:
             _check_cancel()
@@ -714,29 +823,37 @@ def generate_seeds(
             for i in range(len(boxes)):
                 _check_cancel()
                 conf = float(confidences[i])
-                if conf >= threshold:
-                    identity, identity_sim = _assign_identity(
-                        crop_features[i], centroids,
-                    )
-                    seeds.append({
-                        "frame_idx": int(frame_idx),
-                        "xyxy": boxes[i].tolist(),
-                        "confidence": round(conf, 4),
-                        "identity": int(identity),
-                        "identity_similarity": round(float(identity_sim), 4),
-                        "source": "multi_prompt_knn",
-                    })
-                elif _ENABLE_REFINEMENT and conf >= _REFINE_THRESHOLD:
-                    # Preserve original behavior: refine all medium-confidence rejects.
-                    medium_candidates.append((frame_idx, boxes[i], det_scores[i], "refined_medium"))
-                elif (
+
+                should_refine_medium = (
                     _ENABLE_REFINEMENT
+                    and conf >= _REFINE_THRESHOLD
+                    and conf < _REFINE_UPPER_CONF
+                )
+                should_refine_oversized = (
+                    _ENABLE_REFINEMENT
+                    and conf < _REFINE_UPPER_CONF
                     and i < len(inferred_reasons)
                     and inferred_reasons[i] == "oversized_box"
-                ):
-                    # Additional fallback: if inferred reject subtype is oversized_box,
-                    # attempt SAM3 refinement even for low-confidence rejects.
+                )
+
+                if should_refine_medium:
+                    medium_candidates.append((frame_idx, boxes[i], det_scores[i], "refined_medium"))
+                    continue
+                if should_refine_oversized:
                     oversized_candidates.append((frame_idx, boxes[i], det_scores[i], "refined_oversized"))
+                    continue
+
+                identity, identity_sim = _assign_identity(
+                    crop_features[i], centroids,
+                )
+                seeds.append({
+                    "frame_idx": int(frame_idx),
+                    "xyxy": boxes[i].tolist(),
+                    "confidence": round(conf, 4),
+                    "identity": int(identity),
+                    "identity_similarity": round(float(identity_sim), 4),
+                    "source": "multi_prompt_knn",
+                })
 
         # Refine medium-confidence candidates and oversized fallbacks.
         _check_cancel()
@@ -759,7 +876,7 @@ def generate_seeds(
                 seed = _score_and_accept_seed(
                     box, pil_frame,
                     support_feats, support_labels, support_reasons,
-                    centroids, threshold, tag, frame_idx,
+                    centroids, None, tag, frame_idx,
                 )
                 if seed is not None:
                     seeds.append(seed)
@@ -772,15 +889,38 @@ def generate_seeds(
             torch.cuda.empty_cache()
 
     # ---- Finalise (runs even on cancellation to save partial seeds) ----
+    had_existing_state = bool(previous_seeds) or bool(prev_targets) or bool(prev_cached)
     if _cancelled:
-        logger.info("Seed generation cancelled after %d seeds on %d/%d frames",
-                     len(seeds), progress.current, total_frames)
-    with session._lock:
-        if _cancelled and session.seeds:
-            # Cancellation: preserve existing seeds, discard partial results
-            seeds = list(session.seeds)
+        logger.info(
+            "Seed generation cancelled after %d seeds (%d/%d target frames)",
+            len(seeds), progress.current, total_frames,
+        )
+
+    final_cached_frames: List[int]
+    final_target_frames: List[int]
+    if _cancelled and had_existing_state:
+        # Preserve existing state if generation was interrupted mid-update.
+        seeds = list(previous_seeds)
+        final_cached_frames = sorted(prev_cached)
+        final_target_frames = sorted(prev_targets)
+    else:
+        if _cancelled:
+            # Keep only frames that were already represented plus newly processed.
+            final_target_set = (target_frame_set & prev_targets) | processed_new_frames
+            final_target_frames = sorted(final_target_set)
+            final_cached_frames = sorted((target_cached & prev_cached) | (processed_new_frames & target_cached))
+            seeds = [
+                s for s in seeds
+                if int(s.get("frame_idx", -1)) in final_target_set
+            ]
         else:
-            session.seeds = seeds
+            final_cached_frames = sorted(target_cached)
+            final_target_frames = target_frames
+
+    with session._lock:
+        session.seeds = seeds
+        session.seed_cached_frames = final_cached_frames
+        session.seed_target_frames = final_target_frames
         # Only advance phase if we have seeds; empty seeds on cancel
         # should leave phase unchanged so user can retry generation
         if seeds:
@@ -790,12 +930,20 @@ def generate_seeds(
 
     identity_counts: Dict[int, int] = {}
     for seed in seeds:
-        ident = seed["identity"]
+        ident = int(seed.get("identity", -1))
         identity_counts[ident] = identity_counts.get(ident, 0) + 1
 
+    filtered_now = filter_seeds_by_threshold(
+        seeds, session.seed_config.confidence_threshold,
+    )
     summary = {
-        "total_seeds": len(seeds),
-        "frames_scanned": total_frames,
+        "total_seeds": len(seeds),  # total generated candidates
+        "filtered_seeds": len(filtered_now),
+        "frames_scanned": len(final_target_frames),
+        "frames_processed_this_run": len(processed_new_frames),
+        "cached_frames_selected": len(final_cached_frames),
+        "delta_frames_added": len(added_cached),
+        "delta_frames_removed": len(removed_cached),
         "identities": identity_counts,
         "prompts_used": prompts,
     }
@@ -812,8 +960,8 @@ def generate_seeds(
         )
 
     logger.info(
-        "Seed generation complete: %d seeds across %d frames, %d identities",
-        len(seeds), total_frames, len(identity_counts),
+        "Seed generation complete: %d candidates across %d target frames (%d new processed), %d identities",
+        len(seeds), len(final_target_frames), len(processed_new_frames), len(identity_counts),
     )
     progress.step = f"Done - {len(seeds)} seeds generated"
     return summary
@@ -870,12 +1018,20 @@ def upload_seeds(
             "No seeds to upload. Run seed generation first."
         )
 
+    threshold = _clamp_confidence_threshold(session.seed_config.confidence_threshold)
+    uploadable_seeds = filter_seeds_by_threshold(session.seeds, threshold)
+    if not uploadable_seeds:
+        raise RuntimeError(
+            f"No seeds meet confidence threshold {threshold:.2f}. "
+            "Lower the threshold or regenerate."
+        )
+
     # ---- Group seeds by identity ----
     progress.step = "Grouping seeds by identity..."
     progress.current = 1
 
     identity_seeds: Dict[int, List[Dict[str, Any]]] = {}
-    for seed in session.seeds:
+    for seed in uploadable_seeds:
         ident = seed["identity"]
         identity_seeds.setdefault(ident, []).append(seed)
 
@@ -907,9 +1063,12 @@ def upload_seeds(
 
     total_keyframes = sum(len(t["sequence"]) for t in tracks)
     logger.info(
-        "Upload: %d tracks, %d total keyframes",
+        "Upload: %d tracks, %d total keyframes (threshold=%.2f, generated=%d, passing=%d)",
         len(tracks),
         total_keyframes,
+        threshold,
+        len(session.seeds),
+        len(uploadable_seeds),
     )
 
     # ---- Build LS prediction payload ----
@@ -941,6 +1100,9 @@ def upload_seeds(
     result = {
         "tracks_uploaded": len(tracks),
         "total_keyframes": total_keyframes,
+        "confidence_threshold": threshold,
+        "total_generated_seeds": len(session.seeds),
+        "uploaded_seeds": len(uploadable_seeds),
         "identities": list(identity_seeds.keys()),
         "model_version": prediction.get("model_version", "sam3-init-seed"),
     }

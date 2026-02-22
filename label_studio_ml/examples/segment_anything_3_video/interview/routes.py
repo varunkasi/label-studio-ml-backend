@@ -340,7 +340,7 @@ def session_resume():
             transferred.source_crop_id = cid
             transferred.source_frame_idx = crop.frame_idx
             transferred.source_video_key = source.video_key
-            session.crops[transferred.crop_id] = transferred
+            session.add_crop(transferred)
         # Build-from starts a fresh detection round timeline while preserving
         # transferred support knowledge.
         session.current_round = 0
@@ -601,8 +601,7 @@ def _cross_video_gate(session, video_path, video_key,
         )
         with session._lock:
             for cid in cross_video_ids:
-                del session.crops[cid]
-            session.touch()
+                session.remove_crop(cid)
         warning = (
             f"Removed {len(cross_video_ids)} imported supports — they "
             f"came from a different video. Cross-video transfer is not "
@@ -1011,7 +1010,7 @@ def detect_subcategorize():
     if reject_reason == "not_person":
         for cid in existing_corrected:
             _delete_cached_accepted_crop(session, cid)
-            del session.crops[cid]
+            session.remove_crop(cid)
 
     # If an adjusted box was provided, create a corrected crop.
     # Features for the corrected crop are extracted lazily during
@@ -1033,7 +1032,7 @@ def detect_subcategorize():
         # (idempotency: re-subcategorize replaces, not duplicates)
         for cid in existing_corrected:
             _delete_cached_accepted_crop(session, cid)
-            del session.crops[cid]
+            session.remove_crop(cid)
 
         new_crop = CropData(
             crop_id=str(uuid.uuid4())[:12],
@@ -1424,18 +1423,22 @@ def seeds_list():
     if session is None:
         return jsonify({"error": "Session not found"}), 404
 
-    # Summarize seeds by identity
-    identity_summary = {}
-    for seed in session.seeds:
-        identity = seed.get("identity", "unknown")
-        if identity not in identity_summary:
-            identity_summary[identity] = {"count": 0, "frames": []}
-        identity_summary[identity]["count"] += 1
-        identity_summary[identity]["frames"].append(seed.get("frame_idx", 0))
+    from .seeding_phase import filter_seeds_by_threshold, summarise_seeds_by_identity
+
+    threshold = max(0.0, min(1.0, float(session.seed_config.confidence_threshold)))
+    filtered = filter_seeds_by_threshold(session.seeds, threshold)
+    identity_summary = summarise_seeds_by_identity(filtered)
+    generated_identity_summary = summarise_seeds_by_identity(session.seeds)
 
     return jsonify({
-        "total_seeds": len(session.seeds),
+        # Backward-compatible: total_seeds remains the currently visible
+        # (threshold-filtered) count shown in preview/upload flows.
+        "total_seeds": len(filtered),
+        "total_generated_seeds": len(session.seeds),
         "identities": identity_summary,
+        "generated_identities": generated_identity_summary,
+        "target_frames": len(session.seed_target_frames),
+        "cached_frames_selected": len(session.seed_cached_frames),
         "seed_config": {
             "frame_pct": session.seed_config.frame_pct,
             "confidence_threshold": session.seed_config.confidence_threshold,
@@ -1500,7 +1503,9 @@ def seeds_config_put():
     if "frame_pct" in data:
         session.seed_config.frame_pct = max(1, min(100, int(data["frame_pct"])))
     if "confidence_threshold" in data:
-        session.seed_config.confidence_threshold = float(data["confidence_threshold"])
+        session.seed_config.confidence_threshold = max(
+            0.0, min(1.0, float(data["confidence_threshold"])),
+        )
 
     session.touch()
     save_session(session)
@@ -1520,6 +1525,13 @@ def seeds_upload():
     session = get_session(session_id)
     if session is None:
         return jsonify({"error": "Session not found"}), 404
+
+    if "confidence_threshold" in data:
+        session.seed_config.confidence_threshold = max(
+            0.0, min(1.0, float(data["confidence_threshold"])),
+        )
+        session.touch()
+        save_session(session)
 
     def _upload(progress):
         from .seeding_phase import upload_seeds
