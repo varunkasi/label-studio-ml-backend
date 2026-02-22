@@ -170,10 +170,7 @@ const AppState = {
     rejectReviewDrawActive: false,          // reject-review-only draw/save toggle state
     rejectReviewFixExpandPct: 0,            // expansion percent for pre-Fix prompt preview
     rejectReviewExpandBase: null,           // base box for expansion preview [x1,y1,x2,y2]
-    rejectReviewSam3AutoEnabled: false,     // persistent in-session SAM3 auto mode preference
-    rejectReviewSam3InFlight: false,        // true while /detect/refine_box request is active
-    rejectReviewSam3QueuedPrompt: null,     // latest queued {cropId, promptXyxy, source}
-    rejectReviewSam3ActiveRequestId: 0,     // monotonic request token for stale-response guard
+    rejectReviewSam3AutoEnabled: false,     // session-scoped SAM3 auto mode toggle
 
     // Active components (for cleanup)
     _components: {},
@@ -1217,44 +1214,6 @@ var _SUBCATEGORY_LABELS = {
     oversized_box: 'Oversized Box',
 };
 
-function _isRejectReviewSam3EligibleSubcat(subcat) {
-    return subcat === 'partial_box' || subcat === 'oversized_box';
-}
-
-function _setRejectReviewSam3AutoEnabled(enabled) {
-    AppState.rejectReviewSam3AutoEnabled = !!enabled;
-    var toggle = document.getElementById('reject-review-sam3-auto-toggle');
-    if (toggle) {
-        toggle.checked = AppState.rejectReviewSam3AutoEnabled;
-    }
-}
-
-function _setRejectReviewSam3BusyUI(busy) {
-    var isBusy = !!busy;
-
-    var fixBtn = document.getElementById('reject-review-fix-btn');
-    if (fixBtn) {
-        fixBtn.disabled = isBusy;
-        fixBtn.textContent = isBusy ? 'Fixing...' : 'Fix (SAM3)';
-    }
-
-    var autoToggle = document.getElementById('reject-review-sam3-auto-toggle');
-    if (autoToggle) {
-        autoToggle.disabled = isBusy;
-    }
-
-    var subcatBtns = document.querySelectorAll('#reject-review-bar .subcat-btn');
-    subcatBtns.forEach(function (btn) {
-        btn.disabled = isBusy;
-    });
-}
-
-function _blockRejectReviewWhileSam3Busy() {
-    if (!AppState.rejectReviewSam3InFlight) return false;
-    showToast('SAM3 refine in progress. Please wait.', 'warning');
-    return true;
-}
-
 /**
  * Enter reject review mode, showing rejected crops one at a time.
  * @param {Array} rejectedCrops - Rejected crops missing a reject_reason.
@@ -1267,9 +1226,6 @@ function _enterRejectReview(rejectedCrops) {
     AppState.rejectReviewBoxAdjusted = false;
     AppState.rejectReviewDrawActive = false;
     AppState.rejectReviewExpandBase = null;
-    AppState.rejectReviewSam3InFlight = false;
-    AppState.rejectReviewSam3QueuedPrompt = null;
-    AppState.rejectReviewSam3ActiveRequestId = 0;
 
     // Change header
     var header = document.querySelector('.detection-header');
@@ -1292,24 +1248,13 @@ function _enterRejectReview(rejectedCrops) {
         var fv = AppState._components.frameViewer;
         if (fv) {
             AppState._components.boxAdjuster = new BoxAdjuster(fv);
-            AppState._components.boxAdjuster.onBoxChanged(function (box) {
+            AppState._components.boxAdjuster.onBoxChanged(function () {
                 AppState.rejectReviewBoxAdjusted = true;
                 var ba = AppState._components.boxAdjuster;
                 if (ba && ba.isActive()) {
-                    var b = box || ba.getBox();
-                    if (b && b.x1 != null && b.y1 != null && b.x2 != null && b.y2 != null) {
-                        var promptXyxy = [b.x1, b.y1, b.x2, b.y2];
-                        AppState.rejectReviewExpandBase = promptXyxy;
-
-                        var crop = AppState.rejectReviewCrops[AppState.rejectReviewIndex];
-                        if (
-                            AppState.rejectReviewMode &&
-                            AppState.rejectReviewSam3AutoEnabled &&
-                            _isRejectReviewSam3EligibleSubcat(AppState.rejectReviewSubcategory) &&
-                            crop
-                        ) {
-                            _queueRejectReviewSam3Fix(promptXyxy, crop.crop_id, 'auto');
-                        }
+                    var b = ba.getBox();
+                    if (b) {
+                        AppState.rejectReviewExpandBase = [b.x1, b.y1, b.x2, b.y2];
                     }
                 }
             });
@@ -1349,7 +1294,7 @@ function _buildRejectReviewUI() {
             btn.classList.add('active');
         }
         btn.addEventListener('click', function () {
-            _setSubcategory(subcat);
+            _setSubcategory(subcat, { fromUser: true });
         });
         bar.appendChild(btn);
     });
@@ -1377,7 +1322,7 @@ function _buildRejectReviewUI() {
     });
     wrap.appendChild(fixBtn);
 
-    // Auto-SAM3 checkbox for commit-time refinement after box edit.
+    // SAM3 auto-mode toggle (shown for partial/oversized)
     var autoWrap = document.createElement('label');
     autoWrap.id = 'reject-review-sam3-auto-wrap';
     autoWrap.className = 'reject-review-sam3-auto-wrap';
@@ -1388,10 +1333,7 @@ function _buildRejectReviewUI() {
     autoToggle.id = 'reject-review-sam3-auto-toggle';
     autoToggle.checked = !!AppState.rejectReviewSam3AutoEnabled;
     autoToggle.addEventListener('change', function () {
-        _setRejectReviewSam3AutoEnabled(autoToggle.checked);
-        if (!AppState.rejectReviewSam3AutoEnabled) {
-            AppState.rejectReviewSam3QueuedPrompt = null;
-        }
+        AppState.rejectReviewSam3AutoEnabled = !!autoToggle.checked;
     });
     autoWrap.appendChild(autoToggle);
 
@@ -1461,7 +1403,6 @@ function _showRejectReviewCrop(index) {
     AppState.rejectReviewDrawActive = false;
     AppState.rejectReviewFixExpandPct = 0;
     AppState.rejectReviewExpandBase = null;
-    AppState.rejectReviewSam3QueuedPrompt = null;
 
     var crop = crops[index];
     var base = crop.corrected_xyxy || crop.xyxy;
@@ -1492,7 +1433,6 @@ function _showRejectReviewCrop(index) {
     // Reset draw toggle first.
     _setRejectReviewDrawButton(false);
     _setRejectReviewExpandControl(0);
-    _setRejectReviewSam3BusyUI(AppState.rejectReviewSam3InFlight);
 
     // Restore subcategory buttons — will re-activate adjuster for partial/oversized
     _setSubcategory(initialSubcat);
@@ -1502,9 +1442,11 @@ function _showRejectReviewCrop(index) {
  * Set the current subcategory selection.
  * @param {string} subcat - 'not_person', 'partial_box', or 'oversized_box'
  */
-function _setSubcategory(subcat) {
+function _setSubcategory(subcat, options) {
+    var opts = options || {};
+    var fromUser = !!opts.fromUser;
+    var prevSubcat = AppState.rejectReviewSubcategory;
     AppState.rejectReviewSubcategory = subcat;
-    var sam3Eligible = _isRejectReviewSam3EligibleSubcat(subcat);
 
     // Update button active states
     var btns = document.querySelectorAll('#reject-review-bar .subcat-btn');
@@ -1515,25 +1457,27 @@ function _setSubcategory(subcat) {
     // Show/hide Fix button based on subcategory
     var fixBtn = document.getElementById('reject-review-fix-btn');
     if (fixBtn) {
-        fixBtn.style.display = sam3Eligible ? '' : 'none';
+        fixBtn.style.display = (subcat === 'partial_box' || subcat === 'oversized_box')
+            ? '' : 'none';
     }
     var autoWrap = document.getElementById('reject-review-sam3-auto-wrap');
     if (autoWrap) {
-        autoWrap.style.display = sam3Eligible ? 'flex' : 'none';
+        autoWrap.style.display = (subcat === 'partial_box' || subcat === 'oversized_box')
+            ? 'flex' : 'none';
     }
     var expandWrap = document.getElementById('reject-review-fix-expand-wrap');
     if (expandWrap) {
-        expandWrap.style.display = sam3Eligible ? '' : 'none';
+        expandWrap.style.display = (subcat === 'partial_box' || subcat === 'oversized_box')
+            ? '' : 'none';
     }
 
     // Activate/deactivate box adjuster based on subcategory
     var ba = AppState._components.boxAdjuster;
-    if (sam3Eligible) {
+    if (subcat === 'partial_box' || subcat === 'oversized_box') {
         AppState.rejectReviewDrawActive = true;
         _setRejectReviewDrawButton(true);
         _previewRejectReviewExpansion();
     } else {
-        AppState.rejectReviewSam3QueuedPrompt = null;
         if (ba && ba.isActive()) ba.deactivate();
         AppState.rejectReviewDrawActive = false;
         AppState.rejectReviewBoxAdjusted = false;
@@ -1542,20 +1486,27 @@ function _setSubcategory(subcat) {
         _setRejectReviewDrawButton(false);
     }
 
-    _setRejectReviewSam3BusyUI(AppState.rejectReviewSam3InFlight);
+    // Explicit user selection of Oversized Box should immediately run SAM3 refine.
+    if (
+        fromUser &&
+        subcat === 'oversized_box' &&
+        prevSubcat !== 'oversized_box' &&
+        AppState.rejectReviewSam3AutoEnabled &&
+        AppState.rejectReviewMode
+    ) {
+        _fixOversizedBox();
+    }
 }
 
 /** Cycle the subcategory in the given direction (-1 or +1). */
 function _cycleSubcategory(direction) {
     var idx = _SUBCATEGORIES.indexOf(AppState.rejectReviewSubcategory);
     idx = (idx + direction + _SUBCATEGORIES.length) % _SUBCATEGORIES.length;
-    _setSubcategory(_SUBCATEGORIES[idx]);
+    _setSubcategory(_SUBCATEGORIES[idx], { fromUser: true });
 }
 
 /** Save the current reject review crop and advance to the next one. */
 async function _saveAndAdvanceRejectReview() {
-    if (_blockRejectReviewWhileSam3Busy()) return;
-
     var crops = AppState.rejectReviewCrops;
     var index = AppState.rejectReviewIndex;
     if (index < 0 || index >= crops.length) return;
@@ -1579,8 +1530,6 @@ async function _saveAndAdvanceRejectReview() {
 
 /** Go back to the previous rejected crop (saves current first). */
 async function _prevRejectReviewCrop() {
-    if (_blockRejectReviewWhileSam3Busy()) return;
-
     var index = AppState.rejectReviewIndex;
     if (index <= 0) return;
 
@@ -1636,7 +1585,6 @@ async function _toggleRejectReviewDraw() {
     }
 
     // Turning draw OFF: persist reason + adjusted box immediately.
-    if (_blockRejectReviewWhileSam3Busy()) return;
     var saved = await _saveRejectReviewCurrent(true);
     if (!saved) return;
 
@@ -1723,60 +1671,55 @@ function _previewRejectReviewExpansion() {
  * Calls /api/detect/refine_box, applies the refined box to the BoxAdjuster,
  * and keeps Draw mode ON so the user can further adjust.
  */
-function _queueRejectReviewSam3Fix(promptXyxy, cropId, source) {
-    if (!promptXyxy || promptXyxy.length !== 4 || !cropId) return;
-
-    var parsedPrompt = promptXyxy.map(function (v) { return Number(v); });
-    if (!parsedPrompt.every(function (v) { return Number.isFinite(v); })) return;
-    if (parsedPrompt[0] >= parsedPrompt[2] || parsedPrompt[1] >= parsedPrompt[3]) return;
-
-    var queued = {
-        cropId: cropId,
-        promptXyxy: parsedPrompt,
-        source: source === 'manual' ? 'manual' : 'auto',
-    };
-
-    if (AppState.rejectReviewSam3InFlight) {
-        AppState.rejectReviewSam3QueuedPrompt = queued;
+async function _fixOversizedBox() {
+    var subcat = AppState.rejectReviewSubcategory;
+    if (subcat !== 'partial_box' && subcat !== 'oversized_box') {
+        showToast('Fix is only available for Partial/Oversized categories', 'warning');
         return;
     }
 
-    _runRejectReviewSam3Fix(queued.promptXyxy, queued.cropId, queued.source);
-}
+    var crop = AppState.rejectReviewCrops[AppState.rejectReviewIndex];
+    if (!crop) return;
 
-async function _runRejectReviewSam3Fix(promptXyxy, cropId, source) {
-    AppState.rejectReviewSam3InFlight = true;
-    AppState.rejectReviewSam3ActiveRequestId += 1;
-    var requestId = AppState.rejectReviewSam3ActiveRequestId;
-    var isManual = source === 'manual';
-    _setRejectReviewSam3BusyUI(true);
+    var fixBtn = document.getElementById('reject-review-fix-btn');
+    if (fixBtn) {
+        fixBtn.disabled = true;
+        fixBtn.textContent = 'Fixing...';
+    }
 
     try {
+        var ba = AppState._components.boxAdjuster;
+        var promptXyxy = null;
+        if (ba && ba.isActive()) {
+            var activeBox = ba.getBox();
+            if (activeBox) {
+                promptXyxy = [activeBox.x1, activeBox.y1, activeBox.x2, activeBox.y2];
+            }
+        }
+        if (!promptXyxy) {
+            promptXyxy = crop.corrected_xyxy || crop.xyxy;
+        }
+
         var result = await API.post('/detect/refine_box', {
             session_id: AppState.sessionId,
-            crop_id: cropId,
+            crop_id: crop.crop_id,
             prompt_xyxy: promptXyxy,
         });
 
-        if (requestId !== AppState.rejectReviewSam3ActiveRequestId) return;
-        if (!AppState.rejectReviewMode) return;
-
         if (result.error) {
-            showToast((isManual ? 'Fix failed: ' : 'Auto SAM3 failed: ') + result.error, 'error');
+            showToast('Fix failed: ' + result.error, 'error');
             return;
         }
 
         var refined = result.refined_xyxy;
         if (!refined || refined.length !== 4) {
-            showToast(isManual ? 'Fix returned invalid box' : 'Auto SAM3 returned invalid box', 'error');
+            showToast('Fix returned invalid box', 'error');
             return;
         }
 
-        var crop = AppState.rejectReviewCrops[AppState.rejectReviewIndex];
-        if (!crop || crop.crop_id !== cropId) return;
-
-        var ba = AppState._components.boxAdjuster;
+        // Apply the refined box to BoxAdjuster
         if (ba) {
+            // Deactivate and reactivate with new box to update handles
             if (ba.isActive()) ba.deactivate();
             ba.activate({
                 x1: refined[0],
@@ -1786,72 +1729,25 @@ async function _runRejectReviewSam3Fix(promptXyxy, cropId, source) {
             });
         }
 
+        // Mark box as adjusted and ensure draw mode stays on
         AppState.rejectReviewBoxAdjusted = true;
         AppState.rejectReviewDrawActive = true;
         _setRejectReviewDrawButton(true);
 
+        // Store refined box on crop for later save
         crop.corrected_xyxy = refined;
         AppState.rejectReviewExpandBase = [refined[0], refined[1], refined[2], refined[3]];
 
-        if (isManual) {
-            var conf = (result.confidence * 100).toFixed(0);
-            showToast('Box refined (IoU ' + conf + '%). Adjust if needed, then save.', 'success');
-        }
+        var conf = (result.confidence * 100).toFixed(0);
+        showToast('Box refined (IoU ' + conf + '%). Adjust if needed, then save.', 'success');
     } catch (err) {
-        showToast(
-            (isManual ? 'Fix failed: ' : 'Auto SAM3 failed: ') + (err.message || err),
-            'error'
-        );
+        showToast('Fix failed: ' + (err.message || err), 'error');
     } finally {
-        if (requestId !== AppState.rejectReviewSam3ActiveRequestId) return;
-
-        var queued = AppState.rejectReviewSam3QueuedPrompt;
-        AppState.rejectReviewSam3QueuedPrompt = null;
-
-        if (queued) {
-            var currentCrop = AppState.rejectReviewCrops[AppState.rejectReviewIndex];
-            var canRunQueued = (
-                AppState.rejectReviewMode &&
-                currentCrop &&
-                currentCrop.crop_id === queued.cropId &&
-                _isRejectReviewSam3EligibleSubcat(AppState.rejectReviewSubcategory) &&
-                (queued.source === 'manual' || AppState.rejectReviewSam3AutoEnabled)
-            );
-            if (canRunQueued) {
-                _runRejectReviewSam3Fix(queued.promptXyxy, queued.cropId, queued.source);
-                return;
-            }
-        }
-
-        AppState.rejectReviewSam3InFlight = false;
-        _setRejectReviewSam3BusyUI(false);
-    }
-}
-
-function _fixOversizedBox() {
-    var subcat = AppState.rejectReviewSubcategory;
-    if (!_isRejectReviewSam3EligibleSubcat(subcat)) {
-        showToast('Fix is only available for Partial/Oversized categories', 'warning');
-        return;
-    }
-
-    var crop = AppState.rejectReviewCrops[AppState.rejectReviewIndex];
-    if (!crop) return;
-
-    var ba = AppState._components.boxAdjuster;
-    var promptXyxy = null;
-    if (ba && ba.isActive()) {
-        var activeBox = ba.getBox();
-        if (activeBox) {
-            promptXyxy = [activeBox.x1, activeBox.y1, activeBox.x2, activeBox.y2];
+        if (fixBtn) {
+            fixBtn.disabled = false;
+            fixBtn.textContent = 'Fix (SAM3)';
         }
     }
-    if (!promptXyxy) {
-        promptXyxy = crop.corrected_xyxy || crop.xyxy;
-    }
-    if (!promptXyxy) return;
-
-    _queueRejectReviewSam3Fix(promptXyxy, crop.crop_id, 'manual');
 }
 
 async function _saveRejectReviewCurrent(includeAdjustedBox, reloadFrame) {
@@ -1901,8 +1797,6 @@ async function _saveRejectReviewCurrent(includeAdjustedBox, reloadFrame) {
 
 /** Exit reject review mode, restoring normal detection UI. */
 function _exitRejectReview() {
-    if (_blockRejectReviewWhileSam3Busy()) return;
-
     var unreviewed = AppState.rejectReviewCrops.filter(function (c) {
         return !c.reject_reason;
     });
@@ -1925,9 +1819,6 @@ function _exitRejectReview() {
     AppState.rejectReviewBoxAdjusted = false;
     AppState.rejectReviewDrawActive = false;
     AppState.rejectReviewExpandBase = null;
-    AppState.rejectReviewSam3InFlight = false;
-    AppState.rejectReviewSam3QueuedPrompt = null;
-    AppState.rejectReviewSam3ActiveRequestId = 0;
 
     // Deactivate box adjuster
     var ba = AppState._components.boxAdjuster;
@@ -2120,26 +2011,21 @@ document.addEventListener('keydown', (e) => {
         if (AppState.rejectReviewMode) {
             if (e.key === 'j' || e.key === 'J') {
                 e.preventDefault();
-                if (_blockRejectReviewWhileSam3Busy()) return;
                 _cycleSubcategory(-1);
             } else if (e.key === 'k' || e.key === 'K') {
                 e.preventDefault();
-                if (_blockRejectReviewWhileSam3Busy()) return;
                 _cycleSubcategory(1);
             } else if (e.key === 'ArrowDown') {
                 e.preventDefault();
                 _fixOversizedBox();
             } else if (e.key === 'ArrowRight' || e.key === 'Enter') {
                 e.preventDefault();
-                if (_blockRejectReviewWhileSam3Busy()) return;
                 _saveAndAdvanceRejectReview();
             } else if (e.key === 'ArrowLeft') {
                 e.preventDefault();
-                if (_blockRejectReviewWhileSam3Busy()) return;
                 _prevRejectReviewCrop();
             } else if (e.key === 'Escape') {
                 e.preventDefault();
-                if (_blockRejectReviewWhileSam3Busy()) return;
                 _exitRejectReview();
             }
             return;

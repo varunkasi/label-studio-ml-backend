@@ -878,10 +878,6 @@ body {
   margin: 0;
 }
 
-.reject-review-sam3-auto-wrap input[type="checkbox"]:disabled {
-  cursor: wait;
-}
-
 .reject-review-sam3-auto-label {
   color: var(--text-secondary);
 }
