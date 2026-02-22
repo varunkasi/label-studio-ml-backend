@@ -146,16 +146,20 @@ def release_ufm_model():
 def compute_pairwise_similarity(
     crop_images: List[Any],
     batch_size: int = UFM_BATCH_SIZE,
+    pair_indices: Optional[List[Tuple[int, int]]] = None,
     progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> np.ndarray:
     """Compute NxN pairwise similarity matrix using UFM covisibility.
 
-    For each pair (i, j) where i < j, runs UFM's predict_correspondences_batched
-    and takes the mean covisibility mask value as the similarity score.
+    For each selected pair (i, j) where i < j, runs UFM's
+    predict_correspondences_batched and takes mean covisibility mask as the
+    similarity score.
 
     Args:
         crop_images: List of PIL Images (will be resized to 224x224 internally).
         batch_size: Number of pairs per forward pass.
+        pair_indices: Optional subset of index pairs to run. If None, runs all
+            upper-triangular pairs.
         progress_callback: Optional fn(pairs_done, total_pairs) for progress.
 
     Returns:
@@ -177,8 +181,26 @@ def compute_pairwise_similarity(
         crop_tensors.append(torch.from_numpy(np.array(resized)))
 
     # Build pair indices
-    pair_indices = [(i, j) for i in range(N) for j in range(i + 1, N)]
-    total_pairs = len(pair_indices)
+    if pair_indices is None:
+        pairs_to_run = [(i, j) for i in range(N) for j in range(i + 1, N)]
+    else:
+        seen = set()
+        pairs_to_run: List[Tuple[int, int]] = []
+        for raw_i, raw_j in pair_indices:
+            i = int(raw_i)
+            j = int(raw_j)
+            if i == j:
+                continue
+            if i > j:
+                i, j = j, i
+            if i < 0 or j >= N:
+                continue
+            key = (i, j)
+            if key in seen:
+                continue
+            seen.add(key)
+            pairs_to_run.append(key)
+    total_pairs = len(pairs_to_run)
 
     sim_matrix = np.zeros((N, N), dtype=np.float32)
     np.fill_diagonal(sim_matrix, 1.0)
@@ -194,7 +216,7 @@ def compute_pairwise_similarity(
     pairs_done = 0
 
     for batch_start in range(0, total_pairs, batch_size):
-        batch_pairs = pair_indices[batch_start:batch_start + batch_size]
+        batch_pairs = pairs_to_run[batch_start:batch_start + batch_size]
         source_batch = torch.stack([crop_tensors[i] for i, j in batch_pairs])
         target_batch = torch.stack([crop_tensors[j] for i, j in batch_pairs])
 
