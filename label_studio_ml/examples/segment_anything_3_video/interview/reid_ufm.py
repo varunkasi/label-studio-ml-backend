@@ -514,6 +514,11 @@ def run_ufm_reid_pipeline(
     pair_indices = pair_plan["pair_indices"]
     pair_stats = pair_plan["stats"]
     rep_images = [crop_images[idx] for idx in rep_indices]
+    naive_pairs = int(pair_stats["n_all_pairs"])
+    n_pairs = int(pair_stats["n_ufm_pairs"])
+    avoided_pairs = max(naive_pairs - n_pairs, 0)
+    reduction_pct = (100.0 * avoided_pairs / naive_pairs) if naive_pairs > 0 else 0.0
+    reduction_label = f"avoided {avoided_pairs}/{naive_pairs} ({reduction_pct:.1f}% cut)"
 
     logger.info(
         "UFM ReID pair plan: crops=%d reps=%d nms_suppressed=%d pairs=%d->%d "
@@ -525,17 +530,17 @@ def run_ufm_reid_pipeline(
         pair_stats["n_ufm_pairs"],
         pair_stats["n_pruned_same_frame_pairs"],
     )
+    logger.info("UFM ReID pair reduction summary: %s", reduction_label)
 
-    n_pairs = int(pair_stats["n_ufm_pairs"])
     progress.total = n_pairs
     progress.current = 0
-    progress.step = "Computing UFM similarity (this takes a few minutes)"
+    progress.step = f"UFM pairs: 0/{n_pairs} [{reduction_label}]"
     progress.eta_seconds = None
     progress.items_per_second = None
     pair_t0 = time.time()
 
     def _progress_cb(done, total):
-        progress.step = f"UFM pairs: {done}/{total}"
+        progress.step = f"UFM pairs: {done}/{total} [{reduction_label}]"
         progress.current = done
         elapsed = max(time.time() - pair_t0, 1e-6)
         rate = done / elapsed if done > 0 else 0.0
@@ -610,6 +615,13 @@ def run_ufm_reid_pipeline(
         "cluster_sizes": cluster_sizes,
         "silhouette": round(sil, 4),
         "co_occurrence_warnings": warnings,
+        "ufm_pairs_naive": naive_pairs,
+        "ufm_pairs_executed": n_pairs,
+        "ufm_pairs_avoided": avoided_pairs,
+        "ufm_pairs_reduction_pct": round(reduction_pct, 1),
+        "ufm_representatives": int(pair_stats["n_representatives"]),
+        "ufm_same_frame_nms_suppressed": int(pair_stats["n_nms_suppressed"]),
+        "ufm_same_frame_pairs_pruned": int(pair_stats["n_pruned_same_frame_pairs"]),
     }
     logger.info(
         "UFM ReID complete: %d clusters, silhouette=%.3f, sizes=%s",
