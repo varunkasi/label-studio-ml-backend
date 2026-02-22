@@ -169,6 +169,7 @@ const AppState = {
     rejectReviewBoxAdjusted: false,         // whether box was adjusted for current crop
     rejectReviewDrawActive: false,          // reject-review-only draw/save toggle state
     rejectReviewFixExpandPct: 0,            // expansion percent for pre-Fix prompt preview
+    rejectReviewExpandBase: null,           // base box for expansion preview [x1,y1,x2,y2]
 
     // Active components (for cleanup)
     _components: {},
@@ -901,7 +902,7 @@ function renderDetection(app) {
         AppState.currentCropIndex = index;
         cropLabeler.showCrop(crop, AppState.sessionId);
         // Navigate frame viewer to the crop's frame
-        frameViewer.loadFrame(crop.frame_idx, AppState.sessionId);
+        frameViewer.loadFrame(crop.frame_idx, AppState.sessionId, true, crop.crop_id);
     });
 
     // Render toolbar
@@ -980,11 +981,11 @@ async function _loadDetectionData() {
 
         await _refreshCrops();
 
-        // Load first sampled frame
+        // Keep frame index aligned with the selected crop; _refreshCrops()
+        // already loads the highlighted frame.
         if (AppState.crops.length > 0) {
-            const firstFrame = AppState.crops[0].frame_idx;
-            AppState.currentFrameIdx = firstFrame;
-            if (fv) fv.loadFrame(firstFrame, AppState.sessionId);
+            const idx = Math.max(0, Math.min(AppState.currentCropIndex, AppState.crops.length - 1));
+            AppState.currentFrameIdx = AppState.crops[idx].frame_idx;
         }
     } catch (err) {
         showToast(`Failed to load detection data: ${err.message}`, 'error');
@@ -1015,6 +1016,7 @@ async function _refreshCrops() {
                     const selected = AppState.crops[AppState.currentCropIndex];
                     labeler.showCrop(selected, AppState.sessionId);
                     if (fv && selected) {
+                        AppState.currentFrameIdx = selected.frame_idx;
                         fv.loadFrame(selected.frame_idx, AppState.sessionId, true, selected.crop_id);
                     }
                 }
@@ -1027,6 +1029,7 @@ async function _refreshCrops() {
                     const selected = AppState.crops[0];
                     labeler.showCrop(selected, AppState.sessionId);
                     if (fv) {
+                        AppState.currentFrameIdx = selected.frame_idx;
                         fv.loadFrame(selected.frame_idx, AppState.sessionId, true, selected.crop_id);
                     }
                 }
@@ -1221,6 +1224,7 @@ function _enterRejectReview(rejectedCrops) {
     AppState.rejectReviewSubcategory = 'not_person';
     AppState.rejectReviewBoxAdjusted = false;
     AppState.rejectReviewDrawActive = false;
+    AppState.rejectReviewExpandBase = null;
 
     // Change header
     var header = document.querySelector('.detection-header');
@@ -1245,6 +1249,13 @@ function _enterRejectReview(rejectedCrops) {
             AppState._components.boxAdjuster = new BoxAdjuster(fv);
             AppState._components.boxAdjuster.onBoxChanged(function () {
                 AppState.rejectReviewBoxAdjusted = true;
+                var ba = AppState._components.boxAdjuster;
+                if (ba && ba.isActive()) {
+                    var b = ba.getBox();
+                    if (b) {
+                        AppState.rejectReviewExpandBase = [b.x1, b.y1, b.x2, b.y2];
+                    }
+                }
             });
         }
     }
@@ -1344,7 +1355,7 @@ function _buildRejectReviewUI() {
     hints.className = 'reject-review-hints';
     hints.innerHTML =
         '<span><kbd>J</kbd>/<kbd>K</kbd> Category</span>' +
-        '<span><kbd>F</kbd> Fix (SAM3)</span>' +
+        '<span><kbd>&darr;</kbd> Fix (SAM3)</span>' +
         '<span><kbd>&rarr;</kbd> Save & Next</span>' +
         '<span><kbd>&larr;</kbd> Previous</span>' +
         '<span><kbd>Esc</kbd> Exit</span>';
@@ -1369,8 +1380,13 @@ function _showRejectReviewCrop(index) {
     AppState.rejectReviewBoxAdjusted = false;
     AppState.rejectReviewDrawActive = false;
     AppState.rejectReviewFixExpandPct = 0;
+    AppState.rejectReviewExpandBase = null;
 
     var crop = crops[index];
+    var base = crop.corrected_xyxy || crop.xyxy;
+    if (base && base.length === 4) {
+        AppState.rejectReviewExpandBase = [base[0], base[1], base[2], base[3]];
+    }
 
     // Restore previously-chosen subcategory, or default to 'not_person'
     var initialSubcat = crop.reject_reason || 'not_person';
@@ -1392,9 +1408,7 @@ function _showRejectReviewCrop(index) {
         fv.loadFrame(crop.frame_idx, AppState.sessionId, true, crop.crop_id);
     }
 
-    // Deactivate box adjuster and reset draw toggle first.
-    var ba = AppState._components.boxAdjuster;
-    if (ba && ba.isActive()) ba.deactivate();
+    // Reset draw toggle first.
     _setRejectReviewDrawButton(false);
     _setRejectReviewExpandControl(0);
 
@@ -1430,18 +1444,6 @@ function _setSubcategory(subcat) {
     // Activate/deactivate box adjuster based on subcategory
     var ba = AppState._components.boxAdjuster;
     if (subcat === 'partial_box' || subcat === 'oversized_box') {
-        if (ba && !ba.isActive()) {
-            var crop = AppState.rejectReviewCrops[AppState.rejectReviewIndex];
-            var box = crop && (crop.corrected_xyxy || crop.xyxy);
-            if (box) {
-                ba.activate({
-                    x1: box[0],
-                    y1: box[1],
-                    x2: box[2],
-                    y2: box[3],
-                });
-            }
-        }
         AppState.rejectReviewDrawActive = true;
         _setRejectReviewDrawButton(true);
         _previewRejectReviewExpansion();
@@ -1473,7 +1475,7 @@ async function _saveAndAdvanceRejectReview() {
     var reasonChanged = AppState.rejectReviewSubcategory !== (crop.reject_reason || 'not_person');
     var boxChanged = AppState.rejectReviewBoxAdjusted;
     if (neverSaved || reasonChanged || boxChanged) {
-        var saved = await _saveRejectReviewCurrent(boxChanged);
+        var saved = await _saveRejectReviewCurrent(boxChanged, false);
         if (!saved) return;
     }
 
@@ -1495,7 +1497,7 @@ async function _prevRejectReviewCrop() {
     var reasonChanged = AppState.rejectReviewSubcategory !== (crop.reject_reason || 'not_person');
     var boxChanged = AppState.rejectReviewBoxAdjusted;
     if (neverSaved || reasonChanged || boxChanged) {
-        var saved = await _saveRejectReviewCurrent(boxChanged);
+        var saved = await _saveRejectReviewCurrent(boxChanged, false);
         if (!saved) return;
     }
 
@@ -1526,7 +1528,7 @@ async function _toggleRejectReviewDraw() {
     if (!ba || !crop) return;
 
     if (!AppState.rejectReviewDrawActive) {
-        var box = crop.corrected_xyxy || crop.xyxy;
+        var box = AppState.rejectReviewExpandBase || crop.corrected_xyxy || crop.xyxy;
         if (!ba.isActive() && box) {
             ba.activate({
                 x1: box[0],
@@ -1575,6 +1577,17 @@ function _expandBoxForPreview(box, pct, frameViewer) {
     ];
 }
 
+function _sameBox(a, b, eps) {
+    if (!a || !b) return false;
+    var t = eps || 0.5;
+    return (
+        Math.abs(a[0] - b[0]) <= t &&
+        Math.abs(a[1] - b[1]) <= t &&
+        Math.abs(a[2] - b[2]) <= t &&
+        Math.abs(a[3] - b[3]) <= t
+    );
+}
+
 function _previewRejectReviewExpansion() {
     var subcat = AppState.rejectReviewSubcategory;
     if (subcat !== 'partial_box' && subcat !== 'oversized_box') return;
@@ -1585,7 +1598,7 @@ function _previewRejectReviewExpansion() {
     var crop = crops[index];
     if (!crop) return;
 
-    var baseBox = crop.corrected_xyxy || crop.xyxy;
+    var baseBox = AppState.rejectReviewExpandBase || crop.corrected_xyxy || crop.xyxy;
     if (!baseBox) return;
 
     var ba = AppState._components.boxAdjuster;
@@ -1595,7 +1608,13 @@ function _previewRejectReviewExpansion() {
     var expanded = _expandBoxForPreview(baseBox, AppState.rejectReviewFixExpandPct || 0, fv);
     if (!expanded) return;
 
-    if (ba.isActive()) ba.deactivate();
+    if (ba.isActive()) {
+        var existing = ba.getBox();
+        if (existing && _sameBox(expanded, [existing.x1, existing.y1, existing.x2, existing.y2])) {
+            return;
+        }
+        ba.deactivate();
+    }
     ba.activate({
         x1: expanded[0],
         y1: expanded[1],
@@ -1676,6 +1695,7 @@ async function _fixOversizedBox() {
 
         // Store refined box on crop for later save
         crop.corrected_xyxy = refined;
+        AppState.rejectReviewExpandBase = [refined[0], refined[1], refined[2], refined[3]];
 
         var conf = (result.confidence * 100).toFixed(0);
         showToast('Box refined (IoU ' + conf + '%). Adjust if needed, then save.', 'success');
@@ -1689,10 +1709,11 @@ async function _fixOversizedBox() {
     }
 }
 
-async function _saveRejectReviewCurrent(includeAdjustedBox) {
+async function _saveRejectReviewCurrent(includeAdjustedBox, reloadFrame) {
     var crops = AppState.rejectReviewCrops;
     var index = AppState.rejectReviewIndex;
     if (index < 0 || index >= crops.length) return false;
+    var shouldReload = (reloadFrame !== false);
 
     var crop = crops[index];
     var ba = AppState._components.boxAdjuster;
@@ -1714,13 +1735,17 @@ async function _saveRejectReviewCurrent(includeAdjustedBox) {
         crop.reject_reason = AppState.rejectReviewSubcategory;
         if (adjustedXyxy) {
             crop.corrected_xyxy = adjustedXyxy;
+            AppState.rejectReviewExpandBase = [
+                adjustedXyxy[0], adjustedXyxy[1], adjustedXyxy[2], adjustedXyxy[3],
+            ];
         } else if (AppState.rejectReviewSubcategory === 'not_person') {
             crop.corrected_xyxy = null;
+            AppState.rejectReviewExpandBase = null;
         }
         AppState.stats = result;
         _renderToolbar();
         var fv = AppState._components.frameViewer;
-        if (fv) {
+        if (fv && shouldReload) {
             fv.reload(AppState.sessionId, crop.crop_id);
         }
         return true;
@@ -1752,6 +1777,7 @@ function _exitRejectReview() {
     AppState.rejectReviewIndex = 0;
     AppState.rejectReviewBoxAdjusted = false;
     AppState.rejectReviewDrawActive = false;
+    AppState.rejectReviewExpandBase = null;
 
     // Deactivate box adjuster
     var ba = AppState._components.boxAdjuster;
@@ -1948,7 +1974,7 @@ document.addEventListener('keydown', (e) => {
             } else if (e.key === 'k' || e.key === 'K') {
                 e.preventDefault();
                 _cycleSubcategory(1);
-            } else if (e.key === 'f' || e.key === 'F') {
+            } else if (e.key === 'ArrowDown') {
                 e.preventDefault();
                 _fixOversizedBox();
             } else if (e.key === 'ArrowRight' || e.key === 'Enter') {

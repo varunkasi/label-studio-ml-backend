@@ -9,7 +9,6 @@ from __future__ import annotations
 import logging
 import threading
 import time
-import traceback
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
@@ -23,6 +22,11 @@ class JobStatus(str, Enum):
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class JobCancelledError(RuntimeError):
+    """Raised when a background job is cooperatively cancelled."""
 
 
 @dataclass
@@ -38,6 +42,7 @@ class JobProgress:
     result: Any = None
     error: Optional[str] = None
     _pause_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    _cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
 
     def __post_init__(self):
         self._pause_event.set()  # Not paused by default
@@ -58,6 +63,19 @@ class JobProgress:
     def paused(self) -> bool:
         return not self._pause_event.is_set()
 
+    def cancel(self):
+        """Request cooperative cancellation for this job."""
+        self._cancel_event.set()
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancel_event.is_set()
+
+    def raise_if_cancelled(self) -> None:
+        """Raise if cancellation was requested."""
+        if self.cancelled:
+            raise JobCancelledError("Job cancelled")
+
     def to_dict(self) -> Dict[str, Any]:
         elapsed = (self.finished_at or time.time()) - self.started_at
         pct = (self.current / self.total * 100) if self.total > 0 else 0
@@ -71,6 +89,7 @@ class JobProgress:
             "elapsed_seconds": round(elapsed, 1),
             "error": self.error,
             "paused": self.paused,
+            "cancel_requested": self.cancelled,
         }
 
 
@@ -89,7 +108,7 @@ def _prune_old_jobs() -> None:
     """Remove oldest completed/failed jobs if over limit."""
     completed = [
         (jid, j) for jid, j in _jobs.items()
-        if j.status in (JobStatus.COMPLETED, JobStatus.FAILED)
+        if j.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED)
     ]
     if len(completed) <= _MAX_COMPLETED_JOBS:
         return
@@ -119,8 +138,15 @@ def submit_job(
         progress.started_at = time.time()
         try:
             result = fn(progress)
-            progress.result = result
-            progress.status = JobStatus.COMPLETED
+            if progress.cancelled:
+                progress.status = JobStatus.CANCELLED
+                progress.step = progress.step or "Cancelled"
+            else:
+                progress.result = result
+                progress.status = JobStatus.COMPLETED
+        except JobCancelledError:
+            progress.status = JobStatus.CANCELLED
+            progress.step = progress.step or "Cancelled"
         except Exception as e:
             logger.error("Job %s (%s) failed: %s", job_id, name, e, exc_info=True)
             progress.error = str(e)
@@ -184,4 +210,23 @@ def resume_job(job_id: str) -> bool:
         return False
     job.resume()
     logger.info("Resumed job %s", job_id)
+    return True
+
+
+def cancel_job(job_id: str) -> Optional[bool]:
+    """Request cancellation.
+
+    Returns:
+        True: cancellation requested for a running job.
+        False: job exists but is already terminal.
+        None: job was not found.
+    """
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if job is None:
+            return None
+        if job.status != JobStatus.RUNNING:
+            return False
+        job.cancel()
+    logger.info("Cancellation requested for job %s", job_id)
     return True

@@ -24,6 +24,8 @@ class SeedingUI {
         this.cachedFrameCount = 0;
         this.isGenerating = false;
         this.isUploading = false;
+        this.currentGenerateJobId = null;
+        this.stopRequested = false;
     }
 
     // ------------------------------------------------------------------
@@ -344,6 +346,7 @@ class SeedingUI {
         var actions = document.createElement('div');
         actions.className = 'seeding-actions';
         actions.style.marginTop = '20px';
+        actions.id = 'seed-generate-actions';
 
         var btnGenerate = document.createElement('button');
         btnGenerate.className = 'btn btn-primary';
@@ -355,7 +358,17 @@ class SeedingUI {
             self._generateSeeds(framePct, threshold);
         });
 
+        var btnStop = document.createElement('button');
+        btnStop.className = 'btn btn-reject';
+        btnStop.id = 'btn-stop-generate-seeds';
+        btnStop.textContent = 'Stop Generating';
+        btnStop.style.display = 'none';
+        btnStop.addEventListener('click', function () {
+            self._stopGenerating();
+        });
+
         actions.appendChild(btnGenerate);
+        actions.appendChild(btnStop);
         panel.appendChild(actions);
 
         // -- Progress area (hidden initially) --
@@ -407,11 +420,17 @@ class SeedingUI {
     async _generateSeeds(framePct, confidenceThreshold) {
         if (this.isGenerating) return;
         this.isGenerating = true;
+        this.stopRequested = false;
 
         var btn = document.getElementById('btn-generate-seeds');
+        var btnStop = document.getElementById('btn-stop-generate-seeds');
         if (btn) {
             btn.disabled = true;
             btn.textContent = 'Generating...';
+        }
+        if (btnStop) {
+            btnStop.style.display = '';
+            btnStop.disabled = false;
         }
 
         // Update config on the backend
@@ -425,6 +444,7 @@ class SeedingUI {
             showToast('Failed to update seed config: ' + err.message, 'error');
             this.isGenerating = false;
             if (btn) { btn.disabled = false; btn.textContent = 'Generate Seeds'; }
+            if (btnStop) { btnStop.style.display = 'none'; }
             return;
         }
 
@@ -439,19 +459,46 @@ class SeedingUI {
             showToast('Failed to start seed generation: ' + err.message, 'error');
             this.isGenerating = false;
             if (btn) { btn.disabled = false; btn.textContent = 'Generate Seeds'; }
+            if (btnStop) { btnStop.style.display = 'none'; }
             return;
         }
+        this.currentGenerateJobId = jobId;
 
         // Show progress
-        this._showProgress('Generating seeds...');
+        this._showProgress('Generating seeds...', {
+            framePct: framePct,
+            confidenceThreshold: confidenceThreshold,
+            estimatedFrames: this._estimateTargetFrames(framePct),
+        });
 
         // Poll for completion
         var pollResult = await this._pollJob(jobId);
+        this.currentGenerateJobId = null;
 
         if (!pollResult || pollResult.status === 'failed') {
             this.isGenerating = false;
-            if (btn) { btn.disabled = false; btn.textContent = 'Generate Seeds'; }
+            this.stopRequested = false;
             this._renderConfig();
+            return;
+        }
+        if (pollResult.status === 'cancelled') {
+            // Fetch partial seeds — backend saves them before raising cancellation
+            try {
+                var cancelledSeedData = await API.get('/seeds/list', {
+                    session_id: this.sessionId,
+                });
+                if (cancelledSeedData.total_seeds > 0) {
+                    this.identities = cancelledSeedData.identities || {};
+                    showToast('Cancelled — ' + cancelledSeedData.total_seeds + ' partial seeds saved.', 'warning');
+                    this._renderPreview(cancelledSeedData);
+                } else {
+                    this._renderConfig();
+                }
+            } catch (_) {
+                this._renderConfig();
+            }
+            this.isGenerating = false;
+            this.stopRequested = false;
             return;
         }
 
@@ -469,6 +516,7 @@ class SeedingUI {
         }
 
         this.isGenerating = false;
+        this.stopRequested = false;
     }
 
     // ------------------------------------------------------------------
@@ -795,7 +843,7 @@ class SeedingUI {
     // Progress helpers
     // ------------------------------------------------------------------
 
-    _showProgress(message) {
+    _showProgress(message, meta) {
         var area = document.getElementById('seed-progress-area');
         if (!area) return;
 
@@ -818,6 +866,22 @@ class SeedingUI {
         wrapper.appendChild(track);
         wrapper.appendChild(text);
         area.appendChild(wrapper);
+
+        if (meta) {
+            var summary = document.createElement('div');
+            summary.className = 'seeding-config';
+            summary.style.marginTop = '12px';
+            summary.style.padding = '12px 14px';
+            summary.style.fontSize = '0.8rem';
+            summary.style.color = 'var(--text-secondary)';
+            summary.innerHTML =
+                '<div style="display:flex;gap:16px;flex-wrap:wrap">' +
+                '<span>Coverage: <strong style="color:var(--text-primary)">' + meta.framePct + '%</strong></span>' +
+                '<span>Threshold: <strong style="color:var(--text-primary)">' + meta.confidenceThreshold.toFixed(2) + '</strong></span>' +
+                '<span>Estimated frames: <strong style="color:var(--text-primary)">' + meta.estimatedFrames.toLocaleString() + '</strong></span>' +
+                '</div>';
+            area.appendChild(summary);
+        }
     }
 
     _updateProgress(progress) {
@@ -852,6 +916,9 @@ class SeedingUI {
                 if (progress.status === 'completed') {
                     return progress;
                 }
+                if (progress.status === 'cancelled') {
+                    return progress;
+                }
                 if (progress.status === 'failed') {
                     showToast('Job failed: ' + (progress.error || 'Unknown error'), 'error');
                     return progress;
@@ -872,6 +939,30 @@ class SeedingUI {
         return new Promise(function (resolve) {
             setTimeout(resolve, ms);
         });
+    }
+
+    _estimateTargetFrames(framePct) {
+        var nChange = this.changeKeyframes.length || 0;
+        var cacheCount = this.cachedFrameCount || 0;
+        var sampled = Math.max(1, Math.round(cacheCount * framePct / 100));
+        return Math.max(sampled, nChange);
+    }
+
+    async _stopGenerating() {
+        var jobId = this.currentGenerateJobId;
+        if (!jobId || this.stopRequested) return;
+        this.stopRequested = true;
+
+        var btnStop = document.getElementById('btn-stop-generate-seeds');
+        if (btnStop) btnStop.disabled = true;
+
+        try {
+            await API.post('/job/' + jobId + '/cancel', {});
+            showToast('Stopping seed generation...', 'info');
+        } catch (err) {
+            showToast('Stop request failed: ' + err.message, 'warning');
+        }
+        // Let _generateSeeds handle cleanup when _pollJob returns
     }
 }
 

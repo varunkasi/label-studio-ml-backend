@@ -30,7 +30,7 @@ from seeding_common import (
 
 from .state import CropData, CropLabel, InterviewSession, Phase
 from .cache_manager import save_session
-from .background import JobProgress
+from .background import JobProgress, JobCancelledError
 from .dinov3_classifier import extract_features
 from .knn_classifier import build_support_set, score_crops
 
@@ -462,9 +462,24 @@ def generate_seeds(
 
     import torch
 
+    _cancelled = False
+
+    def _check_cancel() -> None:
+        """Set _cancelled flag; does NOT raise. Callers must check _cancelled."""
+        nonlocal _cancelled
+        if _cancelled:
+            return
+        fn = getattr(progress, "raise_if_cancelled", None)
+        if callable(fn):
+            try:
+                fn()
+            except JobCancelledError:
+                _cancelled = True
+
     # ---- Validate prerequisites ----
     progress.step = "Validating session state..."
     progress.current = 0
+    _check_cancel()
 
     # Build k-NN support set from labeled crops
     support_feats, support_labels, _, support_reasons = build_support_set(session)
@@ -480,6 +495,7 @@ def generate_seeds(
     # ---- Load models ----
     progress.step = "Loading models..."
     detector = Sam3TextBasedDetector()
+    _check_cancel()
 
     centroids = _compute_cluster_centroids(session)
     prompts = session.prompts if session.prompts else ["person"]
@@ -519,6 +535,7 @@ def generate_seeds(
     progress.step = "Generating seeds..."
     progress.total = total_frames
     progress.current = 0
+    _check_cancel()
 
     threshold = session.seed_config.confidence_threshold
     seeds: List[Dict[str, Any]] = []
@@ -554,7 +571,11 @@ def generate_seeds(
         pass
 
     # ---- Process in chunks (batched detection) ----
+    _check_cancel()
     for chunk_start in range(0, total_frames, _SEED_CHUNK_SIZE):
+        if _cancelled:
+            break
+        _check_cancel()
         chunk_indices = all_targets[chunk_start:chunk_start + _SEED_CHUNK_SIZE]
         progress.step = (
             f"Decoding frames {chunk_start + 1}"
@@ -579,6 +600,7 @@ def generate_seeds(
             frames = _decode_frames_sequential(
                 session.video_path, chunk_indices, cache_key=session.cache_key,
             )
+        _check_cancel()
 
         # --- Batched detection: run all prompts via _detect_batch ---
         # Collect detections grouped by frame_idx across all prompts
@@ -586,6 +608,7 @@ def generate_seeds(
         frame_detections: Dict[int, List[Tuple[np.ndarray, float]]] = defaultdict(list)
 
         for prompt_text in prompts:
+            _check_cancel()
             progress.step = (
                 f"Detecting '{prompt_text}' on frames "
                 f"{chunk_start + 1}-{chunk_start + len(chunk_indices)}..."
@@ -610,6 +633,7 @@ def generate_seeds(
         oversized_candidates: List[Tuple[int, np.ndarray, float]] = []
 
         for frame_idx in chunk_indices:
+            _check_cancel()
             dets = frame_detections.get(frame_idx)
             if not dets:
                 continue
@@ -688,6 +712,7 @@ def generate_seeds(
             )
 
             for i in range(len(boxes)):
+                _check_cancel()
                 conf = float(confidences[i])
                 if conf >= threshold:
                     identity, identity_sim = _assign_identity(
@@ -714,6 +739,7 @@ def generate_seeds(
                     oversized_candidates.append((frame_idx, boxes[i], det_scores[i], "refined_oversized"))
 
         # Refine medium-confidence candidates and oversized fallbacks.
+        _check_cancel()
         refine_candidates = medium_candidates + oversized_candidates
         if refine_candidates and _ENABLE_REFINEMENT:
             progress.step = f"Refining {len(refine_candidates)} candidates..."
@@ -724,6 +750,7 @@ def generate_seeds(
                 tags=refine_tags,
             )
             for result in refined:
+                _check_cancel()
                 frame_idx, box, _det_score = result[0], result[1], result[2]
                 tag = result[3] if len(result) > 3 else "refined"
                 pil_frame = frames.get(frame_idx)
@@ -744,10 +771,20 @@ def generate_seeds(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    # ---- Finalise ----
+    # ---- Finalise (runs even on cancellation to save partial seeds) ----
+    if _cancelled:
+        logger.info("Seed generation cancelled after %d seeds on %d/%d frames",
+                     len(seeds), progress.current, total_frames)
     with session._lock:
-        session.seeds = seeds
-        session.advance_to(Phase.SEEDING)
+        if _cancelled and session.seeds:
+            # Cancellation: preserve existing seeds, discard partial results
+            seeds = list(session.seeds)
+        else:
+            session.seeds = seeds
+        # Only advance phase if we have seeds; empty seeds on cancel
+        # should leave phase unchanged so user can retry generation
+        if seeds:
+            session.advance_to(Phase.SEEDING)
 
     save_session(session)
 
@@ -762,6 +799,17 @@ def generate_seeds(
         "identities": identity_counts,
         "prompts_used": prompts,
     }
+
+    if _cancelled:
+        progress.step = f"Cancelled - {len(seeds)} partial seeds saved"
+        logger.info(
+            "Seed generation cancelled: %d partial seeds saved, %d identities",
+            len(seeds), len(identity_counts),
+        )
+        raise JobCancelledError(
+            f"Cancelled after {len(seeds)} seeds on "
+            f"{progress.current}/{total_frames} frames"
+        )
 
     logger.info(
         "Seed generation complete: %d seeds across %d frames, %d identities",
@@ -831,8 +879,8 @@ def upload_seeds(
         ident = seed["identity"]
         identity_seeds.setdefault(ident, []).append(seed)
 
-    # Determine the label text for tracks
-    label_text = session.prompts[0] if session.prompts else "person"
+    # Label must match the LS labeling config's <Label value="Person" />
+    label_text = "Person"
 
     # ---- Build track structures ----
     progress.step = "Building track structures..."
