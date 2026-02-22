@@ -13,6 +13,7 @@ The human specifies k and directly assigns crops to clusters.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -21,6 +22,8 @@ from scipy.cluster.hierarchy import fcluster, linkage
 from scipy.spatial.distance import squareform
 
 logger = logging.getLogger(__name__)
+SAME_FRAME_NMS_IOU = float(os.getenv("INTERVIEW_REID_SAME_FRAME_NMS_IOU", "0.7"))
+SAME_FRAME_CANNOT_LINK_IOU = float(os.getenv("INTERVIEW_REID_SAME_FRAME_CANNOT_LINK_IOU", "0.7"))
 
 
 # ---------------------------------------------------------------------------
@@ -55,6 +58,160 @@ def cluster_hac(
     Z = linkage(condensed, method=method)
     labels = fcluster(Z, t=k, criterion="maxclust") - 1  # 0-indexed
     return labels.astype(np.intp)
+
+
+def build_ufm_pair_plan(
+    crop_ids: List[str],
+    crops: Dict[str, Any],
+    same_frame_nms_iou: float = SAME_FRAME_NMS_IOU,
+    same_frame_cannot_link_iou: float = SAME_FRAME_CANNOT_LINK_IOU,
+) -> Dict[str, Any]:
+    """Build representative crops and candidate UFM pairs.
+
+    Strategy:
+      1. Per-frame NMS on accepted crops to suppress near-duplicate boxes.
+      2. Pre-prune same-frame pairs with IoU below threshold (cannot-link),
+         so those pairs skip UFM inference entirely.
+
+    Returns:
+        Dict with keys:
+          rep_indices: indices into crop_ids used as UFM representatives.
+          rep_of_full: full crop index -> representative index mapping.
+          pair_indices: representative-index pairs to run through UFM.
+          stats: counters for logging/telemetry.
+    """
+    from .detection import _compute_iou_matrix, nms_numpy
+
+    n = len(crop_ids)
+    if n == 0:
+        return {
+            "rep_indices": [],
+            "rep_of_full": [],
+            "pair_indices": [],
+            "stats": {
+                "n_all_crops": 0,
+                "n_representatives": 0,
+                "n_nms_suppressed": 0,
+                "n_all_pairs": 0,
+                "n_representative_pairs": 0,
+                "n_pruned_same_frame_pairs": 0,
+                "n_ufm_pairs": 0,
+            },
+        }
+
+    # Start with identity mapping: each crop is its own representative.
+    rep_global_of_full = list(range(n))
+
+    # Group by frame index for per-frame NMS.
+    frame_to_full: Dict[int, List[int]] = {}
+    for full_idx, cid in enumerate(crop_ids):
+        crop = crops.get(cid)
+        frame_idx = int(crop.frame_idx) if crop is not None else -1
+        frame_to_full.setdefault(frame_idx, []).append(full_idx)
+
+    for full_indices in frame_to_full.values():
+        if len(full_indices) < 2:
+            continue
+
+        boxes = np.array(
+            [crops[crop_ids[idx]].xyxy for idx in full_indices], dtype=np.float32,
+        )
+        # Tiny tie-break to preserve deterministic early-index preference.
+        base_scores = np.array(
+            [float(getattr(crops[crop_ids[idx]], "score", 0.0)) for idx in full_indices],
+            dtype=np.float32,
+        )
+        tie_break = (len(full_indices) - 1 - np.arange(len(full_indices), dtype=np.float32)) * 1e-6
+        keep_local = nms_numpy(
+            boxes,
+            base_scores + tie_break,
+            iou_threshold=same_frame_nms_iou,
+        )
+        keep_local_set = {int(k) for k in keep_local.tolist()}
+
+        if len(keep_local_set) == len(full_indices):
+            continue
+
+        iou = _compute_iou_matrix(boxes, boxes)
+        for local_idx, full_idx in enumerate(full_indices):
+            if local_idx in keep_local_set:
+                rep_global_of_full[full_idx] = full_idx
+                continue
+
+            # Map suppressed crop to the kept crop with max IoU.
+            best_keep = max(
+                keep_local_set,
+                key=lambda k: float(iou[local_idx, k]),
+            )
+            if float(iou[local_idx, best_keep]) >= same_frame_nms_iou:
+                rep_global_of_full[full_idx] = full_indices[best_keep]
+            else:
+                # Safety fallback: leave as its own representative.
+                rep_global_of_full[full_idx] = full_idx
+
+    # Build compact representative index space.
+    rep_indices: List[int] = []
+    global_rep_to_local: Dict[int, int] = {}
+    for rep_global in rep_global_of_full:
+        if rep_global not in global_rep_to_local:
+            global_rep_to_local[rep_global] = len(rep_indices)
+            rep_indices.append(rep_global)
+
+    rep_of_full = [global_rep_to_local[rep_global_of_full[i]] for i in range(n)]
+
+    # Pre-prune impossible same-frame pairs among representatives.
+    rep_frame_to_local: Dict[int, List[int]] = {}
+    for rep_local, full_idx in enumerate(rep_indices):
+        cid = crop_ids[full_idx]
+        crop = crops.get(cid)
+        frame_idx = int(crop.frame_idx) if crop is not None else -1
+        rep_frame_to_local.setdefault(frame_idx, []).append(rep_local)
+
+    pruned_same_frame_pairs: set[Tuple[int, int]] = set()
+    for rep_local_indices in rep_frame_to_local.values():
+        if len(rep_local_indices) < 2:
+            continue
+
+        boxes = np.array(
+            [crops[crop_ids[rep_indices[i]]].xyxy for i in rep_local_indices],
+            dtype=np.float32,
+        )
+        iou = _compute_iou_matrix(boxes, boxes)
+        for a in range(len(rep_local_indices)):
+            for b in range(a + 1, len(rep_local_indices)):
+                if float(iou[a, b]) < same_frame_cannot_link_iou:
+                    i = rep_local_indices[a]
+                    j = rep_local_indices[b]
+                    pruned_same_frame_pairs.add((i, j) if i < j else (j, i))
+
+    pair_indices: List[Tuple[int, int]] = []
+    m = len(rep_indices)
+    for i in range(m):
+        for j in range(i + 1, m):
+            if (i, j) in pruned_same_frame_pairs:
+                continue
+            pair_indices.append((i, j))
+
+    n_nms_suppressed = sum(
+        1 for full_idx, rep_global in enumerate(rep_global_of_full) if full_idx != rep_global
+    )
+    n_all_pairs = n * (n - 1) // 2
+    n_rep_pairs = m * (m - 1) // 2
+    stats = {
+        "n_all_crops": n,
+        "n_representatives": m,
+        "n_nms_suppressed": n_nms_suppressed,
+        "n_all_pairs": n_all_pairs,
+        "n_representative_pairs": n_rep_pairs,
+        "n_pruned_same_frame_pairs": len(pruned_same_frame_pairs),
+        "n_ufm_pairs": len(pair_indices),
+    }
+    return {
+        "rep_indices": rep_indices,
+        "rep_of_full": rep_of_full,
+        "pair_indices": pair_indices,
+        "stats": stats,
+    }
 
 
 def apply_same_frame_constraints(
@@ -344,18 +501,46 @@ def run_ufm_reid_pipeline(
     progress.current = 1
     logger.info("UFM ReID: %d accepted crops", n)
 
-    # Step 2: Compute UFM pairwise similarity — this dominates runtime.
-    # Switch to pair-level progress for a responsive bar.
-    n_pairs = n * (n - 1) // 2
+    # Step 2: Build pair plan (same-frame NMS + cannot-link pruning),
+    # then run UFM only on representative candidate pairs.
+    pair_plan = build_ufm_pair_plan(
+        crop_ids,
+        session.crops,
+        same_frame_nms_iou=SAME_FRAME_NMS_IOU,
+        same_frame_cannot_link_iou=SAME_FRAME_CANNOT_LINK_IOU,
+    )
+    rep_indices = pair_plan["rep_indices"]
+    rep_of_full = np.asarray(pair_plan["rep_of_full"], dtype=np.intp)
+    pair_indices = pair_plan["pair_indices"]
+    pair_stats = pair_plan["stats"]
+    rep_images = [crop_images[idx] for idx in rep_indices]
+    naive_pairs = int(pair_stats["n_all_pairs"])
+    n_pairs = int(pair_stats["n_ufm_pairs"])
+    avoided_pairs = max(naive_pairs - n_pairs, 0)
+    reduction_pct = (100.0 * avoided_pairs / naive_pairs) if naive_pairs > 0 else 0.0
+    reduction_label = f"avoided {avoided_pairs}/{naive_pairs} ({reduction_pct:.1f}% cut)"
+
+    logger.info(
+        "UFM ReID pair plan: crops=%d reps=%d nms_suppressed=%d pairs=%d->%d "
+        "(pruned_same_frame=%d)",
+        pair_stats["n_all_crops"],
+        pair_stats["n_representatives"],
+        pair_stats["n_nms_suppressed"],
+        pair_stats["n_all_pairs"],
+        pair_stats["n_ufm_pairs"],
+        pair_stats["n_pruned_same_frame_pairs"],
+    )
+    logger.info("UFM ReID pair reduction summary: %s", reduction_label)
+
     progress.total = n_pairs
     progress.current = 0
-    progress.step = "Computing UFM similarity (this takes a few minutes)"
+    progress.step = f"UFM pairs: 0/{n_pairs} [{reduction_label}]"
     progress.eta_seconds = None
     progress.items_per_second = None
     pair_t0 = time.time()
 
     def _progress_cb(done, total):
-        progress.step = f"UFM pairs: {done}/{total}"
+        progress.step = f"UFM pairs: {done}/{total} [{reduction_label}]"
         progress.current = done
         elapsed = max(time.time() - pair_t0, 1e-6)
         rate = done / elapsed if done > 0 else 0.0
@@ -365,10 +550,18 @@ def run_ufm_reid_pipeline(
         else:
             progress.eta_seconds = None
 
-    sim_matrix = compute_pairwise_similarity(
-        crop_images,
+    rep_sim_matrix = compute_pairwise_similarity(
+        rep_images,
+        pair_indices=pair_indices,
         progress_callback=_progress_cb,
     )
+    # Broadcast representative similarities back to the full accepted set.
+    sim_matrix = np.array(
+        rep_sim_matrix[np.ix_(rep_of_full, rep_of_full)],
+        dtype=np.float32,
+        copy=True,
+    )
+    np.fill_diagonal(sim_matrix, 1.0)
 
     # Restore to step-level for remaining steps
     progress.total = 4
@@ -378,7 +571,7 @@ def run_ufm_reid_pipeline(
 
     # Step 2.5: Enforce same-frame cannot-links before clustering
     n_constrained = apply_same_frame_constraints(
-        sim_matrix, crop_ids, session.crops,
+        sim_matrix, crop_ids, session.crops, iou_threshold=SAME_FRAME_CANNOT_LINK_IOU,
     )
     if n_constrained:
         logger.info("UFM ReID: zeroed %d same-frame pairs", n_constrained)
@@ -422,6 +615,13 @@ def run_ufm_reid_pipeline(
         "cluster_sizes": cluster_sizes,
         "silhouette": round(sil, 4),
         "co_occurrence_warnings": warnings,
+        "ufm_pairs_naive": naive_pairs,
+        "ufm_pairs_executed": n_pairs,
+        "ufm_pairs_avoided": avoided_pairs,
+        "ufm_pairs_reduction_pct": round(reduction_pct, 1),
+        "ufm_representatives": int(pair_stats["n_representatives"]),
+        "ufm_same_frame_nms_suppressed": int(pair_stats["n_nms_suppressed"]),
+        "ufm_same_frame_pairs_pruned": int(pair_stats["n_pruned_same_frame_pairs"]),
     }
     logger.info(
         "UFM ReID complete: %d clusters, silhouette=%.3f, sizes=%s",
