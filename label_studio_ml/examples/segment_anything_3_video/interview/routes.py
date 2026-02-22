@@ -73,6 +73,20 @@ def _delete_cached_accepted_crop(session: InterviewSession, crop_id: str) -> Non
     delete_cached_accepted_crop_image(session.cache_key, crop_id)
 
 
+def _invalidate_reid_cache(session: InterviewSession, reason: str) -> None:
+    """Invalidate cached ReID/UFM artifacts when accepted crop set changes."""
+    session.reid_clusters = {}
+    session.n_identities = 0
+    for crop in session.crops.values():
+        crop.reid_cluster_id = None
+    session.ufm_similarity_matrix = None
+    session.ufm_crop_ids = []
+    session.ufm_complete = False
+    session.ufm_job_id = None
+    session.touch()
+    logger.info("Invalidated ReID cache for session %s: %s", session.session_id, reason)
+
+
 @interview_bp.after_request
 def _fix_passthrough(response):
     """Convert direct-passthrough file responses to buffered responses.
@@ -913,9 +927,12 @@ def detect_label():
         return jsonify({"error": "Session not found"}), 404
 
     updated = 0
+    reid_changed = False
     for crop_id, label_str in labels.items():
         try:
             label = CropLabel(label_str)
+            existing = session.get_crop(crop_id)
+            old_label = existing.label if existing is not None else None
             if session.label_crop(crop_id, label):
                 updated += 1
                 crop = session.get_crop(crop_id)
@@ -924,8 +941,14 @@ def detect_label():
                         _cache_accepted_crop_for_reid(session, crop)
                     else:
                         _delete_cached_accepted_crop(session, crop_id)
+                if old_label is not None and old_label != label:
+                    if old_label == CropLabel.ACCEPTED or label == CropLabel.ACCEPTED:
+                        reid_changed = True
         except ValueError:
             pass
+
+    if reid_changed:
+        _invalidate_reid_cache(session, reason="accepted label set changed")
 
     save_session(session)
     return jsonify({"updated": updated, **session.stats()})
@@ -957,6 +980,7 @@ def detect_draw():
     )
     session.add_crop(crop)
     _cache_accepted_crop_for_reid(session, crop)
+    _invalidate_reid_cache(session, reason="manual accepted crop added")
     save_session(session)
 
     return jsonify({"crop": crop.to_dict(), **session.stats()})
@@ -1005,12 +1029,14 @@ def detect_subcategorize():
         cid for cid, c in session.crops.items()
         if getattr(c, "corrected_from", None) == crop_id
     ]
+    reid_changed = False
 
     # Saving "not_person" removes any corrected counterpart.
     if reject_reason == "not_person":
         for cid in existing_corrected:
             _delete_cached_accepted_crop(session, cid)
             session.remove_crop(cid)
+            reid_changed = True
 
     # If an adjusted box was provided, create a corrected crop.
     # Features for the corrected crop are extracted lazily during
@@ -1033,6 +1059,7 @@ def detect_subcategorize():
         for cid in existing_corrected:
             _delete_cached_accepted_crop(session, cid)
             session.remove_crop(cid)
+            reid_changed = True
 
         new_crop = CropData(
             crop_id=str(uuid.uuid4())[:12],
@@ -1047,6 +1074,10 @@ def detect_subcategorize():
         session.add_crop(new_crop)
         _cache_accepted_crop_for_reid(session, new_crop)
         new_crop_id = new_crop.crop_id
+        reid_changed = True
+
+    if reid_changed:
+        _invalidate_reid_cache(session, reason="corrected accepted crops changed")
 
     save_session(session)
 
