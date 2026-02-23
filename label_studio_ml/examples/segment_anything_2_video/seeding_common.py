@@ -173,7 +173,17 @@ def _get_video_path(task: Dict[str, Any]) -> Tuple[str, str]:
             logger.info("Resolved relative video URL to %s", video_url)
 
     logger.info("Downloading/caching video via get_local_path…")
-    local_path = get_local_path(video_url, task_id=task["id"])
+
+    # Add feature: Use LS_CACHE_DIR if set
+    cache_dir = os.getenv("LS_CACHE_DIR", None)
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+
+    if cache_dir:
+        logger.info("Using cache directory: %s", cache_dir)
+        local_path = get_local_path(video_url, cache_dir=cache_dir, task_id=task["id"])
+    else:
+        local_path = get_local_path(video_url, task_id=task["id"])
     
     # Check for empty or missing file
     if os.path.exists(local_path) and os.path.getsize(local_path) == 0:
